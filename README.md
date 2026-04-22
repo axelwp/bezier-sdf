@@ -15,9 +15,9 @@ WebGPU primary, WebGL fallback, static SVG when neither is available.
 
 ## Why
 
-Every vector rendering library in the browser — SVG, Canvas, Pixi, Lottie, you name it — does roughly the same thing under the hood: take Bezier curves, triangulate them on the CPU, upload the triangles to the GPU, rasterize. It works, but it scales badly for animation. Every frame where the shape *changes* needs a fresh tessellation, a fresh upload, and a fresh rasterization. That's why a logo reveal animation in Lottie hits a budget that a static SVG doesn't.
+Every vector rendering library in the browser: SVG, Canvas, Pixi, Lottie, you name it, does roughly the same thing under the hood: take Bezier curves, triangulate them on the CPU, upload the triangles to the GPU, rasterize. It works, but it scales badly for animation. Every frame where the shape *changes* needs a fresh tessellation, a fresh upload, and a fresh rasterization. That's why a logo reveal animation in Lottie hits a budget that a static SVG doesn't.
 
-This library takes the other path. The Bezier curves *are* the input to the GPU shader. The shader computes "distance from this pixel to the nearest point on any curve" directly — no triangles, no CPU tessellation, no intermediate mesh. The shape is a [signed distance field](https://iquilezles.org/articles/distfunctions2d/) defined by the curves themselves.
+This library takes the other path. The Bezier curves *are* the input to the GPU shader. The shader computes "distance from this pixel to the nearest point on any curve" directly. No triangles, no CPU tessellation, no intermediate mesh. The shape is a [signed distance field](https://iquilezles.org/articles/distfunctions2d/) defined by the curves themselves.
 
 Two consequences:
 
@@ -149,13 +149,13 @@ Measured on a 2023 M1 MacBook at 1024×1024, 26 cubic segments total:
 | WebGL baked          | ~14ms             | ~1.1ms            |
 | WebGL direct (fallback) | n/a            | ~3.2ms            |
 
-The bake step is a one-time cost at init. Every frame after that is dominated by texture sampling and smooth-min — well under one vblank even at 4K resolution.
+The bake step is a one-time cost at init. Every frame after that is dominated by texture sampling and smooth-min, well under one vblank even at 4K resolution.
 
 See [`docs/performance.md`](./docs/performance.md) for the full methodology and comparisons to SVG, Canvas, and Lottie equivalents.
 
 ## Seen in the wild
 
-This library powers the logo reveal on [levx.app](https://levx.app) *(replace with your site)* — a chart-line-to-logo morph that demonstrates the polyline sampling pattern in production. Source is closed but the technique is documented in [`docs/technique.md`](./docs/technique.md#the-chart-to-logo-morph-pattern).
+This library powers the logo reveal on [levx.trade](https://levx.trade) *(replace with your site)* — a chart-line-to-logo morph that demonstrates the polyline sampling pattern in production. Source is closed but the technique is documented in [`docs/technique.md`](./docs/technique.md#the-chart-to-logo-morph-pattern).
 
 ## Contributing
 
