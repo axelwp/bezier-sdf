@@ -1,0 +1,61 @@
+{
+  "name": "@bezier-sdf/core",
+  "version": "0.1.0",
+  "description": "Framework-agnostic GPU signed-distance-field rendering of cubic Bezier curves. WebGPU + WebGL renderers, Canvas 2D helpers, and geometry utilities.",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./geometry": {
+      "types": "./dist/geometry/index.d.ts",
+      "import": "./dist/geometry/index.js"
+    },
+    "./renderers": {
+      "types": "./dist/renderers/index.d.ts",
+      "import": "./dist/renderers/index.js"
+    },
+    "./canvas": {
+      "types": "./dist/canvas/index.d.ts",
+      "import": "./dist/canvas/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "sdf",
+    "signed-distance-field",
+    "bezier",
+    "webgl",
+    "webgpu",
+    "shader",
+    "svg",
+    "logo",
+    "vector-graphics",
+    "gpu"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_HANDLE/bezier-sdf.git",
+    "directory": "packages/core"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.40",
+    "typescript": "^5.4.0"
+  }
+}

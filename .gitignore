@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.turbo/
+.vite/
+.DS_Store
+*.log
+coverage/
+.env
+.env.local
+.idea/
+.vscode/settings.json
+.claude
+.github
