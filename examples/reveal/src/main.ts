@@ -57,10 +57,20 @@ async function main() {
     if (animating) requestAnimationFrame(tick);
   };
 
-  window.addEventListener('resize', () => {
-    sizeCanvas(canvas);
-    if (!animating) renderer.render(baseUniforms(currentSplit));
-  });
+  const onResize = () => {
+    if (sizeCanvas(canvas)) renderer.render(baseUniforms(currentSplit));
+  };
+  window.addEventListener('resize', onResize);
+  // DPR changes (monitor hop, browser zoom on some engines) don't always
+  // fire 'resize' — watch the resolution media query too.
+  let dprMql = window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`);
+  const onDprChange = () => {
+    onResize();
+    dprMql?.removeEventListener('change', onDprChange);
+    dprMql = window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`);
+    dprMql?.addEventListener('change', onDprChange);
+  };
+  dprMql?.addEventListener('change', onDprChange);
 
   if (reducedMotion) {
     renderer.render(baseUniforms(0));
@@ -69,10 +79,14 @@ async function main() {
   }
 }
 
-function sizeCanvas(canvas: HTMLCanvasElement) {
+function sizeCanvas(canvas: HTMLCanvasElement): boolean {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = Math.max(1, Math.floor(window.innerWidth * dpr));
-  canvas.height = Math.max(1, Math.floor(window.innerHeight * dpr));
+  const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  if (canvas.width === w && canvas.height === h) return false;
+  canvas.width = w;
+  canvas.height = h;
+  return true;
 }
 
 main().catch((err) => {
