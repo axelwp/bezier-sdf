@@ -123,6 +123,14 @@ See [`packages/core/README.md`](./packages/core/README.md) for the full API, and
 
 Each folder under [`examples/`](./examples) is a standalone Vite app that depends on `@bezier-sdf/core` via the workspace link — edit a core file, the example hot-reloads.
 
+<p align="center">
+  <video src="./docs/assets/reveal.mp4" autoplay muted loop playsinline width="480">
+    <img src="./docs/assets/reveal.gif" alt="Split-morph reveal: two chevrons start merged and slide apart" width="480" />
+  </video>
+  <br/>
+  <sub><code>examples/reveal</code> — run with <code>pnpm --filter @bezier-sdf/example-reveal dev</code></sub>
+</p>
+
 | Example         | Technique                                                              |
 |-----------------|------------------------------------------------------------------------|
 | `reveal`        | Split-morph intro: sub-paths start merged, slide to final positions on scroll-into-view |
