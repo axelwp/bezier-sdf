@@ -2,7 +2,7 @@ import { createRenderer, DEMO_MARK, type Uniforms } from '@bezier-sdf/core';
 
 const COLOR: readonly [number, number, number] = [1, 0.23, 0.48];
 const SMIN_K = 0.08;
-const START_OFFSET = 0.3;
+const START_OFFSET = 0.5;
 const DELAY_MS = 100;
 const DURATION_MS = 1400;
 
