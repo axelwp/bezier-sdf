@@ -1,4 +1,4 @@
-import type { Effect } from './types';
+import type { EffectDefinition, EffectFrame, EffectRuntime } from './types';
 
 const DURATION_MS = 1400;
 const START_OFFSET = 0.3;
@@ -36,32 +36,52 @@ function splitOffsets(pathCount: number, split: number): Array<[number, number]>
   return out;
 }
 
-/**
- * The intro effect from the README prototype: multi-path logos split outward
- * before the reveal and ease together to their baked positions; single-path
- * logos fade from 0 → 1 opacity over the same window (since there's nothing
- * to split).
- */
-export const reveal: Effect = {
+export const reveal: EffectDefinition = {
   name: 'reveal',
-  durationMs: DURATION_MS,
-  initial(pathCount) {
-    return {
+  needsPointer: false,
+  scrollTrigger: true,
+  create({ pathCount, reducedMotion }): EffectRuntime {
+    const settled: EffectFrame = {
+      pathOffsets: splitOffsets(pathCount, 0),
+      opacity: 1,
+      sminK: SMIN_K,
+    };
+    const poised: EffectFrame = {
       pathOffsets: splitOffsets(pathCount, 1),
       opacity: pathCount === 1 ? 0 : 1,
       sminK: SMIN_K,
-      done: false,
     };
-  },
-  at(elapsed, pathCount) {
-    const t = Math.min(1, Math.max(0, elapsed / DURATION_MS));
-    const eased = easeOutCubic(t);
-    const split = 1 - eased;
+
+    if (reducedMotion) {
+      return {
+        frame: () => settled,
+        active: () => false,
+      };
+    }
+
+    // `null` = not yet triggered. The component calls `replay(now)` on
+    // mount (autoPlay) or on first IntersectionObserver hit (default).
+    let startMs: number | null = null;
+
     return {
-      pathOffsets: splitOffsets(pathCount, split),
-      opacity: pathCount === 1 ? eased : 1,
-      sminK: SMIN_K,
-      done: t >= 1,
+      frame(now) {
+        if (startMs === null) return poised;
+        const t = Math.min(1, Math.max(0, (now - startMs) / DURATION_MS));
+        const eased = easeOutCubic(t);
+        const split = 1 - eased;
+        return {
+          pathOffsets: splitOffsets(pathCount, split),
+          opacity: pathCount === 1 ? eased : 1,
+          sminK: SMIN_K,
+        };
+      },
+      active(now) {
+        if (startMs === null) return false;
+        return now - startMs < DURATION_MS;
+      },
+      replay(now) {
+        startMs = now;
+      },
     };
   },
 };

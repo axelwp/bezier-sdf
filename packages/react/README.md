@@ -16,17 +16,31 @@ import { BezierLogo } from '@bezier-sdf/react';
 
 Renders the SVG silhouette through a GPU signed-distance field inside the component's layout box. No animation by default.
 
-## Intro animation
+## Effects
+
+| Value | Behavior |
+|---|---|
+| `'none'` (default) | Static render. |
+| `'reveal'` | Split-and-merge intro. Waits for scroll-into-view unless `autoPlay`. |
+| `'ripple'` | Click/tap the canvas → Gaussian shockwave ring through the silhouette. Up to 4 concurrent rings. |
+| `'liquid-cursor'` | Hover the canvas → the silhouette bulges toward the pointer and fuses with it when close. |
 
 ```tsx
-<BezierLogo src="/logo.svg" color="#ff3a7a" effect="reveal" />
+<BezierLogo src="/logo.svg" effect="reveal" />                 // scroll-triggered
+<BezierLogo src="/logo.svg" effect="reveal" autoPlay />        // plays on mount
+<BezierLogo src="/logo.svg" effect="ripple" color="#9af078" /> // click anywhere on the canvas
+<BezierLogo src="/logo.svg" effect="liquid-cursor" />          // hover
 ```
 
-With `effect="reveal"` and the default `autoPlay={false}`, the animation waits for the component to scroll into view, then plays once. Pass `autoPlay` to play on mount:
+### Composing effects
+
+Pass an array to layer multiple presets. The built-ins use disjoint uniforms (reveal → `pathOffsets`; liquid-cursor → `cursor*`; ripple → `ripples`) so they compose without stepping on each other.
 
 ```tsx
-<BezierLogo src="/logo.svg" effect="reveal" autoPlay />
+<BezierLogo src="/logo.svg" effect={['liquid-cursor', 'ripple']} />
 ```
+
+On desktop, hover bulges the silhouette toward the pointer and clicks fire a ripple through it. On touch (no hover), tapping engages both at once.
 
 ## Replay
 
@@ -44,7 +58,7 @@ const ref = useRef<BezierLogoHandle>(null);
 | `src` | `string` | — | SVG URL or data URI. |
 | `color` | `string` | `'#000'` | Any CSS color. |
 | `opacity` | `number` | `1` | 0..1 multiplier applied on top of any effect opacity. |
-| `effect` | `'none' \| 'reveal'` | `'none'` | Intro effect preset. |
+| `effect` | `'none' \| 'reveal' \| 'ripple' \| 'liquid-cursor' \| Array<…>` | `'none'` | Single preset or an array to compose. |
 | `autoPlay` | `boolean` | `false` | Skip the scroll-into-view wait. |
 | `renderer` | `'auto' \| 'webgpu' \| 'webgl'` | `'auto'` | Force a backend. |
 | `pauseWhenOffscreen` | `boolean` | `true` | Cancel rAF while offscreen. |

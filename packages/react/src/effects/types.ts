@@ -1,35 +1,68 @@
 /**
- * An Effect is a pure function from elapsed time to a partial uniforms
- * overlay. The component owns the base uniforms (all pathOffsets zero,
- * opacity 1, sminK 0.08) and merges the effect's frame on top each tick.
+ * An effect is a small stateful runtime the component drives each frame.
  *
- * Kept deliberately minimal. Future effects (ripple, liquid-cursor, morph)
- * will need richer inputs — pointer position, ripple events, a second mark.
- * When that happens, widen `EffectContext` rather than changing this
- * interface's call shape; callers of `at` and `initial` won't have to move.
+ * `reveal` is time-based: elapsed ms since `replay()` → frame. `ripple` and
+ * `liquid-cursor` are event-driven: a pointer moved, a click happened, and
+ * the frame reflects that state. Wrapping both in one interface keeps the
+ * component's uniform-merging loop trivial — it doesn't care which shape
+ * of effect is active, only what fields the frame filled in.
  */
 
 export interface EffectFrame {
-  /** Overlay for per-path screen offsets; length must match pathCount. */
+  /** Overlay for per-path SDF offsets; length must match `pathCount`. */
   pathOffsets?: ReadonlyArray<readonly [number, number]>;
   /** Overlay opacity in 0..1. */
   opacity?: number;
   /** Overlay sminK (soft-union radius). */
   sminK?: number;
-  /** When true, the component stops the rAF loop and freezes at this frame. */
-  done: boolean;
+  /** Cursor position in SDF space (`[-1, 1]`). */
+  cursor?: readonly [number, number];
+  /** Pull strength at `cursor`. See core `Uniforms.cursorPull`. */
+  cursorPull?: number;
+  /** Softening epsilon for the pull field. See core `Uniforms.cursorRadius`. */
+  cursorRadius?: number;
+  /** Active ripple rings. See core `Uniforms.ripples`. */
+  ripples?: ReadonlyArray<readonly [number, number, number, number]>;
 }
 
-export interface Effect {
-  readonly name: string;
-  /** Total animation length in ms. `at(durationMs)` should return `done: true`. */
-  readonly durationMs: number;
+export interface EffectRuntime {
+  /** Frame for `now` (ms since `performance.timeOrigin`). */
+  frame(now: number): EffectFrame;
   /**
-   * State shown *before* the effect is triggered — e.g. the pre-reveal
-   * split-out position, or the zero-opacity start for a fade-in. Lets the
-   * component render a stable "poised" frame while waiting for scroll-in.
+   * Should rAF keep pumping after this frame? Returning `false` lets the
+   * component freeze on the last emitted frame until an event (pointer,
+   * replay, intersection) nudges it back on.
    */
-  initial(pathCount: number): EffectFrame;
-  /** State at the given elapsed time in ms since the effect started. */
-  at(elapsed: number, pathCount: number): EffectFrame;
+  active(now: number): boolean;
+  /** Pointer moved over the canvas. `x`/`y` in SDF space. */
+  pointerMove?(x: number, y: number, now: number): void;
+  /** Pointer left the canvas. */
+  pointerLeave?(now: number): void;
+  /** Pointer pressed on the canvas. `x`/`y` in SDF space. */
+  pointerDown?(x: number, y: number, now: number): void;
+  /**
+   * Reset the effect to its pre-trigger state (for reveal, re-plays from
+   * the split-out pose; a no-op for purely reactive effects).
+   */
+  replay?(now: number): void;
+}
+
+export interface EffectCreateOptions {
+  pathCount: number;
+  reducedMotion: boolean;
+  /** Forwarded from the component prop — only `reveal` uses it. */
+  autoPlay: boolean;
+}
+
+export interface EffectDefinition {
+  readonly name: string;
+  /** If `true`, the component attaches `pointer*` listeners to the canvas. */
+  readonly needsPointer: boolean;
+  /**
+   * If `true`, the component waits for the element to scroll into view
+   * before calling `runtime.replay()` to kick off the animation. `autoPlay`
+   * and `prefers-reduced-motion` both bypass this gate.
+   */
+  readonly scrollTrigger: boolean;
+  create(opts: EffectCreateOptions): EffectRuntime;
 }
