@@ -11,6 +11,10 @@ WebGPU primary, WebGL fallback, static SVG when neither is available.
 
 ### [**→ Live demo**](https://axelwp.github.io/)
 
+[![npm version](https://img.shields.io/npm/v/@bezier-sdf/core.svg)](https://www.npmjs.com/package/@bezier-sdf/core)
+
+`npm install @bezier-sdf/core`
+
 </div>
 
 ---
