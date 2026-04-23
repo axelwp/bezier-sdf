@@ -9,8 +9,9 @@
  *      forever after.
  *   2. SAMPLE pass — runs every frame. Samples each path's baked SDF at
  *      a translated UV (so each sub-shape can animate independently),
- *      smooth-unions the results, rasterizes the silhouette with fwidth-
- *      based anti-aliasing.
+ *      and either smooth-unions them (legacy single-color path, used by
+ *      the reveal example) or composites them with per-path fill/stroke
+ *      modes and colors (the mode used for arbitrary user SVGs).
  *
  * If half-float textures aren't available, DIRECT_FRAG evaluates one
  * combined SDF per pixel. Slower but always works — no animation because
@@ -124,11 +125,22 @@ void main() {
 
 /**
  * Sample fragment. Reads up to MAX_PATHS baked SDFs, each translated by
- * its own offset, and smooth-unions the results.
+ * its own offset. Supports two composition modes:
  *
- * We can't index samplers dynamically in GLSL ES 1.00, so we unroll by
- * path count up to MAX_PATHS=4. u_pathCount tells the shader how many
- * are actually bound.
+ *   u_compositeMode == 0 (legacy):
+ *     Smooth-union all paths together and emit a single silhouette in
+ *     `u_color`. Used by the reveal example where sub-paths morph into
+ *     each other and are conceptually one shape.
+ *
+ *   u_compositeMode == 1 (per-path):
+ *     Composite paths independently using the "over" operator in SVG
+ *     document order. Each path has its own mode (fill / stroke / both),
+ *     colors, and opacities. Used when loading arbitrary SVGs that may
+ *     have per-path paint. smin is not applied across paths in this mode
+ *     — see KNOWN_LIMITATIONS.md.
+ *
+ * We can't index samplers dynamically in GLSL ES 1.00, so sampler and
+ * per-path offset access is unrolled in `sampleIdx`.
  */
 export const WEBGL_SAMPLE_FRAG = /* glsl */ `
 #extension GL_OES_standard_derivatives : enable
@@ -137,11 +149,13 @@ precision highp float;
 uniform vec2  u_res;
 uniform float u_zoom;
 uniform vec2  u_offset;
-uniform vec3  u_color;
 uniform float u_opacity;
 
-uniform float u_bound;
+// Legacy single-color smin path.
+uniform vec3  u_color;
 uniform float u_sminK;
+
+uniform float u_bound;
 uniform int   u_pathCount;
 uniform sampler2D u_sdf0;
 uniform sampler2D u_sdf1;
@@ -154,31 +168,70 @@ uniform vec2 u_pathOffset3;
 uniform vec2  u_cursor;
 uniform float u_cursorPull;
 uniform float u_cursorRadius;
-uniform vec4  u_ripples[4]; // (x, y, age, amplitude) per slot
+uniform vec4  u_ripples[4];  // (x, y, age, amplitude) per slot
+
+// Per-path composite uniforms (only meaningful when u_compositeMode != 0).
+uniform int   u_compositeMode;
+uniform ivec4 u_pathMode;            // 0=fill, 1=stroke, 2=both
+uniform vec4  u_pathStrokeHalfW;
+uniform vec4  u_pathFillOpacity;
+uniform vec4  u_pathStrokeOpacity;
+uniform vec3  u_pathFillColor0;
+uniform vec3  u_pathFillColor1;
+uniform vec3  u_pathFillColor2;
+uniform vec3  u_pathFillColor3;
+uniform vec3  u_pathStrokeColor0;
+uniform vec3  u_pathStrokeColor1;
+uniform vec3  u_pathStrokeColor2;
+uniform vec3  u_pathStrokeColor3;
 
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
 }
 
-float sampleAt(sampler2D sdf, vec2 uv, vec2 pathOffset) {
-  vec2 local = uv - pathOffset;
+float sampleIdx(int i, vec2 uv) {
+  // Unrolled per-index fetch — GLSL ES 1.00 disallows dynamic indexing
+  // of sampler arrays, and per-path offsets are kept as peer uniforms
+  // so all four have the same packing.
+  vec2 po = u_pathOffset0;
+  if (i == 1) po = u_pathOffset1;
+  else if (i == 2) po = u_pathOffset2;
+  else if (i == 3) po = u_pathOffset3;
+  vec2 local = uv - po;
   vec2 t = clamp((local / u_bound) * 0.5 + 0.5, 0.0, 1.0);
-  return texture2D(sdf, t).r;
+  if (i == 0) return texture2D(u_sdf0, t).r;
+  if (i == 1) return texture2D(u_sdf1, t).r;
+  if (i == 2) return texture2D(u_sdf2, t).r;
+  return texture2D(u_sdf3, t).r;
 }
 
-void main() {
-  vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
-  uv *= 2.0 / u_zoom;
-  uv -= u_offset;
+vec3 fillColorIdx(int i) {
+  if (i == 0) return u_pathFillColor0;
+  if (i == 1) return u_pathFillColor1;
+  if (i == 2) return u_pathFillColor2;
+  return u_pathFillColor3;
+}
+vec3 strokeColorIdx(int i) {
+  if (i == 0) return u_pathStrokeColor0;
+  if (i == 1) return u_pathStrokeColor1;
+  if (i == 2) return u_pathStrokeColor2;
+  return u_pathStrokeColor3;
+}
+float v4Idx(vec4 v, int i) {
+  if (i == 0) return v.x;
+  if (i == 1) return v.y;
+  if (i == 2) return v.z;
+  return v.w;
+}
+int i4Idx(ivec4 v, int i) {
+  if (i == 0) return v.x;
+  if (i == 1) return v.y;
+  if (i == 2) return v.z;
+  return v.w;
+}
 
-  float k = max(u_sminK, 1e-4);
-  // Seed with path 0 (always present). Union successive paths in.
-  float d = sampleAt(u_sdf0, uv, u_pathOffset0);
-  if (u_pathCount > 1) d = smin(d, sampleAt(u_sdf1, uv, u_pathOffset1), k);
-  if (u_pathCount > 2) d = smin(d, sampleAt(u_sdf2, uv, u_pathOffset2), k);
-  if (u_pathCount > 3) d = smin(d, sampleAt(u_sdf3, uv, u_pathOffset3), k);
-
+void applyDistEffects(inout float d, vec2 uv) {
   // Liquid-cursor pull — subtract an inverse-square radial field from the
   // scene SDF. Locally reduces the distance value, so the zero-contour
   // (the silhouette edge) bulges out toward the cursor and fuses with it
@@ -197,10 +250,55 @@ void main() {
     float rp = (rd - r.z) / RIPPLE_WIDTH;
     d -= r.w * exp(-rp * rp);
   }
+}
 
-  float aa = fwidth(d) * 1.2;
-  float mask = 1.0 - smoothstep(-aa, aa, d);
-  gl_FragColor = vec4(u_color, mask * u_opacity);
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
+  uv *= 2.0 / u_zoom;
+  uv -= u_offset;
+
+  if (u_compositeMode == 0) {
+    float k = max(u_sminK, 1e-4);
+    float d = sampleIdx(0, uv);
+    if (u_pathCount > 1) d = smin(d, sampleIdx(1, uv), k);
+    if (u_pathCount > 2) d = smin(d, sampleIdx(2, uv), k);
+    if (u_pathCount > 3) d = smin(d, sampleIdx(3, uv), k);
+    applyDistEffects(d, uv);
+    float aa = fwidth(d) * 1.2;
+    float mask = 1.0 - smoothstep(-aa, aa, d);
+    gl_FragColor = vec4(u_color, mask * u_opacity);
+    return;
+  }
+
+  // Per-path composite: accumulate with Porter-Duff "over" in premultiplied
+  // alpha, convert back to straight alpha for the straight-alpha blend
+  // func configured on the GL context.
+  vec4 acc = vec4(0.0);
+  for (int i = 0; i < 4; i++) {
+    if (i >= u_pathCount) break;
+    float d = sampleIdx(i, uv);
+    applyDistEffects(d, uv);
+    int mode = i4Idx(u_pathMode, i);
+    float aa = fwidth(d) * 1.2;
+
+    // Fill layer (mode 0 or 2).
+    if (mode != 1) {
+      float a = (1.0 - smoothstep(-aa, aa, d)) * v4Idx(u_pathFillOpacity, i);
+      vec4 src = vec4(fillColorIdx(i) * a, a);
+      acc = src + acc * (1.0 - src.a);
+    }
+    // Stroke layer (mode 1 or 2).
+    if (mode != 0) {
+      float halfW = v4Idx(u_pathStrokeHalfW, i);
+      float de = abs(d) - halfW;
+      float aaS = fwidth(de) * 1.2;
+      float a = (1.0 - smoothstep(-aaS, aaS, de)) * v4Idx(u_pathStrokeOpacity, i);
+      vec4 src = vec4(strokeColorIdx(i) * a, a);
+      acc = src + acc * (1.0 - src.a);
+    }
+  }
+  vec3 rgb = acc.a > 1e-6 ? acc.rgb / acc.a : vec3(0.0);
+  gl_FragColor = vec4(rgb, acc.a * u_opacity);
 }
 `;
 

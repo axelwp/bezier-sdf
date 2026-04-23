@@ -1,4 +1,4 @@
-import type { Mark, CubicSegment } from './types';
+import type { Mark, CubicSegment, Path } from './types';
 
 export interface NormalizeOptions {
   /**
@@ -43,20 +43,30 @@ export interface NormalizedMark {
 export function normalizeMark(source: Mark, options: NormalizeOptions = {}): NormalizedMark {
   const { extent = 0.95, flipY = true } = options;
 
-  // Compute bbox from endpoints (P0 and P3). Control points can lie
-  // slightly outside; in practice they rarely extend the visible shape.
+  // Compute bbox from endpoints (P0 and P3), expanded per-path by the
+  // stroke half-width so stroked paths don't end up with their outer
+  // edge outside the normalized target range (which would clip against
+  // the canvas at zoom=1). Control points can lie slightly outside the
+  // endpoint bbox but rarely extend the visible shape.
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const path of source.paths) {
-    for (const seg of path) {
+    const hw = path.mode === 'fill' ? 0 : path.strokeWidth * 0.5;
+    let pMinX = Infinity, pMinY = Infinity, pMaxX = -Infinity, pMaxY = -Infinity;
+    for (const seg of path.segments) {
       for (const i of [0, 6] as const) {
         const x = seg[i]!;
         const y = seg[i + 1]!;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
+        if (x < pMinX) pMinX = x;
+        if (x > pMaxX) pMaxX = x;
+        if (y < pMinY) pMinY = y;
+        if (y > pMaxY) pMaxY = y;
       }
     }
+    if (!isFinite(pMinX)) continue;
+    if (pMinX - hw < minX) minX = pMinX - hw;
+    if (pMaxX + hw > maxX) maxX = pMaxX + hw;
+    if (pMinY - hw < minY) minY = pMinY - hw;
+    if (pMaxY + hw > maxY) maxY = pMaxY + hw;
   }
   if (!isFinite(minX)) {
     // Empty mark — return unchanged to avoid NaN propagation.
@@ -79,15 +89,19 @@ export function normalizeMark(source: Mark, options: NormalizeOptions = {}): Nor
     (y - centerY) * scale * ySign,
   ];
 
-  const paths = source.paths.map((path) =>
-    path.map((seg): CubicSegment => {
+  const paths: Path[] = source.paths.map((path): Path => {
+    const segments = path.segments.map((seg): CubicSegment => {
       const [p0x, p0y] = transform(seg[0]!, seg[1]!);
       const [p1x, p1y] = transform(seg[2]!, seg[3]!);
       const [p2x, p2y] = transform(seg[4]!, seg[5]!);
       const [p3x, p3y] = transform(seg[6]!, seg[7]!);
       return [p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y];
-    }),
-  );
+    });
+    // Stroke width lives in the same coordinate system as the points, so
+    // scaling the geometry means scaling the stroke by the same factor.
+    // flipY affects orientation, never width, so it isn't applied here.
+    return { ...path, segments, strokeWidth: path.strokeWidth * scale };
+  });
 
   return {
     mark: { paths },

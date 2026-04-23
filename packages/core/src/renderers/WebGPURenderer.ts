@@ -13,30 +13,34 @@ const MAX_SEGS = 32;
 
 /**
  * Uniform buffer layout — matches the WGSL `Uniforms` struct in
- * shaders/webgpu.ts. vec3<f32> has align 16 but size 12; pathOffset3
- * naturally ends at 64 so no extra padding is needed before `color`.
+ * shaders/webgpu.ts. Offsets are computed per the WGSL alignment rules
+ * (vec3<f32> has align 16 / size 12; array<vec4> has 16-byte stride).
  *
- *   resolution   : vec2<f32>   // 0   (8)
- *   zoom         : f32         // 8   (4)
- *   sminK        : f32         // 12  (4)
- *   offset       : vec2<f32>   // 16  (8)
- *   _pad0        : vec2<f32>   // 24  (8)
- *   pathOffset0  : vec2<f32>   // 32  (8)
- *   pathOffset1  : vec2<f32>   // 40  (8)
- *   pathOffset2  : vec2<f32>   // 48  (8)
- *   pathOffset3  : vec2<f32>   // 56  (8)
- *   color        : vec3<f32>   // 64  (12)
- *   opacity      : f32         // 76  (4)
- *   bound        : f32         // 80  (4)
- *   pathCount    : u32         // 84  (4)
- *   cursor          : vec2<f32>    // 88   (8)
- *   cursorPull      : f32          // 96   (4)
- *   cursorRadius    : f32          // 100  (4)
- *   _padR           : vec2<f32>    // 104  (8) — array<vec4> is 16-byte aligned
- *   ripples[0..3]   : vec4<f32>[4] // 112  (64) — 16-byte stride, (x,y,age,amp)
- * Total: 176 bytes, 16-aligned.
+ *   resolution      : vec2<f32>        // 0   (8)
+ *   zoom            : f32              // 8   (4)
+ *   sminK           : f32              // 12  (4)
+ *   offset          : vec2<f32>        // 16  (8)
+ *   compositeMode   : u32              // 24  (4)
+ *   _pad0           : u32              // 28  (4)
+ *   pathOffset0..3  : vec2<f32>[4]     // 32  (32)
+ *   color           : vec3<f32>        // 64  (12)
+ *   opacity         : f32              // 76  (4)
+ *   bound           : f32              // 80  (4)
+ *   pathCount       : u32              // 84  (4)
+ *   cursor          : vec2<f32>        // 88  (8)
+ *   cursorPull      : f32              // 96  (4)
+ *   cursorRadius    : f32              // 100 (4)
+ *   _padR           : vec2<f32>        // 104 (8)
+ *   ripples[0..3]   : vec4<f32>[4]     // 112 (64)
+ *   pathMode        : vec4<u32>        // 176 (16)
+ *   pathStrokeHalfW : vec4<f32>        // 192 (16)
+ *   pathFillOpacity : vec4<f32>        // 208 (16)
+ *   pathStrokeOpacity:vec4<f32>        // 224 (16)
+ *   pathFillColor   : vec4<f32>[4]     // 240 (64)
+ *   pathStrokeColor : vec4<f32>[4]     // 304 (64)
+ * Total: 368 bytes, 16-aligned.
  */
-const UNIFORM_BUFFER_SIZE = 176;
+const UNIFORM_BUFFER_SIZE = 368;
 
 export class WebGPURenderer implements Renderer {
   readonly kind = 'webgpu' as const;
@@ -179,9 +183,10 @@ export class WebGPURenderer implements Renderer {
     bindGroupLayout: GPUBindGroupLayout,
     path: Path,
   ): GPUTexture {
-    const segFloats = new Float32Array(path.length * 8);
-    for (let i = 0; i < path.length; i++) {
-      segFloats.set(path[i] as unknown as ArrayLike<number>, i * 8);
+    const segs = path.segments;
+    const segFloats = new Float32Array(segs.length * 8);
+    for (let i = 0; i < segs.length; i++) {
+      segFloats.set(segs[i] as unknown as ArrayLike<number>, i * 8);
     }
     const segmentBuffer = device.createBuffer({
       size: segFloats.byteLength,
@@ -222,14 +227,26 @@ export class WebGPURenderer implements Renderer {
     const { device, context, samplePipeline, uniformBuffer, sampleBindGroup } = this;
     if (!device || !context || !samplePipeline || !uniformBuffer || !sampleBindGroup || this.disposed) return;
 
+    const perPath =
+      u.pathModes !== undefined ||
+      u.pathFillColors !== undefined ||
+      u.pathStrokeColors !== undefined ||
+      u.pathStrokeHalfW !== undefined;
+
     const view = new DataView(this.uniformData);
+    // Zero-fill between writes so stale data from prior frames doesn't
+    // leak (e.g. ripple slots that weren't re-populated).
+    new Uint8Array(this.uniformData).fill(0);
+
     view.setFloat32(0,  u.width,    true);
     view.setFloat32(4,  u.height,   true);
     view.setFloat32(8,  u.zoom,     true);
     view.setFloat32(12, u.sminK,    true);
     view.setFloat32(16, u.offsetX,  true);
     view.setFloat32(20, u.offsetY,  true);
-    // 24-31: _pad0
+    view.setUint32(24, perPath ? 1 : 0, true);
+    // 28: _pad0
+
     const writeOff = (slot: number, off?: readonly [number, number]) => {
       const base = 32 + slot * 8;
       view.setFloat32(base,     off ? off[0] : 0, true);
@@ -250,7 +267,7 @@ export class WebGPURenderer implements Renderer {
     view.setFloat32(92, cursor[1], true);
     view.setFloat32(96, u.cursorPull ?? 0, true);
     view.setFloat32(100, u.cursorRadius ?? 1, true);
-    // ripples[0..3] at 112..176, zero-fill missing slots.
+    // ripples[0..3] at 112..176.
     const ripples = u.ripples;
     for (let i = 0; i < 4; i++) {
       const r = ripples?.[i];
@@ -260,6 +277,38 @@ export class WebGPURenderer implements Renderer {
       view.setFloat32(base + 8,  r ? r[2] : 0, true);
       view.setFloat32(base + 12, r ? r[3] : 0, true);
     }
+
+    if (perPath) {
+      const modes = u.pathModes ?? [];
+      for (let i = 0; i < 4; i++) {
+        const m = modes[i];
+        const v = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
+        view.setUint32(176 + i * 4, v, true);
+      }
+      const halfW = u.pathStrokeHalfW ?? [];
+      for (let i = 0; i < 4; i++) view.setFloat32(192 + i * 4, halfW[i] ?? 0, true);
+      const fo = u.pathFillOpacity ?? [];
+      for (let i = 0; i < 4; i++) view.setFloat32(208 + i * 4, fo[i] ?? 1, true);
+      const so = u.pathStrokeOpacity ?? [];
+      for (let i = 0; i < 4; i++) view.setFloat32(224 + i * 4, so[i] ?? 1, true);
+      const fc = u.pathFillColors;
+      for (let i = 0; i < 4; i++) {
+        const c = fc?.[i];
+        const base = 240 + i * 16;
+        view.setFloat32(base,      c?.[0] ?? 0, true);
+        view.setFloat32(base + 4,  c?.[1] ?? 0, true);
+        view.setFloat32(base + 8,  c?.[2] ?? 0, true);
+      }
+      const sc = u.pathStrokeColors;
+      for (let i = 0; i < 4; i++) {
+        const c = sc?.[i];
+        const base = 304 + i * 16;
+        view.setFloat32(base,      c?.[0] ?? 0, true);
+        view.setFloat32(base + 4,  c?.[1] ?? 0, true);
+        view.setFloat32(base + 8,  c?.[2] ?? 0, true);
+      }
+    }
+
     device.queue.writeBuffer(uniformBuffer, 0, this.uniformData);
 
     const encoder = device.createCommandEncoder();

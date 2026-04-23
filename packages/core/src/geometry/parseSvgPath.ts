@@ -1,4 +1,4 @@
-import type { CubicSegment, Path, Mark } from './types';
+import { type CubicSegment, type Mark, makePath } from './types';
 
 /**
  * Parse an SVG path data string into one or more {@link Path}s of cubic
@@ -38,7 +38,7 @@ export function parseSvgPath(d: string): Mark {
     lastQuadC1: null,
   };
 
-  const paths: Path[] = [];
+  const paths: CubicSegment[][] = [];
   let current: CubicSegment[] | null = null;
   let cmd: string | null = null;
 
@@ -177,7 +177,7 @@ export function parseSvgPath(d: string): Mark {
     }
   }
 
-  return { paths: paths.filter((p) => p.length > 0) };
+  return { paths: paths.filter((p) => p.length > 0).map((segs) => makePath(segs)) };
 }
 
 /* -------------------------------------------------------------------------- */

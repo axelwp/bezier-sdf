@@ -1,6 +1,8 @@
-export type { CubicSegment, Path, Mark } from './types';
-export { mark } from './types';
+export type { CubicSegment, Path, PathMode, RgbColor, Mark } from './types';
+export { makePath, mark } from './types';
 export { LEFT_CHEVRON, RIGHT_CHEVRON, DEMO_MARK } from './default-mark';
 export { parseSvgPath } from './parseSvgPath';
+export { parseSvgDocument } from './parseSvgDocument';
+export { parseColor, parseColorAlpha, type RgbTriple } from './parseColor';
 export { normalizeMark, type NormalizeOptions, type NormalizedMark } from './normalize';
 export { sampleBezierPath, evalCubic } from './sampling';

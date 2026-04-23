@@ -1,6 +1,8 @@
 /**
  * WGSL shaders for the WebGPU renderer. Same algorithm as the GLSL
- * version — bake SDFs per path, then sample + smooth-union at runtime.
+ * version — bake SDFs per path, then sample + either smooth-union
+ * (legacy single-color mode used by the reveal example) or composite
+ * per-path fill/stroke layers (used for arbitrary user SVGs).
  */
 
 export const WEBGPU_BAKE_SIZE = 1024;
@@ -116,8 +118,15 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 /**
  * Sample shader. Fixed-count texture bindings (4) because WGSL doesn't
  * let us index sampler arrays at draw time on all platforms. Unused
- * slots are still bound (to a 1x1 dummy) but u_pathCount gates the
- * smooth-union loop.
+ * slots are still bound (to a 1x1 dummy) but pathCount gates the
+ * composition loop.
+ *
+ * Two composition modes, selected by `compositeMode`:
+ *   0 — legacy: smooth-union all paths, paint in `color`. Used by the
+ *       reveal example so split sub-paths morph as one shape.
+ *   1 — per-path: composite fill/stroke layers per path in document
+ *       order ("over" operator). Used for arbitrary user SVGs. smin is
+ *       not applied across paths in this mode; see KNOWN_LIMITATIONS.md.
  */
 export const WEBGPU_SAMPLE_SHADER = /* wgsl */ `
 struct Uniforms {
@@ -125,7 +134,8 @@ struct Uniforms {
   zoom: f32,
   sminK: f32,
   offset: vec2<f32>,
-  _pad0: vec2<f32>,
+  compositeMode: u32,
+  _pad0: u32,
   pathOffset0: vec2<f32>,
   pathOffset1: vec2<f32>,
   pathOffset2: vec2<f32>,
@@ -137,8 +147,14 @@ struct Uniforms {
   cursor: vec2<f32>,
   cursorPull: f32,
   cursorRadius: f32,
-  _padR: vec2<f32>,             // explicit pad — array<vec4> needs 16-byte align
-  ripples: array<vec4<f32>, 4>, // (x, y, age, amplitude) per slot
+  _padR: vec2<f32>,
+  ripples: array<vec4<f32>, 4>,
+  pathMode: vec4<u32>,
+  pathStrokeHalfW: vec4<f32>,
+  pathFillOpacity: vec4<f32>,
+  pathStrokeOpacity: vec4<f32>,
+  pathFillColor: array<vec4<f32>, 4>,
+  pathStrokeColor: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -169,10 +185,31 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
   return min(a, b) - h * h * k * 0.25;
 }
 
-fn sampleAt(tex: texture_2d<f32>, uv: vec2<f32>, pathOffset: vec2<f32>) -> f32 {
-  let local = uv - pathOffset;
+fn sampleIdx(i: u32, uv: vec2<f32>) -> f32 {
+  var po = U.pathOffset0;
+  if (i == 1u) { po = U.pathOffset1; }
+  else if (i == 2u) { po = U.pathOffset2; }
+  else if (i == 3u) { po = U.pathOffset3; }
+  let local = uv - po;
   let t = clamp((local / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-  return textureSample(tex, samp, t).r;
+  if (i == 0u) { return textureSample(tex0, samp, t).r; }
+  if (i == 1u) { return textureSample(tex1, samp, t).r; }
+  if (i == 2u) { return textureSample(tex2, samp, t).r; }
+  return textureSample(tex3, samp, t).r;
+}
+
+fn applyDistEffects(d0: f32, uv: vec2<f32>) -> f32 {
+  var d = d0;
+  let toCursor = U.cursor - uv;
+  d = d - U.cursorPull / (dot(toCursor, toCursor) + U.cursorRadius);
+  let RIPPLE_WIDTH: f32 = 0.12;
+  for (var i: i32 = 0; i < 4; i = i + 1) {
+    let r = U.ripples[i];
+    let rd = length(uv - r.xy);
+    let rp = (rd - r.z) / RIPPLE_WIDTH;
+    d = d - r.w * exp(-rp * rp);
+  }
+  return d;
 }
 
 @fragment
@@ -183,33 +220,46 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv * (2.0 / U.zoom);
   uv = uv - U.offset;
 
-  let k = max(U.sminK, 1e-4);
-  var d = sampleAt(tex0, uv, U.pathOffset0);
-  if (U.pathCount > 1u) { d = smin(d, sampleAt(tex1, uv, U.pathOffset1), k); }
-  if (U.pathCount > 2u) { d = smin(d, sampleAt(tex2, uv, U.pathOffset2), k); }
-  if (U.pathCount > 3u) { d = smin(d, sampleAt(tex3, uv, U.pathOffset3), k); }
-
-  // Liquid-cursor pull — subtract an inverse-square radial field from the
-  // scene SDF. Locally reduces the distance value, so the zero-contour
-  // (the silhouette edge) bulges out toward the cursor and fuses with it
-  // when close. cursorPull=0 disables; cursorRadius is a softening
-  // epsilon (smaller = sharper/narrower tendril).
-  let toCursor = U.cursor - uv;
-  d = d - U.cursorPull / (dot(toCursor, toCursor) + U.cursorRadius);
-
-  // Up to 4 concurrent shockwave rings. JS advances each ring's radius
-  // (ripples[i].z) and tapers its amplitude (ripples[i].w) independently.
-  // Dead slots (amplitude=0) contribute nothing.
-  let RIPPLE_WIDTH: f32 = 0.12;
-  for (var i: i32 = 0; i < 4; i = i + 1) {
-    let r = U.ripples[i];
-    let rd = length(uv - r.xy);
-    let rp = (rd - r.z) / RIPPLE_WIDTH;
-    d = d - r.w * exp(-rp * rp);
+  if (U.compositeMode == 0u) {
+    let k = max(U.sminK, 1e-4);
+    var d = sampleIdx(0u, uv);
+    if (U.pathCount > 1u) { d = smin(d, sampleIdx(1u, uv), k); }
+    if (U.pathCount > 2u) { d = smin(d, sampleIdx(2u, uv), k); }
+    if (U.pathCount > 3u) { d = smin(d, sampleIdx(3u, uv), k); }
+    d = applyDistEffects(d, uv);
+    let aa = fwidth(d) * 1.2;
+    let mask = 1.0 - smoothstep(-aa, aa, d);
+    return vec4<f32>(U.color, mask * U.opacity);
   }
 
-  let aa = fwidth(d) * 1.2;
-  let mask = 1.0 - smoothstep(-aa, aa, d);
-  return vec4<f32>(U.color, mask * U.opacity);
+  // Per-path composite: accumulate with Porter-Duff "over" in premultiplied
+  // alpha, convert back to straight alpha at the end.
+  var acc = vec4<f32>(0.0);
+  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+    if (i >= U.pathCount) { break; }
+    var d = sampleIdx(i, uv);
+    d = applyDistEffects(d, uv);
+    let mode = U.pathMode[i];
+    let aa = fwidth(d) * 1.2;
+
+    // Fill layer (mode 0 or 2).
+    if (mode != 1u) {
+      let a = (1.0 - smoothstep(-aa, aa, d)) * U.pathFillOpacity[i];
+      let src = vec4<f32>(U.pathFillColor[i].rgb * a, a);
+      acc = src + acc * (1.0 - src.a);
+    }
+    // Stroke layer (mode 1 or 2).
+    if (mode != 0u) {
+      let halfW = U.pathStrokeHalfW[i];
+      let de = abs(d) - halfW;
+      let aaS = fwidth(de) * 1.2;
+      let a = (1.0 - smoothstep(-aaS, aaS, de)) * U.pathStrokeOpacity[i];
+      let src = vec4<f32>(U.pathStrokeColor[i].rgb * a, a);
+      acc = src + acc * (1.0 - src.a);
+    }
+  }
+  var rgb = vec3<f32>(0.0);
+  if (acc.a > 1e-6) { rgb = acc.rgb / acc.a; }
+  return vec4<f32>(rgb, acc.a * U.opacity);
 }
 `;

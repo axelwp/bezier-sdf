@@ -15,7 +15,8 @@ interface CardSpec {
   id: string;
   number: string;
   title: string;
-  color: string;
+  /** Omit to render with the SVG's own per-path fill/stroke paint. */
+  color?: string;
   effect: BezierLogoProps['effect'];
   autoPlay?: boolean;
   code: string;
@@ -77,6 +78,14 @@ const CARDS: CardSpec[] = [
     effect: 'reveal',
     code: `<BezierLogo effect="reveal" />`,
     hint: 'scrolls into view',
+  },
+  {
+    id: 'native-paint',
+    number: '07',
+    title: 'Native SVG paint',
+    effect: 'none',
+    code: `<BezierLogo src={src} />`,
+    hint: 'omits color — per-path fills/strokes',
   },
 ];
 

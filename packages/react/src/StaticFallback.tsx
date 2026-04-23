@@ -1,9 +1,10 @@
 import type { CSSProperties } from 'react';
-import type { Mark } from '@bezier-sdf/core';
+import type { Mark, Path, RgbColor } from '@bezier-sdf/core';
 
 export interface StaticFallbackProps {
   mark: Mark;
-  color: string;
+  /** Optional global color override. When omitted, per-path SVG colors are used. */
+  color?: string;
   opacity: number;
   className?: string;
   style?: CSSProperties;
@@ -17,9 +18,7 @@ export interface StaticFallbackProps {
  *
  * The mark is already in normalized `[-1, 1]` shader space (y-up). We
  * negate Y per-point so the SVG viewBox (y-down) produces the same visual
- * orientation as the GPU render. `preserveAspectRatio="xMidYMid meet"`
- * matches the GPU path's aspect behavior — the silhouette fits inside the
- * container without distortion.
+ * orientation as the GPU render.
  */
 export function StaticFallback({
   mark,
@@ -29,7 +28,6 @@ export function StaticFallback({
   style,
   ariaLabel,
 }: StaticFallbackProps) {
-  const d = markToSvgPath(mark);
   return (
     <svg
       className={className}
@@ -39,25 +37,72 @@ export function StaticFallback({
       role={ariaLabel ? 'img' : 'presentation'}
       aria-label={ariaLabel}
     >
-      <path d={d} fill={color} opacity={opacity} fillRule="evenodd" />
+      {mark.paths.map((p, i) => renderPath(p, i, color, opacity))}
     </svg>
   );
 }
 
-function markToSvgPath(mark: Mark): string {
-  const parts: string[] = [];
-  for (const path of mark.paths) {
-    if (path.length === 0) continue;
-    const first = path[0]!;
-    parts.push(`M ${fmt(first[0]!)} ${fmt(-first[1]!)}`);
-    for (const seg of path) {
-      parts.push(
-        `C ${fmt(seg[2]!)} ${fmt(-seg[3]!)} ${fmt(seg[4]!)} ${fmt(-seg[5]!)} ${fmt(seg[6]!)} ${fmt(-seg[7]!)}`,
-      );
-    }
-    parts.push('Z');
+function renderPath(path: Path, key: number, globalColor: string | undefined, opacity: number) {
+  const d = pathToSvgD(path);
+  if (!d) return null;
+
+  // When the caller supplied a global color override, every path inherits
+  // it — matches the GPU legacy mode.
+  if (globalColor !== undefined) {
+    return (
+      <path
+        key={key}
+        d={d}
+        fill={path.mode === 'stroke' ? 'none' : globalColor}
+        stroke={path.mode !== 'fill' ? globalColor : 'none'}
+        strokeWidth={path.mode !== 'fill' ? path.strokeWidth : undefined}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fillRule="evenodd"
+        opacity={opacity}
+      />
+    );
   }
+
+  // Per-path SVG paint.
+  const wantFill   = path.mode !== 'stroke';
+  const wantStroke = path.mode !== 'fill';
+  return (
+    <path
+      key={key}
+      d={d}
+      fill={wantFill ? rgbToHex(path.fillColor) : 'none'}
+      fillOpacity={wantFill ? path.fillOpacity * opacity : undefined}
+      stroke={wantStroke ? rgbToHex(path.strokeColor) : 'none'}
+      strokeOpacity={wantStroke ? path.strokeOpacity * opacity : undefined}
+      strokeWidth={wantStroke ? path.strokeWidth : undefined}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fillRule="evenodd"
+    />
+  );
+}
+
+function pathToSvgD(path: Path): string {
+  const segs = path.segments;
+  if (segs.length === 0) return '';
+  const first = segs[0]!;
+  const parts: string[] = [`M ${fmt(first[0]!)} ${fmt(-first[1]!)}`];
+  for (const seg of segs) {
+    parts.push(
+      `C ${fmt(seg[2]!)} ${fmt(-seg[3]!)} ${fmt(seg[4]!)} ${fmt(-seg[5]!)} ${fmt(seg[6]!)} ${fmt(-seg[7]!)}`,
+    );
+  }
+  // Only close fills — leaving stroked open paths unclosed matches the
+  // GPU's stroke mode, which renders `|d| < halfWidth` on the curve set
+  // without an implicit closing segment.
+  if (path.mode !== 'stroke') parts.push('Z');
   return parts.join(' ');
+}
+
+function rgbToHex(c: RgbColor): string {
+  const h = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0');
+  return `#${h(c[0])}${h(c[1])}${h(c[2])}`;
 }
 
 function fmt(n: number): string {

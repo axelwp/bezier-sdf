@@ -2,6 +2,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -9,7 +10,9 @@ import {
 import {
   createRenderer,
   type Mark,
+  type PathMode,
   type Renderer,
+  type RgbColor,
 } from '@bezier-sdf/core';
 import { loadMark } from './svg-cache';
 import { parseColor } from './parseColor';
@@ -44,7 +47,11 @@ export interface BezierLogoHandle {
 export interface BezierLogoProps {
   /** URL (or data URI) of the SVG to trace. */
   src: string;
-  /** Any CSS color string. Defaults to `#000`. */
+  /**
+   * Optional global color override. When set, every path is painted with
+   * this color (smooth-union mode, matches the reveal example). Omit to
+   * honor the SVG's own per-path fill/stroke colors.
+   */
   color?: string;
   /** 0..1 opacity multiplier applied on top of any effect opacity. */
   opacity?: number;
@@ -144,6 +151,27 @@ function eventToSdfSpace(
   ];
 }
 
+interface PerPathUniforms {
+  pathModes: PathMode[];
+  pathStrokeHalfW: number[];
+  pathFillColors: RgbColor[];
+  pathStrokeColors: RgbColor[];
+  pathFillOpacity: number[];
+  pathStrokeOpacity: number[];
+}
+
+function buildPerPath(mark: Mark): PerPathUniforms {
+  return {
+    pathModes: mark.paths.map((p) => p.mode),
+    // shader expects half-width.
+    pathStrokeHalfW: mark.paths.map((p) => p.strokeWidth * 0.5),
+    pathFillColors: mark.paths.map((p) => p.fillColor),
+    pathStrokeColors: mark.paths.map((p) => p.strokeColor),
+    pathFillOpacity: mark.paths.map((p) => p.fillOpacity),
+    pathStrokeOpacity: mark.paths.map((p) => p.strokeOpacity),
+  };
+}
+
 /**
  * Drop-in GPU logo. Handles fetch, parse, normalization, DPR, resize,
  * WebGPU→WebGL→SVG fallback, optional intro and interactive effects, and
@@ -154,7 +182,7 @@ function eventToSdfSpace(
 export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function BezierLogo(
   {
     src,
-    color = '#000',
+    color,
     opacity = 1,
     effect = 'none',
     autoPlay = false,
@@ -174,11 +202,16 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
   const [mark, setMark] = useState<Mark | null>(null);
   const [fallback, setFallback] = useState(false);
 
+  // Per-path uniforms derived from the mark. Stable across re-renders so
+  // the rAF loop can read them without tearing.
+  const perPath = useMemo(() => (mark ? buildPerPath(mark) : null), [mark]);
+
   // Latest props + mutable loop state. Updated on every render so the rAF
   // loop sees fresh color/opacity without forcing a re-init.
   const stateRef = useRef({
     color,
     opacity,
+    perPath,
     pauseWhenOffscreen,
     rafId: 0,
     visible: true,
@@ -187,6 +220,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
   });
   stateRef.current.color = color;
   stateRef.current.opacity = opacity;
+  stateRef.current.perPath = perPath;
   stateRef.current.pauseWhenOffscreen = pauseWhenOffscreen;
 
   useImperativeHandle(ref, () => ({
@@ -252,23 +286,67 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       if (!r) return true;
       const frame =
         runtimes.length > 0 ? mergeFrames(runtimes.map((rt) => rt.frame(now))) : null;
-      const [cr, cg, cb] = parseColor(state.color);
       const offsets = frame?.pathOffsets ?? zeroOffsets(r.pathCount);
-      r.render({
-        width: canvas.width,
-        height: canvas.height,
-        zoom: 1,
-        sminK: frame?.sminK ?? DEFAULT_SMIN_K,
-        offsetX: 0,
-        offsetY: 0,
-        pathOffsets: offsets,
-        color: [cr, cg, cb],
-        opacity: (frame?.opacity ?? 1) * state.opacity,
-        cursor: frame?.cursor,
-        cursorPull: frame?.cursorPull,
-        cursorRadius: frame?.cursorRadius,
-        ripples: frame?.ripples,
-      });
+      const base = state.perPath;
+
+      // Rule: `color` tints only when the mark is all-fill paths (the
+      // reveal example, single-color logos). The moment an SVG carries
+      // a stroke anywhere, it's a "real" SVG — render it exactly as
+      // drawn, `color` is ignored. Avoids recoloring an icon into
+      // something its author didn't intend.
+      const allFill = base ? base.pathModes.every((m) => m === 'fill') : true;
+      const useLegacy = allFill && state.color !== undefined;
+
+      if (useLegacy) {
+        const [cr, cg, cb] = parseColor(state.color!);
+        r.render({
+          width: canvas.width,
+          height: canvas.height,
+          zoom: 1,
+          sminK: frame?.sminK ?? DEFAULT_SMIN_K,
+          offsetX: 0,
+          offsetY: 0,
+          pathOffsets: offsets,
+          color: [cr, cg, cb],
+          opacity: (frame?.opacity ?? 1) * state.opacity,
+          cursor: frame?.cursor,
+          cursorPull: frame?.cursorPull,
+          cursorRadius: frame?.cursorRadius,
+          ripples: frame?.ripples,
+        });
+      } else {
+        // Per-path composite using the SVG's own paint. `color` is
+        // intentionally ignored here.
+        const perPath = base ?? {
+          pathModes: [] as PathMode[],
+          pathStrokeHalfW: [] as number[],
+          pathFillColors: [] as RgbColor[],
+          pathStrokeColors: [] as RgbColor[],
+          pathFillOpacity: [] as number[],
+          pathStrokeOpacity: [] as number[],
+        };
+        r.render({
+          width: canvas.width,
+          height: canvas.height,
+          zoom: 1,
+          sminK: frame?.sminK ?? DEFAULT_SMIN_K,
+          offsetX: 0,
+          offsetY: 0,
+          pathOffsets: offsets,
+          color: [0, 0, 0],
+          opacity: (frame?.opacity ?? 1) * state.opacity,
+          cursor: frame?.cursor,
+          cursorPull: frame?.cursorPull,
+          cursorRadius: frame?.cursorRadius,
+          ripples: frame?.ripples,
+          pathModes: perPath.pathModes,
+          pathStrokeHalfW: perPath.pathStrokeHalfW,
+          pathFillColors: perPath.pathFillColors,
+          pathStrokeColors: perPath.pathStrokeColors,
+          pathFillOpacity: perPath.pathFillOpacity,
+          pathStrokeOpacity: perPath.pathStrokeOpacity,
+        });
+      }
       return runtimes.some((rt) => rt.active(now));
     };
 

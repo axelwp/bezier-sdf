@@ -1,4 +1,4 @@
-import { normalizeMark, parseSvgPath, type Mark } from '@bezier-sdf/core';
+import { normalizeMark, parseSvgDocument, type Mark } from '@bezier-sdf/core';
 
 /**
  * Cache of `src` → parsed, normalized Mark. Keyed by the exact `src` string
@@ -26,7 +26,8 @@ export function loadMark(src: string): Promise<Mark> {
       throw new Error(`failed to fetch ${src}: ${res.status} ${res.statusText}`);
     }
     const text = await res.text();
-    return parseSvgText(text);
+    const mark = parseSvgDocument(text, { maxPaths: 4 });
+    return normalizeMark(mark).mark;
   })();
 
   cache.set(src, p);
@@ -40,45 +41,4 @@ export function loadMark(src: string): Promise<Mark> {
 /** Visible mainly for tests and advanced users. */
 export function clearSvgCache(): void {
   cache.clear();
-}
-
-/**
- * Parse an SVG document's text, extract every `<path>` element's `d`
- * attribute, merge into one Mark, and normalize into the renderer's
- * `[-1, 1]` space with Y flipped.
- *
- * Non-path elements (`<rect>`, `<circle>`, `<polygon>`) are ignored for
- * now — future versions may convert them. The renderer's 4-path ceiling
- * is enforced here so the error surfaces with a clear message instead of
- * from deep inside the shader init.
- */
-function parseSvgText(text: string): Mark {
-  const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
-  const parseErr = doc.querySelector('parsererror');
-  if (parseErr) {
-    throw new Error(`SVG parse error: ${parseErr.textContent?.trim() ?? 'unknown'}`);
-  }
-  const pathEls = Array.from(doc.querySelectorAll('path'));
-  if (pathEls.length === 0) {
-    throw new Error('SVG contains no <path> elements — convert shapes to paths first.');
-  }
-
-  const paths = [];
-  for (const el of pathEls) {
-    const d = el.getAttribute('d');
-    if (!d) continue;
-    const sub = parseSvgPath(d);
-    for (const p of sub.paths) paths.push(p);
-  }
-  if (paths.length === 0) {
-    throw new Error('SVG <path> elements had no usable `d` data.');
-  }
-  if (paths.length > 4) {
-    throw new Error(
-      `SVG has ${paths.length} paths but @bezier-sdf/core supports at most 4. ` +
-        'Merge smaller paths together in your vector editor.',
-    );
-  }
-
-  return normalizeMark({ paths }).mark;
 }

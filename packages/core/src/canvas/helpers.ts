@@ -33,11 +33,11 @@ export function makeTransform(width: number, height: number, zoom = 1.0): ToCanv
  */
 export function buildPath2D(path: Path, toCanvas: ToCanvas): Path2D {
   const p2d = new Path2D();
-  const first = path[0];
+  const first = path.segments[0];
   if (!first) return p2d;
   const [sx, sy] = toCanvas(first[0]!, first[1]!);
   p2d.moveTo(sx, sy);
-  for (const seg of path) {
+  for (const seg of path.segments) {
     const [c1x, c1y] = toCanvas(seg[2]!, seg[3]!);
     const [c2x, c2y] = toCanvas(seg[4]!, seg[5]!);
     const [ex, ey]   = toCanvas(seg[6]!, seg[7]!);
@@ -144,17 +144,18 @@ export function perturbPath(
   timeMs: number,
   extraPhase = 0,
 ): void {
-  if (path.length === 0) return;
+  const segs = path.segments;
+  if (segs.length === 0) return;
   const osc1 = Math.sin(timeMs * seed.freq1 + seed.phase1 + extraPhase);
   const osc2 = Math.sin(timeMs * seed.freq2 + seed.phase2 + extraPhase);
   const amp = seed.amp;
 
-  const first: CubicSegment = path[0]!;
+  const first: CubicSegment = segs[0]!;
   const [sx, sy] = toCanvas(first[0]!, first[1]!);
   ctx.moveTo(sx, sy);
 
-  for (let k = 0; k < path.length; k++) {
-    const s: CubicSegment = path[k]!;
+  for (let k = 0; k < segs.length; k++) {
+    const s: CubicSegment = segs[k]!;
     // Per-segment phase adjustments so each segment's controls wobble
     // somewhat independently; keeps the perturbation from looking like
     // uniform "wind" pushing the whole shape in one direction.

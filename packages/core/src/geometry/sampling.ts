@@ -1,4 +1,4 @@
-import type { Path } from './types';
+import type { Path, CubicSegment } from './types';
 
 /**
  * Sample `count` points along a path, evenly spaced by segment parameter
@@ -16,11 +16,7 @@ import type { Path } from './types';
  *     (a chart, a sine wave, a straight line) into the shape.
  *   - Positioning elements along a path (particles, dots, labels).
  *
- * This is the building block behind the morph example in the `examples`
- * folder — sample chart-line positions and target-path positions at the
- * same `count`, then `lerp(chart, target, t)` frame-by-frame.
- *
- * @param path Source path (one or more cubics).
+ * @param path Source path.
  * @param count Number of points to sample. Must be >= 2.
  * @returns A Float32Array of length `count * 2` in `[x, y, x, y, ...]` order.
  */
@@ -28,11 +24,12 @@ export function sampleBezierPath(path: Path, count: number): Float32Array {
   if (count < 2) {
     throw new RangeError(`sampleBezierPath: count must be >= 2, got ${count}`);
   }
-  if (path.length === 0) {
+  const segs = path.segments;
+  if (segs.length === 0) {
     return new Float32Array(count * 2);
   }
   const pts = new Float32Array(count * 2);
-  const nSegs = path.length;
+  const nSegs = segs.length;
 
   for (let i = 0; i < count; i++) {
     // `fidx` maps [0, count-1] to [0, nSegs], so i=0 lands on segment 0
@@ -40,7 +37,7 @@ export function sampleBezierPath(path: Path, count: number): Float32Array {
     const fidx = (i / (count - 1)) * nSegs;
     const segIdx = Math.min(nSegs - 1, Math.floor(fidx));
     const t = Math.min(1, fidx - segIdx);
-    const seg = path[segIdx]!;
+    const seg = segs[segIdx]!;
 
     const mt = 1 - t;
     const mt2 = mt * mt;
@@ -63,7 +60,7 @@ export function sampleBezierPath(path: Path, count: number): Float32Array {
  * segment index and the remainder.
  */
 export function evalCubic(
-  seg: import('./types').CubicSegment,
+  seg: CubicSegment,
   t: number,
 ): [number, number] {
   const mt = 1 - t;
