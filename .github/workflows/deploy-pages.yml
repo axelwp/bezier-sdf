@@ -1,0 +1,36 @@
+name: Deploy reveal example to Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm --filter @bezier-sdf/core build
+      - run: pnpm --filter @bezier-sdf/example-reveal build
+
+      - name: Push build to <username>.github.io
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          personal_token: ${{ secrets.PAGES_DEPLOY_TOKEN }}
+          external_repository: YOUR_USERNAME/YOUR_USERNAME.github.io
+          publish_branch: main
+          publish_dir: ./examples/reveal/dist
+          force_orphan: true
+          commit_message: "deploy from bezier-sdf@${{ github.sha }}"
