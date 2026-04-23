@@ -51,11 +51,14 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_HANDLE/bezier-sdf.git",
+    "url": "https://github.com/axelwp/bezier-sdf",
     "directory": "packages/core"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.40",
     "typescript": "^5.4.0"
+  },
+  "publishConfig": {
+  "access": "public"
   }
 }
