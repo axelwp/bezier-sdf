@@ -8,8 +8,11 @@ Smooth animation, crisp at any zoom, no re-tessellation per frame.
 WebGPU primary, WebGL fallback, static SVG when neither is available.
 
 <img src="./docs/assets/default-mark.png" alt="Two rounded chevrons facing each other" width="420" />
+
+### [**→ Live demo**](https://axelwp.github.io/)
+
 </div>
-**→ [Live demo](https://axelwp.github.io/)**
+
 ---
 
 ## Why
