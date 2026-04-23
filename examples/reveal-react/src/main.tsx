@@ -1,88 +1,277 @@
-import { StrictMode, useRef } from 'react';
+import {
+  StrictMode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { createRoot } from 'react-dom/client';
-import { BezierLogo, type BezierLogoHandle } from '@bezier-sdf/react';
+import { BezierLogo, type BezierLogoHandle, type BezierLogoProps } from '@bezier-sdf/react';
+import './styles.css';
 
-function Section({
-  title,
-  code,
-  children,
-}: {
+const DEFAULT_SRC = '/logo.svg';
+
+interface CardSpec {
+  id: string;
+  number: string;
   title: string;
+  color: string;
+  effect: BezierLogoProps['effect'];
+  autoPlay?: boolean;
   code: string;
-  children: React.ReactNode;
+  hint?: string;
+  replay?: boolean;
+}
+
+const CARDS: CardSpec[] = [
+  {
+    id: 'static',
+    number: '01',
+    title: 'Static',
+    color: '#eaeaea',
+    effect: 'none',
+    code: `<BezierLogo src={src} />`,
+  },
+  {
+    id: 'reveal-auto',
+    number: '02',
+    title: 'Reveal · autoplay',
+    color: '#ff3a7a',
+    effect: 'reveal',
+    autoPlay: true,
+    code: `<BezierLogo effect="reveal" autoPlay />`,
+    replay: true,
+  },
+  {
+    id: 'ripple',
+    number: '03',
+    title: 'Ripple',
+    color: '#9af078',
+    effect: 'ripple',
+    code: `<BezierLogo effect="ripple" />`,
+    hint: 'click the plate',
+  },
+  {
+    id: 'liquid',
+    number: '04',
+    title: 'Liquid cursor',
+    color: '#ffb84d',
+    effect: 'liquid-cursor',
+    code: `<BezierLogo effect="liquid-cursor" />`,
+    hint: 'hover the plate',
+  },
+  {
+    id: 'combo',
+    number: '05',
+    title: 'Liquid cursor + ripple',
+    color: '#d78aff',
+    effect: ['liquid-cursor', 'ripple'],
+    code: `<BezierLogo effect={['liquid-cursor','ripple']} />`,
+    hint: 'hover, then click',
+  },
+  {
+    id: 'reveal-scroll',
+    number: '06',
+    title: 'Reveal · scroll',
+    color: '#6af0ff',
+    effect: 'reveal',
+    code: `<BezierLogo effect="reveal" />`,
+    hint: 'scrolls into view',
+  },
+];
+
+function ShowcaseCard({
+  spec,
+  src,
+  bakeKey,
+  onError,
+}: {
+  spec: CardSpec;
+  src: string;
+  bakeKey: number;
+  onError: (err: Error) => void;
 }) {
+  const ref = useRef<BezierLogoHandle>(null);
+
   return (
-    <section style={{ marginTop: 48 }}>
-      <h2 style={{ fontSize: 16, color: '#888', margin: '0 0 8px' }}>
-        {title} — <code>{code}</code>
-      </h2>
-      <div style={{ width: '100%', aspectRatio: '2 / 1', background: '#111', borderRadius: 8, overflow: 'hidden' }}>
-        {children}
+    <article className="card">
+      <header className="card-head">
+        <span className="card-title">{spec.title}</span>
+        <span className="card-num">{spec.number}</span>
+      </header>
+
+      <div className="card-surface">
+        <BezierLogo
+          key={`${spec.id}:${bakeKey}`}
+          ref={ref}
+          src={src}
+          color={spec.color}
+          effect={spec.effect}
+          autoPlay={spec.autoPlay}
+          ariaLabel={spec.title}
+          onError={onError}
+        />
       </div>
-    </section>
+
+      <footer className="card-foot">
+        <code>{spec.code}</code>
+        {spec.hint ? <span className="hint">{spec.hint}</span> : null}
+      </footer>
+
+      {spec.replay ? (
+        <button type="button" className="card-replay" onClick={() => ref.current?.replay()}>
+          ↺ replay
+        </button>
+      ) : null}
+    </article>
   );
 }
 
 function App() {
-  const revealRef = useRef<BezierLogoHandle>(null);
+  const [src, setSrc] = useState<string>(DEFAULT_SRC);
+  const [filename, setFilename] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [toast, setToast] = useState<{ msg: string; kind: 'info' | 'error' } | null>(null);
+  const [bakeKey, setBakeKey] = useState(0);
+  const blobUrlRef = useRef<string | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const errorFiredRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const showToast = useCallback((msg: string, kind: 'info' | 'error' = 'info') => {
+    setToast({ msg, kind });
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 3800);
+  }, []);
+
+  const acceptFile = useCallback((file: File) => {
+    const looksLikeSvg =
+      file.type === 'image/svg+xml' || file.name.toLowerCase().endsWith('.svg');
+    if (!looksLikeSvg) {
+      showToast(`${file.name} isn't an SVG`, 'error');
+      return;
+    }
+    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+    const url = URL.createObjectURL(file);
+    blobUrlRef.current = url;
+    errorFiredRef.current = false;
+    setSrc(url);
+    setFilename(file.name);
+    setBakeKey((k) => k + 1);
+    showToast(`baked ${file.name}`);
+  }, [showToast]);
+
+  const reset = useCallback(() => {
+    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+    blobUrlRef.current = null;
+    errorFiredRef.current = false;
+    setSrc(DEFAULT_SRC);
+    setFilename(null);
+    setBakeKey((k) => k + 1);
+  }, []);
+
+  /* Window-level drag-and-drop. Depth counter handles nested enter/leave. */
+  useEffect(() => {
+    let depth = 0;
+    const carriesFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes('Files');
+
+    const onEnter = (e: DragEvent) => {
+      if (!carriesFiles(e)) return;
+      e.preventDefault();
+      depth += 1;
+      setDragActive(true);
+    };
+    const onOver = (e: DragEvent) => { if (carriesFiles(e)) e.preventDefault(); };
+    const onLeave = (e: DragEvent) => {
+      if (!carriesFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDragActive(false);
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!carriesFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      setDragActive(false);
+      const file = e.dataTransfer?.files[0];
+      if (file) acceptFile(file);
+    };
+    window.addEventListener('dragenter', onEnter);
+    window.addEventListener('dragover', onOver);
+    window.addEventListener('dragleave', onLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onEnter);
+      window.removeEventListener('dragover', onOver);
+      window.removeEventListener('dragleave', onLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [acceptFile]);
+
+  useEffect(() => () => {
+    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+  }, []);
+
+  const onLogoError = useCallback((err: Error) => {
+    if (errorFiredRef.current) return;
+    errorFiredRef.current = true;
+    showToast(err.message, 'error');
+    if (blobUrlRef.current) reset();
+  }, [showToast, reset]);
+
+  const handleFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) acceptFile(file);
+    e.target.value = '';
+  };
+
+  const currentLabel = filename ?? 'logo.svg';
 
   return (
-    <div style={{ padding: '32px 24px', maxWidth: 960, margin: '0 auto' }}>
-      <h1 style={{ fontWeight: 500, letterSpacing: -0.5 }}>@bezier-sdf/react</h1>
-      <p style={{ color: '#999' }}>
-        Four effect presets on the same SVG: static, reveal (autoplay and scroll-triggered), ripple (click), liquid-cursor (hover).
-      </p>
+    <>
+      <div className="page">
+        <header className="intro">
+          <div>
+            <h1>@bezier-sdf/react <span className="v">v0.1.0</span></h1>
+            <p>A gallery for <code>@bezier-sdf/react</code> — a drop-in component that bakes an SVG into a GPU signed-distance field.</p>
+            <p>Drag any <code>.svg</code> onto the page to re-bake every plate below.</p>
+          </div>
+          <div className="upload">
+            <span className="file-pill" data-custom={filename ? 'true' : 'false'} title={currentLabel}>
+              <span className="dot" />
+              <span className="name">{currentLabel}</span>
+            </span>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".svg,image/svg+xml"
+              onChange={handleFilePick}
+              style={{ display: 'none' }}
+            />
+            <button type="button" className="btn" data-variant="accent" onClick={() => fileInputRef.current?.click()}>
+              ↑ upload
+            </button>
+            {filename ? (
+              <button type="button" className="btn" onClick={reset}>reset</button>
+            ) : null}
+          </div>
+        </header>
 
-      <Section title="1. Static" code={'effect="none"'}>
-        <BezierLogo src="/logo.svg" color="#ffffff" ariaLabel="static logo" />
-      </Section>
+        <section className="gallery" aria-label="effect gallery">
+          {CARDS.map((spec) => (
+            <ShowcaseCard key={spec.id} spec={spec} src={src} bakeKey={bakeKey} onError={onLogoError} />
+          ))}
+        </section>
+      </div>
 
-      <Section title="2. Autoplayed reveal" code={'effect="reveal" autoPlay'}>
-        <BezierLogo
-          ref={revealRef}
-          src="/logo.svg"
-          color="#ff3a7a"
-          effect="reveal"
-          autoPlay
-          ariaLabel="autoplayed reveal"
-        />
-      </Section>
-      <button
-        type="button"
-        onClick={() => revealRef.current?.replay()}
-        style={{
-          marginTop: 12, padding: '8px 14px', borderRadius: 6,
-          background: '#222', color: '#eee', border: '1px solid #333', cursor: 'pointer',
-        }}
-      >
-        replay()
-      </button>
+      <div className="drop-overlay" data-active={dragActive ? 'true' : 'false'} aria-hidden>
+        drop .svg to bake
+      </div>
 
-      <Section title="3. Ripple (click the canvas)" code={'effect="ripple"'}>
-        <BezierLogo src="/logo.svg" color="#9af078" effect="ripple" ariaLabel="click to ripple" />
-      </Section>
-
-      <Section title="4. Liquid cursor (hover the canvas)" code={'effect="liquid-cursor"'}>
-        <BezierLogo src="/logo.svg" color="#ffb84d" effect="liquid-cursor" ariaLabel="hover for liquid pull" />
-      </Section>
-
-      <Section title="5. Liquid cursor + ripple (hover and click/tap)" code={'effect={["liquid-cursor","ripple"]}'}>
-        <BezierLogo
-          src="/logo.svg"
-          color="#d78aff"
-          effect={['liquid-cursor', 'ripple']}
-          ariaLabel="hover and click to combine liquid pull and ripple"
-        />
-      </Section>
-
-      <div style={{ height: '120vh' }} />
-
-      <Section title="6. Scroll-triggered reveal" code={'effect="reveal"'}>
-        <BezierLogo src="/logo.svg" color="#6af0ff" effect="reveal" ariaLabel="scroll-triggered reveal" />
-      </Section>
-
-      <div style={{ height: '40vh' }} />
-    </div>
+      <div className="toast" data-visible={toast ? 'true' : 'false'} data-kind={toast?.kind ?? 'info'} role="status" aria-live="polite">
+        {toast?.msg}
+      </div>
+    </>
   );
 }
 
