@@ -14,6 +14,22 @@ import type { Mark, Path } from '../geometry/types';
  * overlap. Large `sminK` (say 0.1+) produces a "fluid metal" bridge
  * between adjacent paths; small `sminK` (< 0.02) collapses to a plain
  * union.
+ *
+ * `cursor` / `cursorPull` / `cursorRadius` subtract an inverse-square
+ * radial field `cursorPull / (|cursor - uv|² + cursorRadius)` from the
+ * scene SDF. The local reduction bulges the silhouette's zero-contour
+ * outward toward `cursor` and fuses with it when close — liquid-metal
+ * attraction. `cursorPull = 0` (the default) is a no-op. `cursorRadius`
+ * is a softening epsilon (smaller = sharper, narrower tendril; typical
+ * range 0.01–0.1 in normalized SDF space). Existing callers don't need
+ * to set these.
+ *
+ * `ripples` is an array of up to 4 concurrent Gaussian shockwave rings.
+ * Each entry is `[x, y, age, amplitude]` where (x,y) is the ring
+ * center in SDF space, `age` is the ring's current radius (grow it
+ * over time from JS), and `amplitude` is its height (taper to zero to
+ * fade). Slots with `amplitude = 0` are no-ops. Omit the field or pass
+ * an empty array to disable ripples entirely.
  */
 export interface Uniforms {
   width: number;
@@ -25,6 +41,10 @@ export interface Uniforms {
   pathOffsets: ReadonlyArray<readonly [number, number]>;
   color: readonly [number, number, number];
   opacity: number;
+  cursor?: readonly [number, number];
+  cursorPull?: number;
+  cursorRadius?: number;
+  ripples?: ReadonlyArray<readonly [number, number, number, number]>;
 }
 
 export interface RendererInitOptions {

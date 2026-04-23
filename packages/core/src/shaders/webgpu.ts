@@ -134,7 +134,11 @@ struct Uniforms {
   opacity: f32,
   bound: f32,
   pathCount: u32,
-  _pad1: vec2<u32>,
+  cursor: vec2<f32>,
+  cursorPull: f32,
+  cursorRadius: f32,
+  _padR: vec2<f32>,             // explicit pad — array<vec4> needs 16-byte align
+  ripples: array<vec4<f32>, 4>, // (x, y, age, amplitude) per slot
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -184,6 +188,25 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   if (U.pathCount > 1u) { d = smin(d, sampleAt(tex1, uv, U.pathOffset1), k); }
   if (U.pathCount > 2u) { d = smin(d, sampleAt(tex2, uv, U.pathOffset2), k); }
   if (U.pathCount > 3u) { d = smin(d, sampleAt(tex3, uv, U.pathOffset3), k); }
+
+  // Liquid-cursor pull — subtract an inverse-square radial field from the
+  // scene SDF. Locally reduces the distance value, so the zero-contour
+  // (the silhouette edge) bulges out toward the cursor and fuses with it
+  // when close. cursorPull=0 disables; cursorRadius is a softening
+  // epsilon (smaller = sharper/narrower tendril).
+  let toCursor = U.cursor - uv;
+  d = d - U.cursorPull / (dot(toCursor, toCursor) + U.cursorRadius);
+
+  // Up to 4 concurrent shockwave rings. JS advances each ring's radius
+  // (ripples[i].z) and tapers its amplitude (ripples[i].w) independently.
+  // Dead slots (amplitude=0) contribute nothing.
+  let RIPPLE_WIDTH: f32 = 0.12;
+  for (var i: i32 = 0; i < 4; i = i + 1) {
+    let r = U.ripples[i];
+    let rd = length(uv - r.xy);
+    let rp = (rd - r.z) / RIPPLE_WIDTH;
+    d = d - r.w * exp(-rp * rp);
+  }
 
   let aa = fwidth(d) * 1.2;
   let mask = 1.0 - smoothstep(-aa, aa, d);

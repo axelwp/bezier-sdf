@@ -43,6 +43,7 @@ export class WebGLRenderer implements Renderer {
   private _mode: 'baked' | 'direct' = 'baked';
   private _pathCount = 0;
   private disposed = false;
+  private ripplesBuf = new Float32Array(16);
 
   get mode(): 'baked' | 'direct' { return this._mode; }
   get pathCount(): number { return this._pathCount; }
@@ -141,6 +142,10 @@ export class WebGLRenderer implements Renderer {
       pathOffset1: gl.getUniformLocation(sampleProgram, 'u_pathOffset1'),
       pathOffset2: gl.getUniformLocation(sampleProgram, 'u_pathOffset2'),
       pathOffset3: gl.getUniformLocation(sampleProgram, 'u_pathOffset3'),
+      cursor:       gl.getUniformLocation(sampleProgram, 'u_cursor'),
+      cursorPull:   gl.getUniformLocation(sampleProgram, 'u_cursorPull'),
+      cursorRadius: gl.getUniformLocation(sampleProgram, 'u_cursorRadius'),
+      ripples:      gl.getUniformLocation(sampleProgram, 'u_ripples'),
     };
     // Bind sampler-to-texture-unit mapping once.
     gl.uniform1i(this.sampleUniforms.sdf0!, 0);
@@ -255,6 +260,23 @@ export class WebGLRenderer implements Renderer {
       setOff('pathOffset1', 1);
       setOff('pathOffset2', 2);
       setOff('pathOffset3', 3);
+      const cursor = u.cursor ?? [0, 0];
+      gl.uniform2f(sU.cursor!, cursor[0], cursor[1]);
+      gl.uniform1f(sU.cursorPull!, u.cursorPull ?? 0);
+      gl.uniform1f(sU.cursorRadius!, u.cursorRadius ?? 1);
+      const rb = this.ripplesBuf;
+      rb.fill(0);
+      const ripples = u.ripples;
+      if (ripples) {
+        for (let i = 0; i < 4 && i < ripples.length; i++) {
+          const r = ripples[i]!;
+          rb[i * 4]     = r[0];
+          rb[i * 4 + 1] = r[1];
+          rb[i * 4 + 2] = r[2];
+          rb[i * 4 + 3] = r[3];
+        }
+      }
+      gl.uniform4fv(sU.ripples!, rb);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
     }

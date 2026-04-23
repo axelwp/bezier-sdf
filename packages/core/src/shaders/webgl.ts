@@ -151,6 +151,10 @@ uniform vec2 u_pathOffset0;
 uniform vec2 u_pathOffset1;
 uniform vec2 u_pathOffset2;
 uniform vec2 u_pathOffset3;
+uniform vec2  u_cursor;
+uniform float u_cursorPull;
+uniform float u_cursorRadius;
+uniform vec4  u_ripples[4]; // (x, y, age, amplitude) per slot
 
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
@@ -174,6 +178,25 @@ void main() {
   if (u_pathCount > 1) d = smin(d, sampleAt(u_sdf1, uv, u_pathOffset1), k);
   if (u_pathCount > 2) d = smin(d, sampleAt(u_sdf2, uv, u_pathOffset2), k);
   if (u_pathCount > 3) d = smin(d, sampleAt(u_sdf3, uv, u_pathOffset3), k);
+
+  // Liquid-cursor pull — subtract an inverse-square radial field from the
+  // scene SDF. Locally reduces the distance value, so the zero-contour
+  // (the silhouette edge) bulges out toward the cursor and fuses with it
+  // when close. u_cursorPull=0 disables; u_cursorRadius is a softening
+  // epsilon (smaller = sharper/narrower tendril).
+  vec2 toCursor = u_cursor - uv;
+  d -= u_cursorPull / (dot(toCursor, toCursor) + u_cursorRadius);
+
+  // Up to 4 concurrent shockwave rings. JS advances each ring's radius
+  // (ripples[i].z) and tapers its amplitude (ripples[i].w) independently.
+  // Dead slots (amplitude=0) contribute nothing.
+  const float RIPPLE_WIDTH = 0.12;
+  for (int i = 0; i < 4; i++) {
+    vec4 r = u_ripples[i];
+    float rd = length(uv - r.xy);
+    float rp = (rd - r.z) / RIPPLE_WIDTH;
+    d -= r.w * exp(-rp * rp);
+  }
 
   float aa = fwidth(d) * 1.2;
   float mask = 1.0 - smoothstep(-aa, aa, d);

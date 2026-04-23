@@ -29,10 +29,14 @@ const MAX_SEGS = 32;
  *   opacity      : f32         // 76  (4)
  *   bound        : f32         // 80  (4)
  *   pathCount    : u32         // 84  (4)
- *   _pad1        : vec2<u32>   // 88  (8)
- * Total: 96 bytes, 16-aligned.
+ *   cursor          : vec2<f32>    // 88   (8)
+ *   cursorPull      : f32          // 96   (4)
+ *   cursorRadius    : f32          // 100  (4)
+ *   _padR           : vec2<f32>    // 104  (8) — array<vec4> is 16-byte aligned
+ *   ripples[0..3]   : vec4<f32>[4] // 112  (64) — 16-byte stride, (x,y,age,amp)
+ * Total: 176 bytes, 16-aligned.
  */
-const UNIFORM_BUFFER_SIZE = 96;
+const UNIFORM_BUFFER_SIZE = 176;
 
 export class WebGPURenderer implements Renderer {
   readonly kind = 'webgpu' as const;
@@ -241,6 +245,21 @@ export class WebGPURenderer implements Renderer {
     view.setFloat32(76, u.opacity,  true);
     view.setFloat32(80, 1.2,        true); // bound (matches shader constant)
     view.setUint32(84, this._pathCount, true);
+    const cursor = u.cursor ?? [0, 0];
+    view.setFloat32(88, cursor[0], true);
+    view.setFloat32(92, cursor[1], true);
+    view.setFloat32(96, u.cursorPull ?? 0, true);
+    view.setFloat32(100, u.cursorRadius ?? 1, true);
+    // ripples[0..3] at 112..176, zero-fill missing slots.
+    const ripples = u.ripples;
+    for (let i = 0; i < 4; i++) {
+      const r = ripples?.[i];
+      const base = 112 + i * 16;
+      view.setFloat32(base,      r ? r[0] : 0, true);
+      view.setFloat32(base + 4,  r ? r[1] : 0, true);
+      view.setFloat32(base + 8,  r ? r[2] : 0, true);
+      view.setFloat32(base + 12, r ? r[3] : 0, true);
+    }
     device.queue.writeBuffer(uniformBuffer, 0, this.uniformData);
 
     const encoder = device.createCommandEncoder();
