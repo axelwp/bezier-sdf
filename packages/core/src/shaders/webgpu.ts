@@ -460,7 +460,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let interior = smoothstep(0.5, 1.0, h);
 
   let sdfToUv = vec2<f32>(min(res.x, res.y)) / res;
-  let refractOffset = normal * lensAmount * U.refractionStrength * sdfToUv;
+  let refractOffset = normal * h * (1.0 - h) * lensAmount * U.refractionStrength * sdfToUv;
 
   let backdropUv = fragCoord.xy / res;
   let offR = backdropUv + refractOffset * (1.0 - U.chromaticStrength);
@@ -498,5 +498,6 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   color = mix(color, U.tintColor, clamp(interior * U.tintStrength, 0.0, 1.0));
 
   return vec4<f32>(color, insideMask * U.opacity);
+  //return vec4<f32>(normal * 0.5 + 0.5, 0.0, insideMask);
 }
 `;

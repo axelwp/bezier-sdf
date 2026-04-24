@@ -485,7 +485,7 @@ void main() {
   // Convert the isotropic SDF-space offset to backdrop-uv space and
   // refract along the inward normal.
   vec2 sdfToUv = vec2(min(u_res.x, u_res.y)) / u_res;
-  vec2 refractOffset = normal * lensAmount * u_refractionStrength * sdfToUv;
+  let refractOffset = normal * h * (1.0 - h) * 4.0 * U.refractionStrength * sdfToUv;
 
   vec2 backdropUv = gl_FragCoord.xy / u_res;
   vec2 offR = backdropUv + refractOffset * (1.0 - u_chromaticStrength);
@@ -553,6 +553,7 @@ void main() {
   float aa = fwidth(d) * 1.2;
   float mask = 1.0 - smoothstep(-aa, aa, d);
   gl_FragColor = vec4(u_color, mask * u_opacity);
+  //gl_FragColor = vec4(normal * 0.5 + 0.5, 0.0, insideMask);
 }
 `;
 
