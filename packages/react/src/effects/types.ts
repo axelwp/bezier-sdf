@@ -45,6 +45,11 @@ export interface EffectRuntime {
    * the split-out pose; a no-op for purely reactive effects).
    */
   replay?(now: number): void;
+  /**
+   * Live-update tuning without tearing down the runtime. Each effect
+   * accepts its own param shape; unknown keys are ignored.
+   */
+  setParams?(params: Record<string, number>): void;
 }
 
 export interface EffectCreateOptions {
@@ -52,6 +57,8 @@ export interface EffectCreateOptions {
   reducedMotion: boolean;
   /** Forwarded from the component prop — only `reveal` uses it. */
   autoPlay: boolean;
+  /** Initial tuning. Effect-specific; each effect casts its own shape. */
+  params?: Record<string, number>;
 }
 
 export interface EffectDefinition {

@@ -3,12 +3,25 @@ import type { EffectDefinition, EffectRuntime } from './types';
 /**
  * Tuning lifted from examples/liquid-cursor. The shader subtracts a
  * Gaussian ring centered on the click point; we grow its radius with time
- * (`age * RIPPLE_SPEED`) and fade its amplitude exponentially.
+ * (`age * speed`) and fade its amplitude exponentially.
  */
-const RIPPLE_SPEED = 2.8;
-const RIPPLE_DURATION = 0.9;
-const RIPPLE_AMPLITUDE = 0.08;
-const RIPPLE_DECAY = 3.5;
+export interface RippleParams {
+  /** Radial growth rate of the ring (SDF units / second). */
+  speed?: number;
+  /** Seconds before the ring is culled. */
+  duration?: number;
+  /** Peak SDF deformation at the ring crest. */
+  amplitude?: number;
+  /** Exponential fade rate; higher = quicker decay. */
+  decay?: number;
+}
+
+const DEFAULTS = {
+  speed: 2.8,
+  duration: 0.9,
+  amplitude: 0.08,
+  decay: 3.5,
+};
 
 type Ring = { x: number; y: number; startMs: number };
 const DEAD: readonly [number, number, number, number] = [0, 0, 0, 0];
@@ -21,15 +34,21 @@ export const ripple: EffectDefinition = {
   name: 'ripple',
   needsPointer: true,
   scrollTrigger: false,
-  create({ reducedMotion }): EffectRuntime {
+  create({ reducedMotion, params }): EffectRuntime {
+    const initial = params as RippleParams | undefined;
+    let speed = initial?.speed ?? DEFAULTS.speed;
+    let duration = initial?.duration ?? DEFAULTS.duration;
+    let amplitude = initial?.amplitude ?? DEFAULTS.amplitude;
+    let decay = initial?.decay ?? DEFAULTS.decay;
+
     const slots: (Ring | null)[] = [null, null, null, null];
     let nextSlot = 0;
 
     const uniformFor = (r: Ring | null, now: number): readonly [number, number, number, number] => {
       if (!r) return DEAD;
       const age = (now - r.startMs) / 1000;
-      if (age < 0 || age > RIPPLE_DURATION) return DEAD;
-      return [r.x, r.y, age * RIPPLE_SPEED, RIPPLE_AMPLITUDE * Math.exp(-age * RIPPLE_DECAY)];
+      if (age < 0 || age > duration) return DEAD;
+      return [r.x, r.y, age * speed, amplitude * Math.exp(-age * decay)];
     };
 
     return {
@@ -38,7 +57,7 @@ export const ripple: EffectDefinition = {
       },
       active(now) {
         for (const r of slots) {
-          if (r && (now - r.startMs) / 1000 < RIPPLE_DURATION) return true;
+          if (r && (now - r.startMs) / 1000 < duration) return true;
         }
         return false;
       },
@@ -46,6 +65,13 @@ export const ripple: EffectDefinition = {
         if (reducedMotion) return;
         slots[nextSlot] = { x, y, startMs: now };
         nextSlot = (nextSlot + 1) % slots.length;
+      },
+      setParams(p) {
+        const rp = p as RippleParams;
+        if (typeof rp.speed === 'number') speed = rp.speed;
+        if (typeof rp.duration === 'number') duration = rp.duration;
+        if (typeof rp.amplitude === 'number') amplitude = rp.amplitude;
+        if (typeof rp.decay === 'number') decay = rp.decay;
       },
     };
   },

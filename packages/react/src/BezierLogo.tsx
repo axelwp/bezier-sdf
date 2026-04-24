@@ -17,23 +17,35 @@ import {
 import { loadMark } from './svg-cache';
 import { parseColor } from './parseColor';
 import { StaticFallback } from './StaticFallback';
-import { reveal } from './effects/reveal';
-import { ripple } from './effects/ripple';
-import { liquidCursor } from './effects/liquid-cursor';
+import { reveal, type RevealParams } from './effects/reveal';
+import { ripple, type RippleParams } from './effects/ripple';
+import { liquidCursor, type LiquidCursorParams } from './effects/liquid-cursor';
 import type { EffectDefinition, EffectFrame, EffectRuntime } from './effects/types';
 
 export type BezierLogoEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor';
 
+export type BezierLogoEffectName = Exclude<BezierLogoEffect, 'none'>;
+
 /**
- * `effect` accepts either a single preset name, or an array to compose
- * multiple presets simultaneously (e.g. `['liquid-cursor', 'ripple']` so
- * hover bulges toward the pointer and clicks fire a ripple through it).
- * Use `'none'` or omit the prop to disable effects entirely — `'none'`
- * is not allowed inside an array.
+ * Object form: name + tuning knobs for that effect. Allows composition
+ * with different params per preset in the array form of `effect`.
+ */
+export type BezierLogoEffectSpec =
+  | ({ name: 'reveal' } & RevealParams)
+  | ({ name: 'ripple' } & RippleParams)
+  | ({ name: 'liquid-cursor' } & LiquidCursorParams);
+
+/**
+ * `effect` accepts: a single preset name, a single spec object, or an
+ * array mixing names and spec objects (e.g. `['liquid-cursor', 'ripple']`
+ * or `[{ name: 'ripple', speed: 3.5 }, 'liquid-cursor']`). Use `'none'`
+ * or omit the prop to disable effects entirely — `'none'` is not allowed
+ * inside an array.
  */
 export type BezierLogoEffectProp =
   | BezierLogoEffect
-  | Array<Exclude<BezierLogoEffect, 'none'>>;
+  | BezierLogoEffectSpec
+  | Array<BezierLogoEffectName | BezierLogoEffectSpec>;
 
 export interface BezierLogoHandle {
   /**
@@ -82,7 +94,7 @@ export interface BezierLogoProps {
 
 const DEFAULT_SMIN_K = 0.08;
 
-const DEFINITIONS: Record<Exclude<BezierLogoEffect, 'none'>, EffectDefinition> = {
+const DEFINITIONS: Record<BezierLogoEffectName, EffectDefinition> = {
   'reveal': reveal,
   'ripple': ripple,
   'liquid-cursor': liquidCursor,
@@ -92,21 +104,51 @@ function zeroOffsets(n: number): Array<[number, number]> {
   return Array.from({ length: n }, () => [0, 0] as [number, number]);
 }
 
-function resolveDefinitions(prop: BezierLogoEffectProp): EffectDefinition[] {
+interface ResolvedSpec {
+  def: EffectDefinition;
+  params?: Record<string, number>;
+}
+
+function specToEntry(
+  item: BezierLogoEffectName | BezierLogoEffectSpec,
+): { name: BezierLogoEffectName; params?: Record<string, number> } {
+  if (typeof item === 'string') return { name: item };
+  const { name, ...rest } = item;
+  const params = rest as Record<string, number>;
+  return { name, params: Object.keys(params).length ? params : undefined };
+}
+
+function resolveSpecs(prop: BezierLogoEffectProp): ResolvedSpec[] {
   if (prop === 'none') return [];
-  if (Array.isArray(prop)) {
-    // De-duplicate — repeating a preset would double its contribution and
-    // is almost certainly a bug.
-    const seen = new Set<string>();
-    const out: EffectDefinition[] = [];
-    for (const name of prop) {
-      if (seen.has(name)) continue;
-      seen.add(name);
-      out.push(DEFINITIONS[name]);
-    }
-    return out;
+  const items: Array<BezierLogoEffectName | BezierLogoEffectSpec> = Array.isArray(prop)
+    ? prop
+    : typeof prop === 'string'
+      ? [prop as BezierLogoEffectName]
+      : [prop];
+  // De-duplicate by name — repeating a preset would double its contribution.
+  const seen = new Set<string>();
+  const out: ResolvedSpec[] = [];
+  for (const item of items) {
+    const { name, params } = specToEntry(item);
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push({ def: DEFINITIONS[name], params });
   }
-  return [DEFINITIONS[prop]];
+  return out;
+}
+
+/** Stable identity key for the useEffect dep — names only, sorted. */
+function effectNamesKey(prop: BezierLogoEffectProp): string {
+  return resolveSpecs(prop).map((s) => s.def.name).sort().join(',');
+}
+
+/** Extract per-effect params map for live updates. */
+function effectParamsMap(prop: BezierLogoEffectProp): Record<string, Record<string, number>> {
+  const out: Record<string, Record<string, number>> = {};
+  for (const { def, params } of resolveSpecs(prop)) {
+    if (params) out[def.name] = params;
+  }
+  return out;
 }
 
 /**
@@ -217,11 +259,22 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
     visible: true,
     replay: () => {},
     requestRender: () => {},
+    pushParams: (_: Record<string, Record<string, number>>) => {},
   });
   stateRef.current.color = color;
   stateRef.current.opacity = opacity;
   stateRef.current.perPath = perPath;
   stateRef.current.pauseWhenOffscreen = pauseWhenOffscreen;
+
+  // Stable primitive dep: mount only re-runs when the *set* of active
+  // effects changes, not when their params do. Params flow through
+  // `stateRef.pushParams` in a separate effect.
+  const effectKey = useMemo(() => effectNamesKey(effect), [effect]);
+  const paramsMap = useMemo(() => effectParamsMap(effect), [effect]);
+  // Latest spec snapshot — read by the mount effect on (re-)init so new
+  // runtimes pick up the current params.
+  const effectRef = useRef(effect);
+  effectRef.current = effect;
 
   useImperativeHandle(ref, () => ({
     replay: () => stateRef.current.replay(),
@@ -256,7 +309,10 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       typeof window !== 'undefined' &&
       (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false);
 
-    const defs = resolveDefinitions(effect);
+    // Snapshot current specs at mount. Param-only changes don't re-run
+    // this effect (see `effectKey` dep); they flow in via `pushParams`.
+    const specs = resolveSpecs(effectRef.current);
+    const defs = specs.map((s) => s.def);
     const needsPointer = defs.some((d) => d.needsPointer);
     const needsScroll = defs.some((d) => d.scrollTrigger);
 
@@ -394,9 +450,18 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       }
 
       // Create runtimes now that we know pathCount.
-      runtimes = defs.map((d) =>
-        d.create({ pathCount: renderer!.pathCount, reducedMotion, autoPlay }),
+      runtimes = specs.map((s) =>
+        s.def.create({ pathCount: renderer!.pathCount, reducedMotion, autoPlay, params: s.params }),
       );
+
+      state.pushParams = (next) => {
+        for (let i = 0; i < runtimes.length; i++) {
+          const name = defs[i]!.name;
+          runtimes[i]!.setParams?.(next[name] ?? {});
+        }
+        // Nudge a frame so static-state effects (e.g. reveal at rest) pick up changes.
+        renderOnce(performance.now());
+      };
 
       // First frame — poised state (reveal) or a zeroed reactive frame.
       // Prevents the empty-canvas flash between renderer init and the
@@ -488,6 +553,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       state.rafId = 0;
       state.requestRender = () => {};
       state.replay = () => {};
+      state.pushParams = () => {};
       pointerCleanup?.();
       ro?.disconnect();
       io?.disconnect();
@@ -495,13 +561,19 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       renderer = null;
       runtimes = [];
     };
-  }, [mark, rendererKind, effect, autoPlay, onReady, onError]);
+  }, [mark, rendererKind, effectKey, autoPlay, onReady, onError]);
 
   /* --------------- 3. React to color/opacity changes mid-life -------------- */
 
   useEffect(() => {
     stateRef.current.requestRender();
   }, [color, opacity]);
+
+  /* --------------- 4. Live-push effect param changes ----------------------- */
+
+  useEffect(() => {
+    stateRef.current.pushParams(paramsMap);
+  }, [paramsMap]);
 
   /* ---------------------------------- UI ----------------------------------- */
 

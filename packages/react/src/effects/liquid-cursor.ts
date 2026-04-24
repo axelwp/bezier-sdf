@@ -1,23 +1,32 @@
 import type { EffectDefinition, EffectRuntime } from './types';
 
 /**
- * Tuning for the shader-side Gaussian cursor pull. Both values are in
+ * Tuning for the shader-side Gaussian cursor pull. Values are in
  * normalized SDF space (the same coordinates the cursor lives in).
  *
- *   PULL   — peak SDF deformation at the cursor (subtracted from the
+ *   pull   — peak SDF deformation at the cursor (subtracted from the
  *            sampled distance). Larger = more aggressive bulge.
- *   RADIUS — Gaussian sigma. Falloff is ~1% at 3·RADIUS and ~0 at
- *            4·RADIUS, so this is the spatial extent of the pull.
+ *   radius — Gaussian sigma. Falloff is ~1% at 3·radius and ~0 at
+ *            4·radius, so this is the spatial extent of the pull.
+ *   lerp   — per-frame smoothing factor (0..1) between raw pointer
+ *            target and rendered cursor position. Lower = laggier.
  *
  * On filled paths the boundary bulges toward the cursor. On stroked
  * paths the shader applies the same falloff to the *sausage* SDF
  * (`abs(d) - halfWidth`), which thickens and warps the ink near the
- * cursor — the "wet paint" model. Same params look slightly different
- * between modes; tune to taste, then leave alone.
+ * cursor — the "wet paint" model.
  */
-const PULL = 0.08;
-const RADIUS = 0.15;
-const POINTER_LERP = 0.5;
+export interface LiquidCursorParams {
+  pull?: number;
+  radius?: number;
+  lerp?: number;
+}
+
+const DEFAULTS = {
+  pull: 0.08,
+  radius: 0.15,
+  lerp: 0.5,
+};
 
 /** `(dx² + dy²)` below which we consider the smoothed cursor to have caught up. */
 const REST_EPS_SQ = 1e-5;
@@ -32,7 +41,7 @@ export const liquidCursor: EffectDefinition = {
   name: 'liquid-cursor',
   needsPointer: true,
   scrollTrigger: false,
-  create({ reducedMotion }): EffectRuntime {
+  create({ reducedMotion, params }): EffectRuntime {
     if (reducedMotion) {
       return {
         frame: () => ({ cursorPull: 0 }),
@@ -40,18 +49,23 @@ export const liquidCursor: EffectDefinition = {
       };
     }
 
+    const initial = params as LiquidCursorParams | undefined;
+    let pull = initial?.pull ?? DEFAULTS.pull;
+    let radius = initial?.radius ?? DEFAULTS.radius;
+    let lerp = initial?.lerp ?? DEFAULTS.lerp;
+
     let targetX = 0, targetY = 0;
     let smoothX = 0, smoothY = 0;
     let hoverPull = 0;
 
     return {
       frame() {
-        smoothX += (targetX - smoothX) * POINTER_LERP;
-        smoothY += (targetY - smoothY) * POINTER_LERP;
+        smoothX += (targetX - smoothX) * lerp;
+        smoothY += (targetY - smoothY) * lerp;
         return {
           cursor: [smoothX, smoothY],
           cursorPull: hoverPull,
-          cursorRadius: RADIUS,
+          cursorRadius: radius,
         };
       },
       active() {
@@ -63,7 +77,7 @@ export const liquidCursor: EffectDefinition = {
       pointerMove(x, y) {
         targetX = x;
         targetY = y;
-        hoverPull = PULL;
+        hoverPull = pull;
       },
       pointerLeave() {
         hoverPull = 0;
@@ -75,7 +89,16 @@ export const liquidCursor: EffectDefinition = {
         // which is fine since it sets identical state.
         targetX = x;
         targetY = y;
-        hoverPull = PULL;
+        hoverPull = pull;
+      },
+      setParams(p) {
+        const lp = p as LiquidCursorParams;
+        if (typeof lp.pull === 'number') {
+          pull = lp.pull;
+          if (hoverPull > 0) hoverPull = pull;
+        }
+        if (typeof lp.radius === 'number') radius = lp.radius;
+        if (typeof lp.lerp === 'number') lerp = lp.lerp;
       },
     };
   },
