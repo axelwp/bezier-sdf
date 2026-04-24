@@ -69,6 +69,23 @@ export interface Renderer {
   readonly pathCount: number;
   init(options: RendererInitOptions): Promise<void>;
   render(uniforms: Uniforms): void;
+  /**
+   * Re-run the bake pass with new geometry, writing into the existing
+   * SDF textures. Used by geometry-distortion effects (e.g. liquid-cursor
+   * on stroked marks) that need the underlying curves to bend rather than
+   * the sampled distance to shift.
+   *
+   * The mark's structural shape — number of paths, paint metadata — must
+   * match what was passed to {@link init}; only segment positions should
+   * differ. Segment counts may differ as long as they stay under the
+   * backend's MAX_SEGS. No GPU resources are allocated; only segment data
+   * is uploaded and the bake pipeline is re-run.
+   *
+   * Optional: backends without a baking step (the WebGL `direct` mode)
+   * may treat this as a no-op. Callers should not rely on rebake outside
+   * `mode === 'baked'`.
+   */
+  rebake(mark: Mark): void;
   dispose(): void;
 }
 

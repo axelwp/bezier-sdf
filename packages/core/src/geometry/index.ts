@@ -6,3 +6,17 @@ export { parseSvgDocument } from './parseSvgDocument';
 export { parseColor, parseColorAlpha, type RgbTriple } from './parseColor';
 export { normalizeMark, type NormalizeOptions, type NormalizedMark } from './normalize';
 export { sampleBezierPath, evalCubic } from './sampling';
+export {
+  type DistortionField,
+  IDENTITY_FIELD,
+  composeFields,
+  distortPath,
+  distortMark,
+  cursorField,
+} from './distort';
+export {
+  splitCubic,
+  chordLength,
+  subdividePath,
+  subdivideMark,
+} from './subdivide';

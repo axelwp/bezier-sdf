@@ -1,4 +1,4 @@
-import type { Path } from '../geometry/types';
+import type { Mark, Path } from '../geometry/types';
 import {
   WEBGPU_BAKE_SHADER,
   WEBGPU_BAKE_SIZE,
@@ -49,6 +49,8 @@ export class WebGPURenderer implements Renderer {
   private context: GPUCanvasContext | null = null;
   private format: GPUTextureFormat = 'bgra8unorm';
   private samplePipeline: GPURenderPipeline | null = null;
+  private bakePipeline: GPURenderPipeline | null = null;
+  private bakeBindGroupLayout: GPUBindGroupLayout | null = null;
   private uniformBuffer: GPUBuffer | null = null;
   private textures: GPUTexture[] = [];
   private dummyTexture: GPUTexture | null = null;
@@ -96,10 +98,13 @@ export class WebGPURenderer implements Renderer {
       fragment: { module: bakeShader, entryPoint: 'fs_main', targets: [{ format: 'r16float' }] },
       primitive: { topology: 'triangle-list' },
     });
+    this.bakePipeline = bakePipeline;
+    this.bakeBindGroupLayout = bakeBindGroupLayout;
 
-    this.textures = mark.paths.map((p) =>
-      this.bakeShape(device, bakePipeline, bakeBindGroupLayout, p),
-    );
+    this.textures = mark.paths.map((p) => this.allocBakeTexture(device));
+    for (let i = 0; i < mark.paths.length; i++) {
+      this.runBakeIntoTexture(device, this.textures[i]!, mark.paths[i]!);
+    }
 
     // Dummy 1x1 texture for unused path slots — WebGPU requires all four
     // texture bindings even when pathCount < 4.
@@ -177,32 +182,44 @@ export class WebGPURenderer implements Renderer {
     });
   }
 
-  private bakeShape(
+  private allocBakeTexture(device: GPUDevice): GPUTexture {
+    return device.createTexture({
+      size: [WEBGPU_BAKE_SIZE, WEBGPU_BAKE_SIZE],
+      format: 'r16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+  }
+
+  /**
+   * Upload `path.segments` into a transient storage buffer, run the bake
+   * fragment program into `texture`. The texture is reused across rebakes.
+   * The segment buffer is recreated each call — at MAX_SEGS×32 bytes it's
+   * a sub-KB allocation, cheaper to recreate than to track mapping.
+   */
+  private runBakeIntoTexture(
     device: GPUDevice,
-    pipeline: GPURenderPipeline,
-    bindGroupLayout: GPUBindGroupLayout,
+    texture: GPUTexture,
     path: Path,
-  ): GPUTexture {
+  ): void {
+    const pipeline = this.bakePipeline;
+    const layout = this.bakeBindGroupLayout;
+    if (!pipeline || !layout) return;
+
     const segs = path.segments;
     const segFloats = new Float32Array(segs.length * 8);
     for (let i = 0; i < segs.length; i++) {
       segFloats.set(segs[i] as unknown as ArrayLike<number>, i * 8);
     }
     const segmentBuffer = device.createBuffer({
-      size: segFloats.byteLength,
+      size: Math.max(segFloats.byteLength, 16),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
     });
     new Float32Array(segmentBuffer.getMappedRange()).set(segFloats);
     segmentBuffer.unmap();
 
-    const texture = device.createTexture({
-      size: [WEBGPU_BAKE_SIZE, WEBGPU_BAKE_SIZE],
-      format: 'r16float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
-    });
     const bindGroup = device.createBindGroup({
-      layout: bindGroupLayout,
+      layout,
       entries: [{ binding: 0, resource: { buffer: segmentBuffer } }],
     });
     const encoder = device.createCommandEncoder();
@@ -220,7 +237,20 @@ export class WebGPURenderer implements Renderer {
     pass.end();
     device.queue.submit([encoder.finish()]);
     segmentBuffer.destroy();
-    return texture;
+  }
+
+  rebake(mark: Mark): void {
+    const device = this.device;
+    if (!device || this.disposed || !this.bakePipeline) return;
+    if (mark.paths.length !== this.textures.length) {
+      throw new Error(
+        `rebake: mark has ${mark.paths.length} paths but renderer was init'd with ${this.textures.length}`,
+      );
+    }
+    validateMark(mark, MAX_PATHS, MAX_SEGS);
+    for (let i = 0; i < mark.paths.length; i++) {
+      this.runBakeIntoTexture(device, this.textures[i]!, mark.paths[i]!);
+    }
   }
 
   render(u: Uniforms): void {
@@ -342,5 +372,7 @@ export class WebGPURenderer implements Renderer {
     this.device = null;
     this.samplePipeline = null;
     this.sampleBindGroup = null;
+    this.bakePipeline = null;
+    this.bakeBindGroupLayout = null;
   }
 }

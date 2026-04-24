@@ -1,22 +1,32 @@
 import type { EffectDefinition, EffectRuntime } from './types';
 
 /**
- * Tuning lifted from examples/liquid-cursor. See that file's comments for
- * the physics — briefly: `cursorPull / cursorRadius` is the peak pull at
- * the cursor itself; it has to exceed typical SDF distances (~0.1–0.3) to
- * visibly reach out from the silhouette.
+ * Tuning for the shader-side Gaussian cursor pull. Both values are in
+ * normalized SDF space (the same coordinates the cursor lives in).
+ *
+ *   PULL   — peak SDF deformation at the cursor (subtracted from the
+ *            sampled distance). Larger = more aggressive bulge.
+ *   RADIUS — Gaussian sigma. Falloff is ~1% at 3·RADIUS and ~0 at
+ *            4·RADIUS, so this is the spatial extent of the pull.
+ *
+ * On filled paths the boundary bulges toward the cursor. On stroked
+ * paths the shader applies the same falloff to the *sausage* SDF
+ * (`abs(d) - halfWidth`), which thickens and warps the ink near the
+ * cursor — the "wet paint" model. Same params look slightly different
+ * between modes; tune to taste, then leave alone.
  */
-const PULL_HOVER = 0.012;
-const RADIUS = 0.05;
+const PULL = 0.08;
+const RADIUS = 0.15;
 const POINTER_LERP = 0.5;
 
 /** `(dx² + dy²)` below which we consider the smoothed cursor to have caught up. */
 const REST_EPS_SQ = 1e-5;
 
 /**
- * Pointer-follow liquid-metal pull. The silhouette's zero-contour bulges
- * toward the cursor; drag it inward and the shape fuses with the pointer.
- * When the cursor leaves, the pull fades and the smoothing tail settles.
+ * Pointer-follow liquid pull. Wires cursor position + pull strength
+ * into shader uniforms; the fragment shader does the actual SDF
+ * deformation. No per-frame rebake needed — the bake is once, the
+ * sample is per-pixel, and the cursor falloff is added in the sampler.
  */
 export const liquidCursor: EffectDefinition = {
   name: 'liquid-cursor',
@@ -24,7 +34,6 @@ export const liquidCursor: EffectDefinition = {
   scrollTrigger: false,
   create({ reducedMotion }): EffectRuntime {
     if (reducedMotion) {
-      // No pull, no motion — silhouette renders flat.
       return {
         frame: () => ({ cursorPull: 0 }),
         active: () => false,
@@ -54,7 +63,7 @@ export const liquidCursor: EffectDefinition = {
       pointerMove(x, y) {
         targetX = x;
         targetY = y;
-        hoverPull = PULL_HOVER;
+        hoverPull = PULL;
       },
       pointerLeave() {
         hoverPull = 0;
@@ -66,7 +75,7 @@ export const liquidCursor: EffectDefinition = {
         // which is fine since it sets identical state.
         targetX = x;
         targetY = y;
-        hoverPull = PULL_HOVER;
+        hoverPull = PULL;
       },
     };
   },

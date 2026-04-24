@@ -198,18 +198,24 @@ fn sampleIdx(i: u32, uv: vec2<f32>) -> f32 {
   return textureSample(tex3, samp, t).r;
 }
 
-fn applyDistEffects(d0: f32, uv: vec2<f32>) -> f32 {
-  var d = d0;
-  let toCursor = U.cursor - uv;
-  d = d - U.cursorPull / (dot(toCursor, toCursor) + U.cursorRadius);
+// Total subtractive deformation field at uv — cursor pull (Gaussian)
+// plus any active ripple rings. See the GLSL shader's effectsField for
+// the full fill-vs-stroke rationale; in short, call sites subtract this
+// from the scene SDF for fills and from the sausage SDF
+// (abs(d) - halfW) for strokes, which is itself a proper fill SDF.
+fn effectsField(uv: vec2<f32>) -> f32 {
+  let delta = uv - U.cursor;
+  let r2 = dot(delta, delta);
+  let sigma = max(U.cursorRadius, 1e-4);
+  var total = U.cursorPull * exp(-r2 / (2.0 * sigma * sigma));
   let RIPPLE_WIDTH: f32 = 0.12;
   for (var i: i32 = 0; i < 4; i = i + 1) {
     let r = U.ripples[i];
     let rd = length(uv - r.xy);
     let rp = (rd - r.z) / RIPPLE_WIDTH;
-    d = d - r.w * exp(-rp * rp);
+    total = total + r.w * exp(-rp * rp);
   }
-  return d;
+  return total;
 }
 
 @fragment
@@ -220,13 +226,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv * (2.0 / U.zoom);
   uv = uv - U.offset;
 
+  let field = effectsField(uv);
+
   if (U.compositeMode == 0u) {
     let k = max(U.sminK, 1e-4);
     var d = sampleIdx(0u, uv);
     if (U.pathCount > 1u) { d = smin(d, sampleIdx(1u, uv), k); }
     if (U.pathCount > 2u) { d = smin(d, sampleIdx(2u, uv), k); }
     if (U.pathCount > 3u) { d = smin(d, sampleIdx(3u, uv), k); }
-    d = applyDistEffects(d, uv);
+    d = d - field;
     let aa = fwidth(d) * 1.2;
     let mask = 1.0 - smoothstep(-aa, aa, d);
     return vec4<f32>(U.color, mask * U.opacity);
@@ -237,21 +245,22 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   var acc = vec4<f32>(0.0);
   for (var i: u32 = 0u; i < 4u; i = i + 1u) {
     if (i >= U.pathCount) { break; }
-    var d = sampleIdx(i, uv);
-    d = applyDistEffects(d, uv);
+    let d = sampleIdx(i, uv);
     let mode = U.pathMode[i];
-    let aa = fwidth(d) * 1.2;
 
-    // Fill layer (mode 0 or 2).
+    // Fill layer (mode 0 or 2). Distort the scene SDF directly.
     if (mode != 1u) {
-      let a = (1.0 - smoothstep(-aa, aa, d)) * U.pathFillOpacity[i];
+      let dFill = d - field;
+      let aa = fwidth(dFill) * 1.2;
+      let a = (1.0 - smoothstep(-aa, aa, dFill)) * U.pathFillOpacity[i];
       let src = vec4<f32>(U.pathFillColor[i].rgb * a, a);
       acc = src + acc * (1.0 - src.a);
     }
-    // Stroke layer (mode 1 or 2).
+    // Stroke layer (mode 1 or 2). Distort the sausage SDF — the proper
+    // fill SDF of the curve dilated by halfW — rather than d itself.
     if (mode != 0u) {
       let halfW = U.pathStrokeHalfW[i];
-      let de = abs(d) - halfW;
+      let de = abs(d) - halfW - field;
       let aaS = fwidth(de) * 1.2;
       let a = (1.0 - smoothstep(-aaS, aaS, de)) * U.pathStrokeOpacity[i];
       let src = vec4<f32>(U.pathStrokeColor[i].rgb * a, a);

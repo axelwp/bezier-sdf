@@ -1,4 +1,4 @@
-import type { Path, CubicSegment } from '../geometry/types';
+import type { Mark, Path, CubicSegment } from '../geometry/types';
 import {
   MAX_PATHS,
   MAX_SEGS,
@@ -39,6 +39,7 @@ export class WebGLRenderer implements Renderer {
   private _pathCount = 0;
   private disposed = false;
   private ripplesBuf = new Float32Array(16);
+  private halfFloatType = 0;
 
   get mode(): 'baked' | 'direct' { return this._mode; }
   get pathCount(): number { return this._pathCount; }
@@ -87,6 +88,7 @@ export class WebGLRenderer implements Renderer {
     const halfFloatLinear = gl.getExtension('OES_texture_half_float_linear');
     if (!halfFloat || !colorBuf || !halfFloatLinear) return false;
     const HALF_FLOAT_OES = halfFloat.HALF_FLOAT_OES;
+    this.halfFloatType = HALF_FLOAT_OES;
 
     const bakeProgram = link(gl, WEBGL_BAKE_VERT, WEBGL_BAKE_FRAG);
     if (!bakeProgram) return false;
@@ -172,8 +174,6 @@ export class WebGLRenderer implements Renderer {
     segments: readonly CubicSegment[],
     halfFloatType: number,
   ): WebGLTexture | null {
-    const [segA, segB] = packSegments(segments);
-
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -185,16 +185,38 @@ export class WebGLRenderer implements Renderer {
       gl.RGBA, halfFloatType, null,
     );
 
+    if (!this.runBakeIntoTexture(gl, bakeProgram, tex, segments)) {
+      gl.deleteTexture(tex);
+      return null;
+    }
+    return tex;
+  }
+
+  /**
+   * Run the bake fragment program into `tex` with the given segments.
+   * Allocates and disposes one FBO; the texture is shared and reused
+   * across rebakes. Returns false only if framebuffer completeness check
+   * fails, which only happens at first-bake time (extension support);
+   * once a texture has succeeded once it'll succeed again.
+   */
+  private runBakeIntoTexture(
+    gl: WebGLRenderingContext,
+    bakeProgram: WebGLProgram,
+    tex: WebGLTexture,
+    segments: readonly CubicSegment[],
+  ): boolean {
+    const [segA, segB] = packSegments(segments);
+
     const fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.deleteFramebuffer(fbo);
-      gl.deleteTexture(tex);
-      return null;
+      return false;
     }
 
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
     gl.useProgram(bakeProgram);
     const posLoc = gl.getAttribLocation(bakeProgram, 'a_pos');
     gl.enableVertexAttribArray(posLoc);
@@ -212,7 +234,31 @@ export class WebGLRenderer implements Renderer {
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fbo);
-    return tex;
+    return true;
+  }
+
+  rebake(mark: Mark): void {
+    const gl = this.gl;
+    if (!gl || this.disposed) return;
+    if (this._mode !== 'baked' || !this.bakeProgram) return; // direct mode: nothing to bake
+    if (mark.paths.length !== this.textures.length) {
+      throw new Error(
+        `rebake: mark has ${mark.paths.length} paths but renderer was init'd with ${this.textures.length}`,
+      );
+    }
+    validateMark(mark, MAX_PATHS, MAX_SEGS);
+    for (let i = 0; i < mark.paths.length; i++) {
+      this.runBakeIntoTexture(gl, this.bakeProgram, this.textures[i]!, mark.paths[i]!.segments);
+    }
+    // Restore the sample program's vertex attrib state — runBakeIntoTexture
+    // bound the bake program's a_pos. Calling render() next switches
+    // programs and re-binds, so this isn't strictly required, but be tidy.
+    if (this.sampleProgram) {
+      gl.useProgram(this.sampleProgram);
+      const posLoc = gl.getAttribLocation(this.sampleProgram, 'a_pos');
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    }
   }
 
   private initDirect(gl: WebGLRenderingContext, combined: readonly CubicSegment[]) {

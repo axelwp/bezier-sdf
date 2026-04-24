@@ -231,14 +231,25 @@ int i4Idx(ivec4 v, int i) {
   return v.w;
 }
 
-void applyDistEffects(inout float d, vec2 uv) {
-  // Liquid-cursor pull — subtract an inverse-square radial field from the
-  // scene SDF. Locally reduces the distance value, so the zero-contour
-  // (the silhouette edge) bulges out toward the cursor and fuses with it
-  // when close. u_cursorPull=0 disables; u_cursorRadius is a softening
-  // epsilon (smaller = sharper/narrower tendril).
-  vec2 toCursor = u_cursor - uv;
-  d -= u_cursorPull / (dot(toCursor, toCursor) + u_cursorRadius);
+// Total subtractive deformation field at uv — the cursor pull plus any
+// active ripple rings. Returned (rather than mutating an inout d) so
+// call sites can subtract it from whichever SDF they're rendering:
+//
+//   - For fills, subtract from the scene SDF directly (d -= field).
+//     The zero-contour bulges toward the cursor.
+//   - For strokes, subtract from the sausage SDF abs(d) - halfWidth.
+//     That virtual region (Minkowski sum of the curve and a disk of
+//     radius halfWidth) is itself a proper fill SDF — distorting it
+//     thickens/warps the ink near the cursor instead of producing the
+//     amoeba-blob breakdown you get from applying the field to d and
+//     then taking abs.
+float effectsField(vec2 uv) {
+  // Cursor pull — Gaussian falloff. Bounded peak (= u_cursorPull) at
+  // r = 0; ~0 past 3·u_cursorRadius. u_cursorPull = 0 disables.
+  vec2 delta = uv - u_cursor;
+  float r2 = dot(delta, delta);
+  float sigma = max(u_cursorRadius, 1e-4);
+  float total = u_cursorPull * exp(-r2 / (2.0 * sigma * sigma));
 
   // Up to 4 concurrent shockwave rings. JS advances each ring's radius
   // (ripples[i].z) and tapers its amplitude (ripples[i].w) independently.
@@ -248,8 +259,9 @@ void applyDistEffects(inout float d, vec2 uv) {
     vec4 r = u_ripples[i];
     float rd = length(uv - r.xy);
     float rp = (rd - r.z) / RIPPLE_WIDTH;
-    d -= r.w * exp(-rp * rp);
+    total += r.w * exp(-rp * rp);
   }
+  return total;
 }
 
 void main() {
@@ -257,13 +269,15 @@ void main() {
   uv *= 2.0 / u_zoom;
   uv -= u_offset;
 
+  float field = effectsField(uv);
+
   if (u_compositeMode == 0) {
     float k = max(u_sminK, 1e-4);
     float d = sampleIdx(0, uv);
     if (u_pathCount > 1) d = smin(d, sampleIdx(1, uv), k);
     if (u_pathCount > 2) d = smin(d, sampleIdx(2, uv), k);
     if (u_pathCount > 3) d = smin(d, sampleIdx(3, uv), k);
-    applyDistEffects(d, uv);
+    d -= field;
     float aa = fwidth(d) * 1.2;
     float mask = 1.0 - smoothstep(-aa, aa, d);
     gl_FragColor = vec4(u_color, mask * u_opacity);
@@ -277,20 +291,24 @@ void main() {
   for (int i = 0; i < 4; i++) {
     if (i >= u_pathCount) break;
     float d = sampleIdx(i, uv);
-    applyDistEffects(d, uv);
     int mode = i4Idx(u_pathMode, i);
-    float aa = fwidth(d) * 1.2;
 
-    // Fill layer (mode 0 or 2).
+    // Fill layer (mode 0 or 2). Distort the scene SDF directly — the
+    // boundary bulges toward the cursor.
     if (mode != 1) {
-      float a = (1.0 - smoothstep(-aa, aa, d)) * v4Idx(u_pathFillOpacity, i);
+      float dFill = d - field;
+      float aa = fwidth(dFill) * 1.2;
+      float a = (1.0 - smoothstep(-aa, aa, dFill)) * v4Idx(u_pathFillOpacity, i);
       vec4 src = vec4(fillColorIdx(i) * a, a);
       acc = src + acc * (1.0 - src.a);
     }
-    // Stroke layer (mode 1 or 2).
+    // Stroke layer (mode 1 or 2). Compute the sausage SDF first
+    // (abs(d) - halfW — the SDF of the curve dilated by halfW), then
+    // distort that. Same math shape as the fill case, applied to a
+    // proper 2D region instead of a 1D level set, so no amoeba blobs.
     if (mode != 0) {
       float halfW = v4Idx(u_pathStrokeHalfW, i);
-      float de = abs(d) - halfW;
+      float de = abs(d) - halfW - field;
       float aaS = fwidth(de) * 1.2;
       float a = (1.0 - smoothstep(-aaS, aaS, de)) * v4Idx(u_pathStrokeOpacity, i);
       vec4 src = vec4(strokeColorIdx(i) * a, a);
