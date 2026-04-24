@@ -245,8 +245,15 @@ const SAMPLE_SDF_DISPATCH = Array.from({ length: MAX_PATHS }, (_, i) =>
  *   0 — legacy: smooth-union all paths, paint in `color`. Used by the
  *       reveal example so split sub-paths morph as one shape.
  *   1 — per-path: composite fill/stroke layers per path in document
- *       order ("over" operator). Used for arbitrary user SVGs. smin is
- *       not applied across paths in this mode; see KNOWN_LIMITATIONS.md.
+ *       order ("over" operator) at rest, so arbitrary user SVGs render
+ *       with correct per-path paint. Under active cursor/ripple effects,
+ *       the fills of all paths are additionally smin-fused with
+ *       polynomial smooth-min and their colors blend via the same
+ *       mix-weight; the blend ramps in with `effectsField` so fusion is
+ *       localized to the distorted region and the at-rest result is
+ *       unchanged. Strokes don't participate in the color-blend (their
+ *       per-path half-width makes cross-path sausage-SDF smin
+ *       ill-defined); they composite "over" the blended fill unchanged.
  */
 export const WEBGPU_SAMPLE_SHADER = /* wgsl */ `
 struct Uniforms {
@@ -304,6 +311,28 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
   return min(a, b) - h * h * k * 0.25;
 }
 
+// Polynomial smooth-min — iquilezles.org/articles/smin. Returns
+// (smin_value, h) where 'h' is the cubic mix-weight *toward 'a'*: h → 1
+// when 'a' is much smaller (a dominates), h → 0 when 'b' is much
+// smaller. Callers use the same h to blend per-path colors with
+// mix(color_b, color_a, h). As k → 0 the h factor clamps to 0/1 and
+// the -h*(1-h)*k bump vanishes, so this degenerates cleanly to min()
+// and hard color selection. 'k' must be strictly positive.
+fn sminPoly(a: f32, b: f32, k: f32) -> vec2<f32> {
+  let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  let d = mix(b, a, h) - h * (1.0 - h) * k;
+  return vec2<f32>(d, h);
+}
+
+// Coupling between the per-pixel effects field and the local smin
+// strength used for color-blend fusion in per-path composite mode.
+// At rest 'effectsField = 0' so 'localK = 0' and the blend path
+// contributes nothing.
+const SMIN_COUPLING: f32 = 0.3;
+// Width of the transition band between pure Porter-Duff (rest) and
+// the full smin-blend result (active effects).
+const BLEND_EPS: f32 = 0.002;
+
 fn pathOffset(i: u32) -> vec2<f32> {
   let v = U.pathOffsets[i / 2u];
   return select(v.zw, v.xy, (i & 1u) == 0u);
@@ -348,7 +377,13 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let field = effectsField(uv);
 
   if (U.compositeMode == 0u) {
-    let k = max(U.sminK, 1e-4);
+    // Legacy single-color smin. Effective k is boosted locally by the
+    // effects field — at rest 'k = U.sminK'; under cursor/ripple the
+    // extra term strengthens fusion only where the distortion reaches,
+    // so adjacent subpaths visibly bridge instead of each rippling
+    // independently. Output stays single-color (legacy silhouette paints
+    // 'U.color'); color-blend fusion is a per-path-mode feature.
+    let k = max(U.sminK + field * SMIN_COUPLING, 1e-4);
     var d = sampleIdx(0u, uv);
     for (var i: u32 = 1u; i < ${MAX_PATHS}u; i = i + 1u) {
       if (i >= U.pathCount) { break; }
@@ -360,9 +395,19 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(U.color, mask * U.opacity);
   }
 
-  // Per-path composite: accumulate with Porter-Duff "over" in premultiplied
-  // alpha, convert back to straight alpha at the end.
-  var acc = vec4<f32>(0.0);
+  // Per-path composite. Two results are computed and blended by
+  // 'blendWeight', a smoothstep of 'localK = field * SMIN_COUPLING':
+  //   (A) Porter-Duff "over" across independent distorted paths — used
+  //       at rest so per-path paint and document-order overlaps match
+  //       the SVG exactly.
+  //   (B) Smin + color-blend across fills, strokes composited "over"
+  //       on top — used under active effects so adjacent subpaths fuse
+  //       with smooth color gradients through the bridge.
+  let localK = field * SMIN_COUPLING;
+  let blendWeight = smoothstep(0.0, 2.0 * BLEND_EPS, localK);
+
+  // (A) Porter-Duff "over" — stable per-path composite.
+  var overAcc = vec4<f32>(0.0);
   for (var i: u32 = 0u; i < ${MAX_PATHS}u; i = i + 1u) {
     if (i >= U.pathCount) { break; }
     let d = sampleIdx(i, uv);
@@ -372,25 +417,80 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     let fillOp = U.pathFillOpacity[slot][sub];
     let strokeOp = U.pathStrokeOpacity[slot][sub];
     let halfW = U.pathStrokeHalfW[slot][sub];
-
-    // Fill layer (mode 0 or 2). Distort the scene SDF directly.
     if (mode != 1u) {
       let dFill = d - field;
       let aa = fwidth(dFill) * 1.2;
       let a = (1.0 - smoothstep(-aa, aa, dFill)) * fillOp;
       let src = vec4<f32>(U.pathFillColor[i].rgb * a, a);
-      acc = src + acc * (1.0 - src.a);
+      overAcc = src + overAcc * (1.0 - src.a);
     }
-    // Stroke layer (mode 1 or 2). Distort the sausage SDF — the proper
-    // fill SDF of the curve dilated by halfW — rather than d itself.
     if (mode != 0u) {
       let de = abs(d) - halfW - field;
       let aaS = fwidth(de) * 1.2;
       let a = (1.0 - smoothstep(-aaS, aaS, de)) * strokeOp;
       let src = vec4<f32>(U.pathStrokeColor[i].rgb * a, a);
-      acc = src + acc * (1.0 - src.a);
+      overAcc = src + overAcc * (1.0 - src.a);
     }
   }
+
+  // (B) Smin + color-blend across fills. Always computed (not gated on
+  // blendWeight) — WGSL's uniformity analyzer flags textureSample inside
+  // a branch whose predicate is per-fragment (blendWeight depends on
+  // fragCoord via effectsField), so we run it unconditionally. Cost is
+  // two extra MAX_PATHS-bounded loops per fragment; when blendWeight = 0
+  // the mix below discards the result so visual behaviour is identical.
+  let kK = max(localK, 1e-4);
+  var hasFill = false;
+  var accSdf: f32 = 0.0;
+  var accCol = vec3<f32>(0.0);
+  var accOp: f32 = 0.0;
+  for (var i: u32 = 0u; i < ${MAX_PATHS}u; i = i + 1u) {
+    if (i >= U.pathCount) { break; }
+    let slot = i / 4u;
+    let sub = i % 4u;
+    let mode = U.pathMode[slot][sub];
+    if (mode != 1u) {
+      let d = sampleIdx(i, uv);
+      let fillOp = U.pathFillOpacity[slot][sub];
+      let col = U.pathFillColor[i].rgb;
+      if (!hasFill) {
+        accSdf = d;
+        accCol = col;
+        accOp = fillOp;
+        hasFill = true;
+      } else {
+        let sh = sminPoly(accSdf, d, kK);
+        accCol = mix(col, accCol, sh.y);
+        accOp = mix(fillOp, accOp, sh.y);
+        accSdf = sh.x;
+      }
+    }
+  }
+  var blendAcc = vec4<f32>(0.0);
+  if (hasFill) {
+    let dFill = accSdf - field;
+    let aa = fwidth(dFill) * 1.2;
+    let a = (1.0 - smoothstep(-aa, aa, dFill)) * accOp;
+    blendAcc = vec4<f32>(accCol * a, a);
+  }
+  for (var i: u32 = 0u; i < ${MAX_PATHS}u; i = i + 1u) {
+    if (i >= U.pathCount) { break; }
+    let slot = i / 4u;
+    let sub = i % 4u;
+    let mode = U.pathMode[slot][sub];
+    if (mode != 0u) {
+      let d = sampleIdx(i, uv);
+      let strokeOp = U.pathStrokeOpacity[slot][sub];
+      let halfW = U.pathStrokeHalfW[slot][sub];
+      let de = abs(d) - halfW - field;
+      let aaS = fwidth(de) * 1.2;
+      let a = (1.0 - smoothstep(-aaS, aaS, de)) * strokeOp;
+      let src = vec4<f32>(U.pathStrokeColor[i].rgb * a, a);
+      blendAcc = src + blendAcc * (1.0 - src.a);
+    }
+  }
+
+  let acc = mix(overAcc, blendAcc, blendWeight);
   var rgb = vec3<f32>(0.0);
   if (acc.a > 1e-6) { rgb = acc.rgb / acc.a; }
   return vec4<f32>(rgb, acc.a * U.opacity);
@@ -486,6 +586,13 @@ ${GLASS_SDF_DISPATCH}
   return 0.0;
 }
 
+// Coupling between the effects field and the local smin strength used
+// for cross-path fusion in glass. Added to 'U.sminK' so the at-rest
+// fusion baseline is preserved and the cursor region gets a stronger
+// bridge on top. Tune down specifically for glass if strong cursor
+// pulls over-fuse.
+const GLASS_SMIN_COUPLING: f32 = 0.3;
+
 // Converts a raw per-path SDF to the right fill-SDF for glass rendering:
 //   - fill (0) or both (2): the scene SDF as-is
 //   - stroke (1):           abs(d) - halfW, the SDF of the curve dilated
@@ -493,10 +600,11 @@ ${GLASS_SDF_DISPATCH}
 //                           proper 2D fill SDF, so all the glass math
 //                           (height field, normals, refraction, Fresnel)
 //                           works on it unchanged.
-// Then smooth-unions across all active paths. Replaces the previous
-// combinedSdf, which assumed every path was a fill.
-fn shapeSdf(uv: vec2<f32>) -> f32 {
-  let k = max(U.sminK, 1e-4);
+// Then smooth-unions across all active paths with the caller-supplied
+// 'k'. Caller injects 'U.sminK + localK' so fusion strengthens under
+// the cursor (see 'lens' below).
+fn shapeSdf(uv: vec2<f32>, kIn: f32) -> f32 {
+  let k = max(kIn, 1e-4);
   let d0 = sampleSdf(0u, uv);
   let m0 = U.pathMode[0][0];
   let h0 = U.pathStrokeHalfW[0][0];
@@ -531,6 +639,14 @@ fn effectsField(uv: vec2<f32>) -> f32 {
   return total;
 }
 
+// Combined lens SDF at 'uv': cross-path smin silhouette (with local k
+// boosted by the effects field) minus the field itself. Fusion and
+// bulge share the same 'f' at each tap — one coherent deformation.
+fn lens(uv: vec2<f32>) -> f32 {
+  let f = effectsField(uv);
+  return shapeSdf(uv, U.sminK + f * GLASS_SMIN_COUPLING) - f;
+}
+
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = U.resolution;
@@ -539,7 +655,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv * (2.0 / U.zoom);
   uv = uv - U.offset;
 
-  let d = shapeSdf(uv) - effectsField(uv);
+  let d = lens(uv);
   let aa = fwidth(d) * 1.2;
   let insideMask = 1.0 - smoothstep(-aa, aa, d);
 
@@ -555,15 +671,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let SOFT_EDGE: f32 = 0.03;
   let D:         f32 = 0.70710678 * SDF_BLUR;  // = SDF_BLUR / √2
 
-  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv) - effectsField(uv))) * 2.0;
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv + vec2<f32>(SDF_BLUR, 0.0)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv - vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv - vec2<f32>(SDF_BLUR, 0.0)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv + vec2<f32>(0.0, SDF_BLUR)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv - vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv - vec2<f32>(0.0, SDF_BLUR)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>( D,  D)) - effectsField(uv + vec2<f32>( D,  D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>( D, -D)) - effectsField(uv + vec2<f32>( D, -D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(-D,  D)) - effectsField(uv + vec2<f32>(-D,  D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(-D, -D)) - effectsField(uv + vec2<f32>(-D, -D)));
+  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv))) * 2.0;
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv + vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv - vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv + vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv - vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv + vec2<f32>( D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv + vec2<f32>( D, -D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv + vec2<f32>(-D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, lens(uv + vec2<f32>(-D, -D)));
   h = h / 10.0;
 
   let grad = vec2<f32>(dpdx(h), dpdy(h));

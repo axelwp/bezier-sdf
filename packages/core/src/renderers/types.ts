@@ -14,9 +14,14 @@ import type { Mark, Path, PathMode, RgbColor } from '../geometry/types';
  *
  *   - **Per-path composite mode** (used for arbitrary user SVGs): pass
  *     `pathModes`, `pathFillColors`, `pathStrokeColors`, `pathStrokeHalfW`.
- *     Each path is rasterized independently (fill, stroke, or both) and
- *     composited in document order. smin is not applied across paths in
- *     this mode — see `KNOWN_LIMITATIONS.md`.
+ *     At rest, each path is rasterized independently (fill, stroke, or
+ *     both) and composited in document order with Porter-Duff "over".
+ *     Under active cursor/ripple effects, the fills of all paths are
+ *     additionally smin-fused and their colors blend via the polynomial
+ *     smooth-min's mix weight, so adjacent subpaths visibly bridge under
+ *     the cursor; the blend is local to the distorted region, so the
+ *     at-rest composite is unchanged. Strokes never participate in the
+ *     color-blend (they composite "over" the blended fill unchanged).
  *
  * `pathOffsets` translates each sub-path's UV before the SDF lookup —
  * the animation primitive. A path at offset `(0, 0)` is drawn in its

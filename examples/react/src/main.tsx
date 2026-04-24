@@ -288,6 +288,15 @@ function Playground({
   const [rippleDurationEnabled, setRippleDurationEnabled] = useState(false);
   const [tint, setTint] = useState(true);
   const [color, setColor] = useState('#ff6a3d');
+
+  // Tint-on by default is the right read for the demo logo (a single-path
+  // silhouette where the color override is the whole point). For an
+  // uploaded SVG the user is almost always there to preview their own
+  // artwork, where the native per-path paint is what they want to see —
+  // force tint off on upload, restore on reset to the default.
+  useEffect(() => {
+    setTint(src === DEFAULT_SRC);
+  }, [src]);
   const [opacity, setOpacity] = useState(1);
   const [autoPlay, setAutoPlay] = useState(false);
   const logoRef = useRef<BezierLogoHandle>(null);
@@ -707,7 +716,10 @@ function ShowcaseCard({
           key={`${spec.id}:${bakeKey}`}
           ref={ref}
           src={src}
-          color={spec.color}
+          // Thematic color applies only to the built-in demo logo —
+          // uploaded SVGs render with their own per-path paint so users
+          // can preview their artwork as authored.
+          color={src === DEFAULT_SRC ? spec.color : undefined}
           effect={spec.effect}
           backdrop={backdrop}
           autoPlay={spec.autoPlay}

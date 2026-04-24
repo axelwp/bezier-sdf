@@ -662,18 +662,15 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       // drawn, `color` is ignored. Avoids recoloring an icon into
       // something its author didn't intend.
       //
-      // Exception: the reveal effect's composite fuses subpaths through
-      // smin. That's correct for the hand-authored demo (two chevrons
-      // morphing through one silhouette is the signature aesthetic) but
-      // wrong for user SVGs, where subpaths carry designer-intended
-      // proportions (hexagons connected by thin line segments get
-      // bridged with visible smin blobs). User SVGs come out of the
-      // parser without a `renderMode` — treated as 'per-path' here — so
-      // only marks that explicitly opt into 'legacy-smin' (DEMO_MARK)
-      // keep the legacy tint branch when reveal is active.
+      // Reveal on a multi-subpath user SVG does smin-union the subpaths
+      // into one silhouette, which can produce visible bridging blobs
+      // between subpaths that shouldn't touch. That's a deliberate
+      // trade the caller opts into by providing `color`: the explicit
+      // tint signals "render this as one shape in one color," which is
+      // the legacy-smin aesthetic regardless of source. Callers who
+      // want preserved subpath structure simply omit `color`.
       const allFill = base ? base.pathModes.every((m) => m === 'fill') : true;
-      const revealForcesPerPath = hasReveal && mark.renderMode !== 'legacy-smin';
-      const useLegacy = !revealForcesPerPath && allFill && state.color !== undefined;
+      const useLegacy = allFill && state.color !== undefined;
 
       if (useLegacy) {
         const [cr, cg, cb] = parseColor(state.color!);
