@@ -521,7 +521,7 @@ void main() {
   vec3 color = mix(frost, chromaticColor, lensAmount);
 
   // Fresnel rim — bright narrow band along the shape's edge.
-  float rim = 1.0 - smoothstep(0.0, 0.02, abs(d));
+  float rim = smoothstep(-0.03, -0.005, d) * (1.0 - smoothstep(-0.005, 0.0, d));
   color += u_rimColor * rim * u_fresnelStrength;
 
   // Interior tint — slight color wash in proportion to depth.

@@ -492,7 +492,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
   var color = mix(frost, chromaticColor, lensAmount);
 
-  let rim = 1.0 - smoothstep(0.0, 0.02, abs(d));
+  let rim = smoothstep(-0.03, -0.005, d) * (1.0 - smoothstep(-0.005, 0.0, d));
   color = color + U.rimColor * rim * U.fresnelStrength;
 
   color = mix(color, U.tintColor, clamp(interior * U.tintStrength, 0.0, 1.0));
