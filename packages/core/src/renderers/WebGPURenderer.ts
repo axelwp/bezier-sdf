@@ -83,6 +83,8 @@ export class WebGPURenderer implements Renderer {
   private glassPipeline: GPURenderPipeline | null = null;
   private glassUniformBuffer: GPUBuffer | null = null;
   private glassBindGroup: GPUBindGroup | null = null;
+  private glassBindGroupLayout: GPUBindGroupLayout | null = null;
+  private sampler: GPUSampler | null = null;
   private backdropTexture: GPUTexture | null = null;
   private glassUniformData = new ArrayBuffer(WEBGPU_GLASS_UNIFORM_SIZE);
   private _pathCount = 0;
@@ -168,6 +170,7 @@ export class WebGPURenderer implements Renderer {
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
     });
+    this.sampler = sampler;
     const sampleShader = device.createShaderModule({ code: WEBGPU_SAMPLE_SHADER });
     const sampleBindGroupLayout = device.createBindGroupLayout({
       entries: [
@@ -261,6 +264,7 @@ export class WebGPURenderer implements Renderer {
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
       ],
     });
+    this.glassBindGroupLayout = glassLayout;
     this.glassPipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [glassLayout] }),
       vertex: { module: glassShader, entryPoint: 'vs_main' },
@@ -361,6 +365,56 @@ export class WebGPURenderer implements Renderer {
     for (let i = 0; i < mark.paths.length; i++) {
       this.runBakeIntoTexture(device, this.textures[i]!, mark.paths[i]!);
     }
+  }
+
+  setBackdrop(source: TexImageSource): void {
+    const device = this.device;
+    if (!device || this.disposed) return;
+    // No glass pipeline was compiled (no backdrop at init) → nothing to
+    // update. Callers can't upgrade a non-glass renderer to glass without
+    // a re-init.
+    if (!this.glassBindGroupLayout || !this.sampler) return;
+
+    const [bw, bh] = textureSourceSize(source);
+    if (!bw || !bh) return;
+
+    const old = this.backdropTexture;
+    // Texture dims are fixed at creation; always allocate a new one rather
+    // than try to detect same-size updates. Cheap, and same-size is the
+    // rare case (caller triggers setBackdrop on *size change*).
+    const next = device.createTexture({
+      size: [bw, bh],
+      format: 'rgba8unorm',
+      usage:
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    device.queue.copyExternalImageToTexture(
+      { source, flipY: false },
+      { texture: next },
+      [bw, bh, 1],
+    );
+    this.backdropTexture = next;
+
+    // Bind group holds the texture view by reference; rebuild so future
+    // render() calls sample the new texture.
+    const viewFor = (i: number) =>
+      (i < this.textures.length ? this.textures[i]! : this.dummyTexture!).createView();
+    this.glassBindGroup = device.createBindGroup({
+      layout: this.glassBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.glassUniformBuffer! } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: viewFor(0) },
+        { binding: 3, resource: viewFor(1) },
+        { binding: 4, resource: viewFor(2) },
+        { binding: 5, resource: viewFor(3) },
+        { binding: 6, resource: next.createView() },
+      ],
+    });
+
+    old?.destroy();
   }
 
   render(u: Uniforms): void {
@@ -567,5 +621,7 @@ export class WebGPURenderer implements Renderer {
     this.bakeBindGroupLayout = null;
     this.glassPipeline = null;
     this.glassBindGroup = null;
+    this.glassBindGroupLayout = null;
+    this.sampler = null;
   }
 }

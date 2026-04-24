@@ -363,6 +363,19 @@ export class WebGLRenderer implements Renderer {
     }
   }
 
+  setBackdrop(source: TexImageSource): void {
+    const gl = this.gl;
+    if (!gl || this.disposed) return;
+    if (!this.backdropTexture) return; // no glass pipeline → nothing to update
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, this.backdropTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE,
+      source,
+    );
+  }
+
   private initDirect(gl: WebGLRenderingContext, combined: readonly CubicSegment[]) {
     const program = link(gl, WEBGL_VERT, WEBGL_DIRECT_FRAG);
     if (!program) throw new Error('direct shader failed to link');

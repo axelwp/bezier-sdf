@@ -104,8 +104,34 @@ export interface BezierLogoProps {
    * Static-only for now: the renderer uploads this once at init. Changing
    * the value triggers a renderer re-init. Ignored unless glass is
    * active.
+   *
+   * Aspect: the image is center-cropped (CSS `cover` behavior) to the
+   * canvas aspect before being sampled by the shader. For the content
+   * inside the lens to line up with whatever you paint behind the
+   * canvas, render that visible layer with the same cover-crop against
+   * a box that matches the canvas's on-screen rect (e.g. `<img
+   * style={{objectFit: 'cover'}}>` at canvas size, or a `background-size:
+   * cover; background-position: center` on a canvas-sized element).
    */
   backdrop?: BezierLogoBackdrop;
+  /**
+   * Gaussian blur (in CSS pixels of the display canvas) applied to the
+   * backdrop after it's resized to match the canvas's backing-store
+   * dimensions. The shader samples the blurred texture — refraction over
+   * high-frequency input (photos, textures) otherwise reads as noisy
+   * smearing because adjacent pixels sample unrelated backdrop detail.
+   * Pre-blurring attenuates that high-frequency content so refraction
+   * reads as smooth warping.
+   *
+   * Default `6`: frosted-glass feel on photos, only a faint softening on
+   * abstract backdrops. Set to `0` for crisp refraction (best for
+   * gradients, grids, UI screenshots). Higher values (`10`–`16`) push
+   * further toward heavy frosting.
+   *
+   * Re-applied whenever the canvas resizes, so the kernel radius remains
+   * correct in display-space. Ignored unless glass is active.
+   */
+  backdropBlur?: number;
   /**
    * Switch the silhouette pipeline to a material shader. `'glass'` renders
    * the shape as a refractive liquid-glass lens (requires `backdrop`).
@@ -313,6 +339,101 @@ async function loadBackdrop(src: BezierLogoBackdrop): Promise<TexImageSource> {
   return src;
 }
 
+/** Native pixel dimensions across the three backdrop source shapes. */
+function sourceSize(
+  src: HTMLImageElement | HTMLCanvasElement | ImageBitmap,
+): { w: number; h: number } {
+  if (typeof HTMLImageElement !== 'undefined' && src instanceof HTMLImageElement) {
+    return { w: src.naturalWidth || src.width, h: src.naturalHeight || src.height };
+  }
+  return { w: src.width, h: src.height };
+}
+
+/**
+ * Resize the backdrop to match the display canvas, then (optionally)
+ * Gaussian-blur it. Refraction sampling reads a different pixel per
+ * destination fragment; on a high-frequency backdrop those neighboring
+ * lookups land on unrelated detail and refraction reads as noise.
+ * Blurring attenuates that high-frequency content so the shader produces
+ * smooth warping instead.
+ *
+ * Resize-first matters: Canvas 2D `filter: blur(Npx)` is specified in CSS
+ * pixels of the *destination*. If we blur at source resolution (say,
+ * 4000px wide) and then downscale, an `Npx` blur there is a sub-pixel
+ * blur in display space — barely visible. Resizing first puts the blur
+ * kernel in the same coordinate space as the final display.
+ *
+ * Two canvases deliberately: blurring in-place on the resized canvas
+ * (re-using the same `drawImage` target) sometimes reads the pre-blur
+ * pixels because the browser treats the canvas as both source and
+ * destination of its own filter — safer to blur from one canvas into
+ * another.
+ *
+ * Aspect handling: the resize is a center-cropped *cover* — the source
+ * is scaled proportionally to fill the target box and trimmed on the
+ * long axis. The glass shader samples backdrop UVs `0..1` straight from
+ * the canvas fragment coordinate, so a stretched texture would render
+ * squashed content inside the lens that doesn't line up with whatever
+ * the user paints behind the canvas (typically the same image with
+ * `background-size: cover` / `object-fit: cover` — also center-cropped).
+ * Cover is the only choice that keeps the two views consistent without
+ * requiring the caller to pre-crop; contain (letterbox) would leave
+ * blank bars the user has no way to color-match to their scene.
+ *
+ * Runs once at init and again on canvas resize. Tens of ms for a 1080p
+ * source; negligible on modern hardware, never per-frame.
+ */
+function prepareBackdrop(
+  source: HTMLImageElement | HTMLCanvasElement | ImageBitmap,
+  targetWidth: number,
+  targetHeight: number,
+  blurPx: number,
+): HTMLCanvasElement {
+  const { w: sw, h: sh } = sourceSize(source);
+  // Source-rect (sx, sy, cropW, cropH) center-cropped to the target
+  // aspect. Falls back to the full source when the source is degenerate
+  // (zero-sized) so we never divide by zero and drawImage stays defined.
+  const targetAspect = targetWidth / targetHeight;
+  let cropW = sw;
+  let cropH = sh;
+  if (sw > 0 && sh > 0) {
+    const sourceAspect = sw / sh;
+    if (sourceAspect > targetAspect) {
+      // Source wider than target → crop left/right.
+      cropW = sh * targetAspect;
+    } else if (sourceAspect < targetAspect) {
+      // Source taller than target → crop top/bottom.
+      cropH = sw / targetAspect;
+    }
+  }
+  const sx = (sw - cropW) * 0.5;
+  const sy = (sh - cropH) * 0.5;
+
+  const resized = document.createElement('canvas');
+  resized.width = targetWidth;
+  resized.height = targetHeight;
+  const rctx = resized.getContext('2d');
+  if (!rctx) throw new Error('liquid-glass: 2D context unavailable for backdrop prep');
+  rctx.imageSmoothingEnabled = true;
+  rctx.imageSmoothingQuality = 'high';
+  rctx.drawImage(
+    source as CanvasImageSource,
+    sx, sy, cropW, cropH,
+    0, 0, targetWidth, targetHeight,
+  );
+
+  if (blurPx <= 0) return resized;
+
+  const blurred = document.createElement('canvas');
+  blurred.width = targetWidth;
+  blurred.height = targetHeight;
+  const bctx = blurred.getContext('2d');
+  if (!bctx) throw new Error('liquid-glass: 2D context unavailable for backdrop blur');
+  bctx.filter = `blur(${blurPx}px)`;
+  bctx.drawImage(resized, 0, 0);
+  return blurred;
+}
+
 interface GlassUniformShape {
   refractionStrength: number;
   chromaticStrength: number;
@@ -358,6 +479,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
     style,
     ariaLabel,
     backdrop,
+    backdropBlur = 6,
     material,
   },
   ref,
@@ -606,12 +728,39 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       startLoop();
     };
 
+    // Kept across the whole mount so the resize observer can re-prepare
+    // the backdrop at the new canvas size without re-fetching the image.
+    let rawBackdrop: HTMLImageElement | HTMLCanvasElement | ImageBitmap | null = null;
+    let preparedW = 0;
+    let preparedH = 0;
+
+    // Prepare at the canvas's current backing-store size, if that size
+    // is usable. Returns `null` when the canvas hasn't been laid out yet
+    // (1×1 fallback from sizeCanvas) or when a prep at that exact size
+    // has already been uploaded. Caller decides whether this becomes the
+    // initial backdrop or a later `setBackdrop` payload.
+    const prepareAtCurrentSize = (): HTMLCanvasElement | null => {
+      if (!rawBackdrop) return null;
+      const tw = canvas.width;
+      const th = canvas.height;
+      if (tw <= 1 || th <= 1) return null;
+      if (tw === preparedW && th === preparedH) return null;
+      const prepared = prepareBackdrop(rawBackdrop, tw, th, backdropBlur);
+      preparedW = tw;
+      preparedH = th;
+      return prepared;
+    };
+
     (async () => {
       let backdropSrc: TexImageSource | undefined;
       if (glassMode && backdrop) {
         try {
-          backdropSrc = await loadBackdrop(backdrop);
+          const loaded = await loadBackdrop(backdrop);
           if (cancelled) return;
+          // loadBackdrop's return type is TexImageSource, but in practice
+          // it only yields the three shapes `BezierLogoBackdrop` exposes
+          // — which is also the set `prepareBackdrop` accepts.
+          rawBackdrop = loaded as HTMLImageElement | HTMLCanvasElement | ImageBitmap;
         } catch (err) {
           if (cancelled) return;
           onError?.(err instanceof Error ? err : new Error(String(err)));
@@ -619,6 +768,11 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
           return;
         }
         sizeCanvas();
+        // If the canvas hasn't been laid out yet (no container size),
+        // seed the renderer with the raw image so the glass pipeline
+        // still compiles; the first ResizeObserver callback will swap in
+        // a properly-sized, properly-blurred backdrop via setBackdrop.
+        backdropSrc = prepareAtCurrentSize() ?? rawBackdrop;
       }
 
       try {
@@ -659,9 +813,18 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       // first event/rAF tick.
       renderOnce(performance.now());
 
-      // Resize.
+      // Resize. A display-size change invalidates the pre-blurred backdrop
+      // (the blur kernel is specified in display-space pixels), so re-prep
+      // and push it through `setBackdrop` before the next render. No GPU
+      // work per frame — `prepareAtCurrentSize` early-exits when the size
+      // hasn't actually changed.
       ro = new ResizeObserver(() => {
-        if (sizeCanvas()) renderOnce(performance.now());
+        if (!sizeCanvas()) return;
+        if (glassMode && renderer && rawBackdrop) {
+          const reprepped = prepareAtCurrentSize();
+          if (reprepped) renderer.setBackdrop(reprepped);
+        }
+        renderOnce(performance.now());
       });
       ro.observe(container);
 
@@ -752,7 +915,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       renderer = null;
       runtimes = [];
     };
-  }, [mark, rendererKind, effectKey, autoPlay, onReady, onError, backdrop, material]);
+  }, [mark, rendererKind, effectKey, autoPlay, onReady, onError, backdrop, backdropBlur, material]);
 
   /* --------------- 3. React to color/opacity changes mid-life -------------- */
 

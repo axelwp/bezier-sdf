@@ -120,6 +120,17 @@ export interface Renderer {
    * `mode === 'baked'`.
    */
   rebake(mark: Mark): void;
+  /**
+   * Replace the backdrop texture used by the glass sample pipeline.
+   * Intended for when the *display* canvas resizes and the caller wants
+   * to re-upload a freshly prepared (resized / re-blurred) backdrop, not
+   * for streaming per-frame content. May be a no-op if the renderer was
+   * not init'd with a backdrop (no glass pipeline compiled).
+   *
+   * The source's dimensions do not need to match the previous backdrop —
+   * the renderer may recreate the underlying texture to fit.
+   */
+  setBackdrop(source: TexImageSource): void;
   dispose(): void;
 }
 
