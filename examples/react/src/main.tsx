@@ -100,6 +100,8 @@ interface CardSpec {
   replay?: boolean;
   /** Provide a backdrop canvas for the liquid-glass material to refract. */
   backdrop?: boolean;
+  /** Show a backdrop upload button in the replay slot. */
+  backdropUpload?: boolean;
 }
 
 const CARDS: CardSpec[] = [
@@ -156,21 +158,38 @@ const CARDS: CardSpec[] = [
     code: `<BezierLogo effect={{ name: 'liquid-glass' }} backdrop={img} />`,
     hint: 'refracts the backdrop',
     backdrop: true,
+    backdropUpload: true,
   },
 ];
 
 /* ============================== playground ============================== */
 
+type GlassNumericParams = {
+  refractionStrength: number;
+  chromaticStrength: number;
+  fresnelStrength: number;
+  tintStrength: number;
+  frostStrength: number;
+};
+
 type PlaygroundParams = {
   reveal: { duration: number; startOffset: number; sminK: number };
   ripple: { speed: number; duration: number; amplitude: number; decay: number };
   'liquid-cursor': { pull: number; radius: number; lerp: number };
+  glass: GlassNumericParams;
 };
 
 const DEFAULT_PARAMS: PlaygroundParams = {
   reveal: { duration: 1400, startOffset: 0.3, sminK: 0.08 },
   ripple: { speed: 2.8, duration: 0.9, amplitude: 0.08, decay: 3.5 },
   'liquid-cursor': { pull: 0.08, radius: 0.15, lerp: 0.5 },
+  glass: {
+    refractionStrength: GLASS_DEFAULTS.refractionStrength,
+    chromaticStrength:  GLASS_DEFAULTS.chromaticStrength,
+    fresnelStrength:    GLASS_DEFAULTS.fresnelStrength,
+    tintStrength:       GLASS_DEFAULTS.tintStrength,
+    frostStrength:      GLASS_DEFAULTS.frostStrength,
+  },
 };
 
 interface SliderSpec {
@@ -200,6 +219,14 @@ const PARAM_UI: Record<FrameEffectName, SliderSpec[]> = {
   ],
 };
 
+const GLASS_PARAM_UI: SliderSpec[] = [
+  { key: 'refractionStrength', label: 'refraction', min: 0, max: 0.2,  step: 0.005 },
+  { key: 'chromaticStrength',  label: 'chromatic',  min: 0, max: 0.1,  step: 0.001 },
+  { key: 'fresnelStrength',    label: 'fresnel',    min: 0, max: 1,    step: 0.01 },
+  { key: 'tintStrength',       label: 'tint',       min: 0, max: 1,    step: 0.01 },
+  { key: 'frostStrength',      label: 'frost',      min: 0, max: 8,    step: 0.1 },
+];
+
 const EFFECT_ORDER: FrameEffectName[] = ['reveal', 'ripple', 'liquid-cursor'];
 const EFFECT_HINT: Record<FrameEffectName, string> = {
   reveal: 'autoplay or replay to see it',
@@ -211,6 +238,8 @@ function buildEffectProp(
   active: Record<FrameEffectName, boolean>,
   params: PlaygroundParams,
   rippleDurationEnabled: boolean,
+  glass: boolean,
+  glassColors: { rimColor: string; tintColor: string },
 ): BezierLogoProps['effect'] {
   const specs: BezierLogoEffectSpec[] = EFFECT_ORDER
     .filter((name) => active[name])
@@ -221,6 +250,16 @@ function buildEffectProp(
       }
       return { name, ...params[name] } as BezierLogoEffectSpec;
     });
+  // Glass params ride alongside via a liquid-glass spec — extracted by
+  // BezierLogo's extractGlassSpec, then applied as glass uniforms. The
+  // `material='glass'` prop is what actually activates the pipeline.
+  if (glass) {
+    specs.push({
+      name: 'liquid-glass',
+      ...params.glass,
+      ...glassColors,
+    } as BezierLogoEffectSpec);
+  }
   if (specs.length === 0) return 'none';
   return specs;
 }
@@ -239,6 +278,12 @@ function Playground({
     ripple: true,
     'liquid-cursor': true,
   });
+  const [glass, setGlass] = useState(false);
+  const [glassRim, setGlassRim] = useState<string>(GLASS_DEFAULTS.rimColor);
+  const [glassTint, setGlassTint] = useState<string>(GLASS_DEFAULTS.tintColor);
+  const [glassUploadUrl, setGlassUploadUrl] = useState<string | null>(null);
+  const [glassUploadName, setGlassUploadName] = useState<string | null>(null);
+  const glassFileInputRef = useRef<HTMLInputElement>(null);
   const [params, setParams] = useState<PlaygroundParams>(DEFAULT_PARAMS);
   const [rippleDurationEnabled, setRippleDurationEnabled] = useState(false);
   const [tint, setTint] = useState(true);
@@ -247,7 +292,51 @@ function Playground({
   const [autoPlay, setAutoPlay] = useState(false);
   const logoRef = useRef<BezierLogoHandle>(null);
 
-  const effectProp = buildEffectProp(active, params, rippleDurationEnabled);
+  // Lazy backdrop — only built when glass is toggled on. If the user
+  // uploaded an image, hand its object URL straight to BezierLogo (it
+  // accepts string URLs). Otherwise use the generated grid+gradient
+  // canvas. Re-using the same value across renders keeps the renderer's
+  // texture upload to a single init pass per mount.
+  const glassGenerated = useMemo<HTMLCanvasElement | null>(
+    () => (glass && !glassUploadUrl ? makeGlassBackdrop() : null),
+    [glass, glassUploadUrl],
+  );
+  const glassBackdrop: string | HTMLCanvasElement | undefined = glass
+    ? (glassUploadUrl ?? glassGenerated ?? undefined)
+    : undefined;
+  const glassBackdropCssUrl = glass
+    ? (glassUploadUrl ?? glassGenerated?.toDataURL() ?? null)
+    : null;
+
+  // Release the object URL on unmount / replace so we don't leak.
+  useEffect(() => () => {
+    if (glassUploadUrl) URL.revokeObjectURL(glassUploadUrl);
+  }, [glassUploadUrl]);
+
+  const onGlassFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) return;
+    const url = URL.createObjectURL(file);
+    if (glassUploadUrl) URL.revokeObjectURL(glassUploadUrl);
+    setGlassUploadUrl(url);
+    setGlassUploadName(file.name);
+  };
+
+  const clearGlassUpload = () => {
+    if (glassUploadUrl) URL.revokeObjectURL(glassUploadUrl);
+    setGlassUploadUrl(null);
+    setGlassUploadName(null);
+  };
+
+  const effectProp = buildEffectProp(
+    active,
+    params,
+    rippleDurationEnabled,
+    glass,
+    { rimColor: glassRim, tintColor: glassTint },
+  );
 
   const toggleEffect = (name: FrameEffectName) => {
     setActive((a) => ({ ...a, [name]: !a[name] }));
@@ -261,7 +350,15 @@ function Playground({
     setParams((p) => ({ ...p, [name]: { ...p[name], [key]: value } }));
   };
 
-  const resetParams = () => setParams(DEFAULT_PARAMS);
+  const updateGlassParam = (key: keyof GlassNumericParams, value: number) => {
+    setParams((p) => ({ ...p, glass: { ...p.glass, [key]: value } }));
+  };
+
+  const resetParams = () => {
+    setParams(DEFAULT_PARAMS);
+    setGlassRim(GLASS_DEFAULTS.rimColor);
+    setGlassTint(GLASS_DEFAULTS.tintColor);
+  };
 
   return (
     <section className="playground" aria-label="playground">
@@ -274,7 +371,14 @@ function Playground({
       </header>
 
       <div className="playground-body">
-        <div className="playground-canvas">
+        <div
+          className="playground-canvas"
+          style={glassBackdropCssUrl ? {
+            backgroundImage: `url(${glassBackdropCssUrl})`,
+            backgroundSize: 'cover',
+            backgroundPosition: 'center',
+          } : undefined}
+        >
           <BezierLogo
             key={bakeKey}
             ref={logoRef}
@@ -282,6 +386,8 @@ function Playground({
             color={tint ? color : undefined}
             opacity={opacity}
             effect={effectProp}
+            material={glass ? 'glass' : undefined}
+            backdrop={glassBackdrop}
             autoPlay={autoPlay}
             ariaLabel="playground logo"
             onError={onError}
@@ -303,10 +409,21 @@ function Playground({
                   <span>{name}</span>
                 </label>
               ))}
+              <label className="chip" data-on={glass ? 'true' : 'false'}>
+                <input
+                  type="checkbox"
+                  checked={glass}
+                  onChange={() => setGlass((g) => !g)}
+                />
+                <span>glass</span>
+              </label>
             </div>
-            {EFFECT_ORDER.some((n) => active[n]) ? (
+            {EFFECT_ORDER.some((n) => active[n]) || glass ? (
               <div className="effect-hint">
-                {EFFECT_ORDER.filter((n) => active[n]).map((n) => EFFECT_HINT[n]).join(' · ')}
+                {[
+                  ...EFFECT_ORDER.filter((n) => active[n]).map((n) => EFFECT_HINT[n]),
+                  ...(glass ? ['refracts the backdrop'] : []),
+                ].join(' · ')}
               </div>
             ) : null}
           </div>
@@ -430,6 +547,67 @@ function Playground({
             </div>
           ) : null}
 
+          {glass ? (
+            <div className="ctrl-group">
+              <div className="ctrl-group-head">
+                glass
+                <span className="group-actions">
+                  <input
+                    ref={glassFileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={onGlassFile}
+                    style={{ display: 'none' }}
+                  />
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => glassFileInputRef.current?.click()}
+                    title={glassUploadName ?? 'use a custom backdrop image'}
+                  >
+                    ↑ backdrop
+                  </button>
+                  {glassUploadUrl ? (
+                    <button type="button" className="btn" onClick={clearGlassUpload}>
+                      reset
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+              {glassUploadName ? (
+                <div className="effect-hint">{glassUploadName}</div>
+              ) : null}
+              {GLASS_PARAM_UI.map((s) => (
+                <ParamSlider
+                  key={s.key}
+                  spec={s}
+                  value={params.glass[s.key as keyof GlassNumericParams]}
+                  onChange={(v) => updateGlassParam(s.key as keyof GlassNumericParams, v)}
+                />
+              ))}
+              <label className="row">
+                <span className="row-label">rim</span>
+                <input
+                  type="color"
+                  value={glassRim}
+                  onChange={(e) => setGlassRim(e.target.value)}
+                  aria-label="rim color"
+                />
+                <code className="row-val">{glassRim}</code>
+              </label>
+              <label className="row">
+                <span className="row-label">tint color</span>
+                <input
+                  type="color"
+                  value={glassTint}
+                  onChange={(e) => setGlassTint(e.target.value)}
+                  aria-label="tint color"
+                />
+                <code className="row-val">{glassTint}</code>
+              </label>
+            </div>
+          ) : null}
+
           <button type="button" className="btn playground-reset" onClick={resetParams}>
             reset params
           </button>
@@ -480,22 +658,42 @@ function ShowcaseCard({
   onError: (err: Error) => void;
 }) {
   const ref = useRef<BezierLogoHandle>(null);
-  const backdrop = useMemo<HTMLCanvasElement | null>(
-    () => (spec.backdrop ? makeGlassBackdrop() : null),
-    [spec.backdrop],
-  );
-  const backdropUrl = useMemo(
-    () => backdrop?.toDataURL() ?? null,
-    [backdrop],
-  );
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploadedUrl, setUploadedUrl] = useState<string | null>(null);
 
-  const surfaceStyle = backdropUrl
+  useEffect(() => () => {
+    if (uploadedUrl) URL.revokeObjectURL(uploadedUrl);
+  }, [uploadedUrl]);
+
+  // Generated backdrop is only built when there's no upload. Swapping to
+  // the uploaded URL drops the generated canvas for GC.
+  const generated = useMemo<HTMLCanvasElement | null>(
+    () => (spec.backdrop && !uploadedUrl ? makeGlassBackdrop() : null),
+    [spec.backdrop, uploadedUrl],
+  );
+  const backdrop: string | HTMLCanvasElement | undefined = uploadedUrl
+    ?? generated
+    ?? undefined;
+  const cssBgUrl = uploadedUrl ?? generated?.toDataURL() ?? null;
+
+  const surfaceStyle = cssBgUrl
     ? {
-        backgroundImage: `url(${backdropUrl})`,
+        backgroundImage: `url(${cssBgUrl})`,
         backgroundSize: 'cover',
         backgroundPosition: 'center',
       }
     : undefined;
+
+  const onUploadFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !file.type.startsWith('image/')) return;
+    const url = URL.createObjectURL(file);
+    setUploadedUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return url;
+    });
+  };
 
   return (
     <article className="card">
@@ -511,7 +709,7 @@ function ShowcaseCard({
           src={src}
           color={spec.color}
           effect={spec.effect}
-          backdrop={backdrop ?? undefined}
+          backdrop={backdrop}
           autoPlay={spec.autoPlay}
           ariaLabel={spec.title}
           onError={onError}
@@ -527,6 +725,25 @@ function ShowcaseCard({
         <button type="button" className="card-replay" onClick={() => ref.current?.replay()}>
           ↺ replay
         </button>
+      ) : null}
+      {spec.backdropUpload ? (
+        <>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={onUploadFile}
+            style={{ display: 'none' }}
+          />
+          <button
+            type="button"
+            className="card-replay"
+            onClick={() => fileInputRef.current?.click()}
+            title="replace the backdrop with a custom image"
+          >
+            ↑ backdrop
+          </button>
+        </>
       ) : null}
     </article>
   );

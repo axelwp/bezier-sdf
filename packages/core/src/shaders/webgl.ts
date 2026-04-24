@@ -366,13 +366,27 @@ uniform float u_frostStrength;
 uniform vec3  u_rimColor;
 uniform vec3  u_tintColor;
 
+uniform vec2  u_cursor;
+uniform float u_cursorPull;
+uniform float u_cursorRadius;
+uniform vec4  u_ripples[4];
+uniform vec2  u_pathOffset0;
+uniform vec2  u_pathOffset1;
+uniform vec2  u_pathOffset2;
+uniform vec2  u_pathOffset3;
+
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
 }
 
 float sampleSdf(int i, vec2 uv) {
-  vec2 t = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
+  vec2 po = u_pathOffset0;
+  if (i == 1) po = u_pathOffset1;
+  else if (i == 2) po = u_pathOffset2;
+  else if (i == 3) po = u_pathOffset3;
+  vec2 local = uv - po;
+  vec2 t = clamp((local / u_bound) * 0.5 + 0.5, 0.0, 1.0);
   if (i == 0) return texture2D(u_sdf0, t).r;
   if (i == 1) return texture2D(u_sdf1, t).r;
   if (i == 2) return texture2D(u_sdf2, t).r;
@@ -388,12 +402,30 @@ float combinedSdf(vec2 uv) {
   return d;
 }
 
+// Mirror of the sample shader's effectsField. Subtracted from the lens
+// SDF at every evaluation site so glass composes with cursor pull and
+// ripple deformations.
+float effectsField(vec2 uv) {
+  vec2 delta = uv - u_cursor;
+  float r2 = dot(delta, delta);
+  float sigma = max(u_cursorRadius, 1e-4);
+  float total = u_cursorPull * exp(-r2 / (2.0 * sigma * sigma));
+  const float RIPPLE_WIDTH = 0.12;
+  for (int i = 0; i < 4; i++) {
+    vec4 r = u_ripples[i];
+    float rd = length(uv - r.xy);
+    float rp = (rd - r.z) / RIPPLE_WIDTH;
+    total += r.w * exp(-rp * rp);
+  }
+  return total;
+}
+
 void main() {
   vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
   uv *= 2.0 / u_zoom;
   uv -= u_offset;
 
-  float d = combinedSdf(uv);
+  float d = combinedSdf(uv) - effectsField(uv);
   float aa = fwidth(d) * 1.2;
   float insideMask = 1.0 - smoothstep(-aa, aa, d);
 
@@ -420,15 +452,15 @@ void main() {
   const float SOFT_EDGE = 0.03;  // half-width of the inside/outside ramp
   const float D = 0.70710678 * SDF_BLUR;  // diagonal tap distance (= B/√2)
 
-  float h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv))) * 2.0;
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(SDF_BLUR, 0.0)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(SDF_BLUR, 0.0)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(0.0, SDF_BLUR)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(0.0, SDF_BLUR)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D,  D)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D, -D)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D,  D)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D, -D)));
+  float h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv) - effectsField(uv))) * 2.0;
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(SDF_BLUR, 0.0)) - effectsField(uv + vec2(SDF_BLUR, 0.0)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(SDF_BLUR, 0.0)) - effectsField(uv - vec2(SDF_BLUR, 0.0)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(0.0, SDF_BLUR)) - effectsField(uv + vec2(0.0, SDF_BLUR)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(0.0, SDF_BLUR)) - effectsField(uv - vec2(0.0, SDF_BLUR)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D,  D)) - effectsField(uv + vec2( D,  D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D, -D)) - effectsField(uv + vec2( D, -D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D,  D)) - effectsField(uv + vec2(-D,  D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D, -D)) - effectsField(uv + vec2(-D, -D)));
   h /= 10.0;  // center weight 2 + 8 outer = 10
 
   // Gradient of the smoothed indicator. Points *inward* (toward the

@@ -27,9 +27,14 @@ export const WEBGPU_BAKE_BOUND = 1.2;
  *   bound              : f32         // 60  (4)
  *   tintColor          : vec3<f32>   // 64  (12)
  *   frostStrength      : f32         // 76  (4)
- * Total: 80 bytes, 16-aligned.
+ *   cursor             : vec2<f32>   // 80  (8)
+ *   cursorPull         : f32         // 88  (4)
+ *   cursorRadius       : f32         // 92  (4)
+ *   ripples            : array<vec4<f32>, 4> // 96 (64)
+ *   pathOffset0..3     : vec2<f32>[4] // 160 (32)
+ * Total: 192 bytes, 16-aligned.
  */
-export const WEBGPU_GLASS_UNIFORM_SIZE = 80;
+export const WEBGPU_GLASS_UNIFORM_SIZE = 192;
 
 /**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
@@ -325,6 +330,14 @@ struct GlassUniforms {
   bound: f32,
   tintColor: vec3<f32>,
   frostStrength: f32,
+  cursor: vec2<f32>,
+  cursorPull: f32,
+  cursorRadius: f32,
+  ripples: array<vec4<f32>, 4>,
+  pathOffset0: vec2<f32>,
+  pathOffset1: vec2<f32>,
+  pathOffset2: vec2<f32>,
+  pathOffset3: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> U: GlassUniforms;
@@ -357,7 +370,12 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 }
 
 fn sampleSdf(i: u32, uv: vec2<f32>) -> f32 {
-  let t = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+  var po = U.pathOffset0;
+  if (i == 1u) { po = U.pathOffset1; }
+  else if (i == 2u) { po = U.pathOffset2; }
+  else if (i == 3u) { po = U.pathOffset3; }
+  let local = uv - po;
+  let t = clamp((local / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
   if (i == 0u) { return textureSample(tex0, samp, t).r; }
   if (i == 1u) { return textureSample(tex1, samp, t).r; }
   if (i == 2u) { return textureSample(tex2, samp, t).r; }
@@ -373,6 +391,25 @@ fn combinedSdf(uv: vec2<f32>) -> f32 {
   return d;
 }
 
+// Mirror of the sample shader's effectsField. Lets the glass material
+// compose with cursor pull + ripple deformations by subtracting this
+// field from the lens SDF wherever it's evaluated (silhouette pass and
+// each height-field tap).
+fn effectsField(uv: vec2<f32>) -> f32 {
+  let delta = uv - U.cursor;
+  let r2 = dot(delta, delta);
+  let sigma = max(U.cursorRadius, 1e-4);
+  var total = U.cursorPull * exp(-r2 / (2.0 * sigma * sigma));
+  let RIPPLE_WIDTH: f32 = 0.12;
+  for (var i: i32 = 0; i < 4; i = i + 1) {
+    let r = U.ripples[i];
+    let rd = length(uv - r.xy);
+    let rp = (rd - r.z) / RIPPLE_WIDTH;
+    total = total + r.w * exp(-rp * rp);
+  }
+  return total;
+}
+
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = U.resolution;
@@ -381,7 +418,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv * (2.0 / U.zoom);
   uv = uv - U.offset;
 
-  let d = combinedSdf(uv);
+  let d = combinedSdf(uv) - effectsField(uv);
   let aa = fwidth(d) * 1.2;
   let insideMask = 1.0 - smoothstep(-aa, aa, d);
 
@@ -397,15 +434,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let SOFT_EDGE: f32 = 0.03;
   let D:         f32 = 0.70710678 * SDF_BLUR;  // = SDF_BLUR / √2
 
-  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv))) * 2.0;
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(SDF_BLUR, 0.0)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(SDF_BLUR, 0.0)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(0.0, SDF_BLUR)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(0.0, SDF_BLUR)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D,  D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D, -D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D,  D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D, -D)));
+  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv) - effectsField(uv))) * 2.0;
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv + vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv - vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv + vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv - vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D,  D)) - effectsField(uv + vec2<f32>( D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D, -D)) - effectsField(uv + vec2<f32>( D, -D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D,  D)) - effectsField(uv + vec2<f32>(-D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D, -D)) - effectsField(uv + vec2<f32>(-D, -D)));
   h = h / 10.0;
 
   let grad = vec2<f32>(dpdx(h), dpdy(h));

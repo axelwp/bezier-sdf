@@ -503,6 +503,29 @@ export class WebGPURenderer implements Renderer {
     view.setFloat32(72, tint[2], true);
     view.setFloat32(76, u.frostStrength ?? GLASS_DEFAULTS.frostStrength, true);
 
+    const cursor = u.cursor ?? [0, 0];
+    view.setFloat32(80, cursor[0], true);
+    view.setFloat32(84, cursor[1], true);
+    view.setFloat32(88, u.cursorPull ?? 0, true);
+    view.setFloat32(92, u.cursorRadius ?? 1, true);
+    const ripples = u.ripples;
+    for (let i = 0; i < 4; i++) {
+      const r = ripples?.[i];
+      const base = 96 + i * 16;
+      view.setFloat32(base,      r ? r[0] : 0, true);
+      view.setFloat32(base + 4,  r ? r[1] : 0, true);
+      view.setFloat32(base + 8,  r ? r[2] : 0, true);
+      view.setFloat32(base + 12, r ? r[3] : 0, true);
+    }
+
+    // pathOffset0..3 at 160..192 (vec2 each, 8 bytes, 8-aligned).
+    for (let i = 0; i < 4; i++) {
+      const o = u.pathOffsets[i];
+      const base = 160 + i * 8;
+      view.setFloat32(base,     o ? o[0] : 0, true);
+      view.setFloat32(base + 4, o ? o[1] : 0, true);
+    }
+
     device.queue.writeBuffer(buffer, 0, this.glassUniformData);
 
     const encoder = device.createCommandEncoder();

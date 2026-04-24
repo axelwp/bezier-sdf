@@ -138,6 +138,14 @@ export class WebGLRenderer implements Renderer {
       frostStrength:      loc('u_frostStrength'),
       rimColor:           loc('u_rimColor'),
       tintColor:          loc('u_tintColor'),
+      cursor:             loc('u_cursor'),
+      cursorPull:         loc('u_cursorPull'),
+      cursorRadius:       loc('u_cursorRadius'),
+      ripples:            loc('u_ripples'),
+      pathOffset0:        loc('u_pathOffset0'),
+      pathOffset1:        loc('u_pathOffset1'),
+      pathOffset2:        loc('u_pathOffset2'),
+      pathOffset3:        loc('u_pathOffset3'),
     };
     // Texture-unit bindings: baked SDFs on 0..3 (same as the non-glass
     // sample program so both can coexist without reshuffling), backdrop
@@ -411,6 +419,35 @@ export class WebGLRenderer implements Renderer {
       gl.uniform3f(gU.rimColor!, rim[0], rim[1], rim[2]);
       const tint = u.tintColor ?? GLASS_DEFAULTS.tintColor;
       gl.uniform3f(gU.tintColor!, tint[0], tint[1], tint[2]);
+
+      const gCursor = u.cursor ?? [0, 0];
+      gl.uniform2f(gU.cursor!, gCursor[0], gCursor[1]);
+      gl.uniform1f(gU.cursorPull!, u.cursorPull ?? 0);
+      gl.uniform1f(gU.cursorRadius!, u.cursorRadius ?? 1);
+      const grb = this.ripplesBuf;
+      grb.fill(0);
+      const gRipples = u.ripples;
+      if (gRipples) {
+        for (let i = 0; i < 4 && i < gRipples.length; i++) {
+          const r = gRipples[i]!;
+          grb[i * 4]     = r[0];
+          grb[i * 4 + 1] = r[1];
+          grb[i * 4 + 2] = r[2];
+          grb[i * 4 + 3] = r[3];
+        }
+      }
+      gl.uniform4fv(gU.ripples!, grb);
+
+      const gOffs = u.pathOffsets;
+      const setGOff = (key: string, i: number) => {
+        const o = gOffs[i];
+        gl.uniform2f(gU[key]!, o ? o[0] : 0, o ? o[1] : 0);
+      };
+      setGOff('pathOffset0', 0);
+      setGOff('pathOffset1', 1);
+      setGOff('pathOffset2', 2);
+      setGOff('pathOffset3', 3);
+
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
     }
