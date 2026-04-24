@@ -60,9 +60,18 @@ export interface Path {
  * A full mark — one or more paths that together make up a logo. The
  * split-morph animation treats each path as an independent sub-shape
  * with its own baked SDF texture. Single-path marks are fine too.
+ *
+ * `renderMode` decides how effects that fuse subpaths (reveal's smin
+ * union) treat the mark. Hand-authored demo geometry — a single-color
+ * silhouette whose subpaths are *meant* to liquid-fuse — opts into
+ * `'legacy-smin'`. Marks parsed from user SVGs carry designer-intended
+ * per-path proportions and default to `'per-path'` so the renderer keeps
+ * them visually distinct. The field is optional; absence is treated as
+ * `'per-path'`.
  */
 export interface Mark {
   readonly paths: readonly Path[];
+  readonly renderMode?: 'legacy-smin' | 'per-path';
 }
 
 /**

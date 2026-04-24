@@ -1,4 +1,4 @@
-import { type CubicSegment, type Path, makePath, mark } from './types';
+import { type CubicSegment, type Mark, type Path, makePath } from './types';
 
 /**
  * Default demo mark: two rounded triangles facing inward (`▶ ◀`).
@@ -35,5 +35,13 @@ const RIGHT_CHEVRON_SEGS: readonly CubicSegment[] = [
 export const LEFT_CHEVRON: Path = makePath(LEFT_CHEVRON_SEGS);
 export const RIGHT_CHEVRON: Path = makePath(RIGHT_CHEVRON_SEGS);
 
-/** The default demo mark, combining both chevrons. */
-export const DEMO_MARK = mark(LEFT_CHEVRON, RIGHT_CHEVRON);
+/**
+ * The default demo mark, combining both chevrons. Opts into
+ * `'legacy-smin'` so the reveal effect keeps its signature liquid-metal
+ * fusion animation — the two chevrons are meant to morph through a
+ * single-silhouette intermediate state, not stay visually separate.
+ */
+export const DEMO_MARK: Mark = {
+  paths: [LEFT_CHEVRON, RIGHT_CHEVRON],
+  renderMode: 'legacy-smin',
+};

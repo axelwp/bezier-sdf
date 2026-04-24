@@ -69,7 +69,8 @@ export function normalizeMark(source: Mark, options: NormalizeOptions = {}): Nor
     if (pMaxY + hw > maxY) maxY = pMaxY + hw;
   }
   if (!isFinite(minX)) {
-    // Empty mark — return unchanged to avoid NaN propagation.
+    // Empty mark — return unchanged to avoid NaN propagation. `source`
+    // already carries any `renderMode` the caller set, so no copy needed.
     return {
       mark: source,
       transform: { offsetX: 0, offsetY: 0, scale: 1, flipY: false },
@@ -104,7 +105,7 @@ export function normalizeMark(source: Mark, options: NormalizeOptions = {}): Nor
   });
 
   return {
-    mark: { paths },
+    mark: { paths, renderMode: source.renderMode },
     transform: { offsetX: -centerX, offsetY: -centerY, scale, flipY },
   };
 }
