@@ -138,10 +138,17 @@ const EFFECT_HINT: Record<BezierLogoEffectName, string> = {
 function buildEffectProp(
   active: Record<BezierLogoEffectName, boolean>,
   params: PlaygroundParams,
+  rippleDurationEnabled: boolean,
 ): BezierLogoProps['effect'] {
   const specs: BezierLogoEffectSpec[] = EFFECT_ORDER
     .filter((name) => active[name])
-    .map((name) => ({ name, ...params[name] } as BezierLogoEffectSpec));
+    .map((name) => {
+      if (name === 'ripple') {
+        const duration = rippleDurationEnabled ? params.ripple.duration : Infinity;
+        return { name, ...params.ripple, duration } as BezierLogoEffectSpec;
+      }
+      return { name, ...params[name] } as BezierLogoEffectSpec;
+    });
   if (specs.length === 0) return 'none';
   return specs;
 }
@@ -161,13 +168,14 @@ function Playground({
     'liquid-cursor': true,
   });
   const [params, setParams] = useState<PlaygroundParams>(DEFAULT_PARAMS);
+  const [rippleDurationEnabled, setRippleDurationEnabled] = useState(false);
   const [tint, setTint] = useState(true);
   const [color, setColor] = useState('#ff6a3d');
   const [opacity, setOpacity] = useState(1);
   const [autoPlay, setAutoPlay] = useState(false);
   const logoRef = useRef<BezierLogoHandle>(null);
 
-  const effectProp = buildEffectProp(active, params);
+  const effectProp = buildEffectProp(active, params, rippleDurationEnabled);
 
   const toggleEffect = (name: BezierLogoEffectName) => {
     setActive((a) => ({ ...a, [name]: !a[name] }));
@@ -295,14 +303,44 @@ function Playground({
           {active.ripple ? (
             <div className="ctrl-group">
               <div className="ctrl-group-head">ripple</div>
-              {PARAM_UI.ripple.map((s) => (
-                <ParamSlider
-                  key={s.key}
-                  spec={s}
-                  value={params.ripple[s.key as keyof PlaygroundParams['ripple']]}
-                  onChange={(v) => updateParam('ripple', s.key, v)}
-                />
-              ))}
+              {PARAM_UI.ripple.map((s) => {
+                if (s.key === 'duration') {
+                  const decimals = Math.max(0, -Math.floor(Math.log10(s.step)));
+                  return (
+                    <div key={s.key} className="row">
+                      <span className="row-label row-label-check">
+                        <input
+                          type="checkbox"
+                          checked={rippleDurationEnabled}
+                          onChange={(e) => setRippleDurationEnabled(e.target.checked)}
+                          aria-label="enable duration cap"
+                        />
+                        duration
+                      </span>
+                      <input
+                        type="range"
+                        min={s.min}
+                        max={s.max}
+                        step={s.step}
+                        value={params.ripple.duration}
+                        onChange={(e) => updateParam('ripple', 'duration', Number(e.target.value))}
+                        disabled={!rippleDurationEnabled}
+                      />
+                      <code className="row-val">
+                        {rippleDurationEnabled ? params.ripple.duration.toFixed(decimals) : '—'}
+                      </code>
+                    </div>
+                  );
+                }
+                return (
+                  <ParamSlider
+                    key={s.key}
+                    spec={s}
+                    value={params.ripple[s.key as keyof PlaygroundParams['ripple']]}
+                    onChange={(v) => updateParam('ripple', s.key, v)}
+                  />
+                );
+              })}
             </div>
           ) : null}
 
