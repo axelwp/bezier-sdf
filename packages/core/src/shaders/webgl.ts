@@ -375,6 +375,14 @@ uniform vec2  u_pathOffset1;
 uniform vec2  u_pathOffset2;
 uniform vec2  u_pathOffset3;
 
+// Per-path render mode (0=fill, 1=stroke, 2=both) and stroke half-width.
+// Mirrors the sample pipeline so stroked paths enter the glass shader as
+// their sausage SDF (abs(d) - halfW, a proper 2D fill SDF). "both" is
+// treated as fill here — a stroke overlay on top of a glass lens doesn't
+// read visually.
+uniform ivec4 u_pathMode;
+uniform vec4  u_pathStrokeHalfW;
+
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
@@ -393,12 +401,34 @@ float sampleSdf(int i, vec2 uv) {
   return texture2D(u_sdf3, t).r;
 }
 
-float combinedSdf(vec2 uv) {
+// Converts a raw per-path SDF to the right fill-SDF for glass rendering:
+//   - fill (0) or both (2): the scene SDF as-is
+//   - stroke (1):           abs(d) - halfW, the sausage SDF (the curve
+//                           dilated by halfW — itself a proper 2D fill
+//                           SDF, so the glass math downstream applies
+//                           unchanged).
+// Then smooth-unions across all active paths. Replaces combinedSdf,
+// which assumed every path was a fill and collapsed strokes into solid
+// silhouettes.
+float shapeSdf(vec2 uv) {
   float k = max(u_sminK, 1e-4);
-  float d = sampleSdf(0, uv);
-  if (u_pathCount > 1) d = smin(d, sampleSdf(1, uv), k);
-  if (u_pathCount > 2) d = smin(d, sampleSdf(2, uv), k);
-  if (u_pathCount > 3) d = smin(d, sampleSdf(3, uv), k);
+  float d0 = sampleSdf(0, uv);
+  float d = (u_pathMode.x == 1) ? (abs(d0) - u_pathStrokeHalfW.x) : d0;
+  if (u_pathCount > 1) {
+    float d1 = sampleSdf(1, uv);
+    float c1 = (u_pathMode.y == 1) ? (abs(d1) - u_pathStrokeHalfW.y) : d1;
+    d = smin(d, c1, k);
+  }
+  if (u_pathCount > 2) {
+    float d2 = sampleSdf(2, uv);
+    float c2 = (u_pathMode.z == 1) ? (abs(d2) - u_pathStrokeHalfW.z) : d2;
+    d = smin(d, c2, k);
+  }
+  if (u_pathCount > 3) {
+    float d3 = sampleSdf(3, uv);
+    float c3 = (u_pathMode.w == 1) ? (abs(d3) - u_pathStrokeHalfW.w) : d3;
+    d = smin(d, c3, k);
+  }
   return d;
 }
 
@@ -425,7 +455,7 @@ void main() {
   uv *= 2.0 / u_zoom;
   uv -= u_offset;
 
-  float d = combinedSdf(uv) - effectsField(uv);
+  float d = shapeSdf(uv) - effectsField(uv);
   float aa = fwidth(d) * 1.2;
   float insideMask = 1.0 - smoothstep(-aa, aa, d);
 
@@ -452,15 +482,15 @@ void main() {
   const float SOFT_EDGE = 0.03;  // half-width of the inside/outside ramp
   const float D = 0.70710678 * SDF_BLUR;  // diagonal tap distance (= B/√2)
 
-  float h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv) - effectsField(uv))) * 2.0;
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(SDF_BLUR, 0.0)) - effectsField(uv + vec2(SDF_BLUR, 0.0)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(SDF_BLUR, 0.0)) - effectsField(uv - vec2(SDF_BLUR, 0.0)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(0.0, SDF_BLUR)) - effectsField(uv + vec2(0.0, SDF_BLUR)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(0.0, SDF_BLUR)) - effectsField(uv - vec2(0.0, SDF_BLUR)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D,  D)) - effectsField(uv + vec2( D,  D)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D, -D)) - effectsField(uv + vec2( D, -D)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D,  D)) - effectsField(uv + vec2(-D,  D)));
-  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D, -D)) - effectsField(uv + vec2(-D, -D)));
+  float h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv) - effectsField(uv))) * 2.0;
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2(SDF_BLUR, 0.0)) - effectsField(uv + vec2(SDF_BLUR, 0.0)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv - vec2(SDF_BLUR, 0.0)) - effectsField(uv - vec2(SDF_BLUR, 0.0)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2(0.0, SDF_BLUR)) - effectsField(uv + vec2(0.0, SDF_BLUR)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv - vec2(0.0, SDF_BLUR)) - effectsField(uv - vec2(0.0, SDF_BLUR)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2( D,  D)) - effectsField(uv + vec2( D,  D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2( D, -D)) - effectsField(uv + vec2( D, -D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2(-D,  D)) - effectsField(uv + vec2(-D,  D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2(-D, -D)) - effectsField(uv + vec2(-D, -D)));
   h /= 10.0;  // center weight 2 + 8 outer = 10
 
   // Gradient of the smoothed indicator. Points *inward* (toward the
@@ -485,7 +515,7 @@ void main() {
   // Convert the isotropic SDF-space offset to backdrop-uv space and
   // refract along the inward normal.
   vec2 sdfToUv = vec2(min(u_res.x, u_res.y)) / u_res;
-  let refractOffset = normal * h * (1.0 - h) * 4.0 * U.refractionStrength * sdfToUv;
+  vec2 refractOffset = normal * h * (1.0 - h) * lensAmount * u_refractionStrength * sdfToUv;
 
   vec2 backdropUv = gl_FragCoord.xy / u_res;
   vec2 offR = backdropUv + refractOffset * (1.0 - u_chromaticStrength);

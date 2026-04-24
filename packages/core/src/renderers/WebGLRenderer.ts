@@ -146,6 +146,8 @@ export class WebGLRenderer implements Renderer {
       pathOffset1:        loc('u_pathOffset1'),
       pathOffset2:        loc('u_pathOffset2'),
       pathOffset3:        loc('u_pathOffset3'),
+      pathMode:           loc('u_pathMode'),
+      pathStrokeHalfW:    loc('u_pathStrokeHalfW'),
     };
     // Texture-unit bindings: baked SDFs on 0..3 (same as the non-glass
     // sample program so both can coexist without reshuffling), backdrop
@@ -460,6 +462,23 @@ export class WebGLRenderer implements Renderer {
       setGOff('pathOffset1', 1);
       setGOff('pathOffset2', 2);
       setGOff('pathOffset3', 3);
+
+      // Per-path render mode + stroke half-width, so stroked paths go
+      // through the glass shader as their sausage SDF (abs(d) - halfW)
+      // instead of as solid silhouettes. Unset → treated as fills, which
+      // matches legacy single-color smin behavior.
+      const gModes = u.pathModes ?? [];
+      const gModeVec = [0, 0, 0, 0];
+      for (let i = 0; i < 4; i++) {
+        const m = gModes[i];
+        gModeVec[i] = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
+      }
+      gl.uniform4i(gU.pathMode!, gModeVec[0]!, gModeVec[1]!, gModeVec[2]!, gModeVec[3]!);
+      const gHalfW = u.pathStrokeHalfW ?? [];
+      gl.uniform4f(
+        gU.pathStrokeHalfW!,
+        gHalfW[0] ?? 0, gHalfW[1] ?? 0, gHalfW[2] ?? 0, gHalfW[3] ?? 0,
+      );
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;

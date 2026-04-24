@@ -609,11 +609,17 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
 
       if (glassMode) {
         // Glass pipeline — shape is a material, not a painter. Per-path
-        // colors are ignored (smooth-union silhouette). pathOffsets,
-        // cursor, and ripple fields from the frame are forwarded so the
-        // lens geometry animates (reveal) and deforms (cursor/ripple).
+        // colors/opacities are ignored (smooth-union silhouette), but
+        // pathModes + pathStrokeHalfW ARE forwarded so stroked paths
+        // enter the glass shader as their sausage SDF (abs(d) - halfW)
+        // rather than being collapsed into solid silhouettes. Without
+        // this a line-icon SVG renders as a filled blob, not glass
+        // tubes. pathOffsets, cursor, and ripple fields from the frame
+        // flow through so the lens geometry animates (reveal) and
+        // deforms (cursor/ripple).
         const spec = extractGlassSpec(effectRef.current) ?? {};
         const gu = resolveGlassUniforms(spec);
+        const base = state.perPath;
         r.render({
           width: canvas.width,
           height: canvas.height,
@@ -628,6 +634,8 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
           cursorPull: frame?.cursorPull,
           cursorRadius: frame?.cursorRadius,
           ripples: frame?.ripples,
+          pathModes: base?.pathModes,
+          pathStrokeHalfW: base?.pathStrokeHalfW,
           glass: true,
           refractionStrength: gu.refractionStrength,
           chromaticStrength:  gu.chromaticStrength,

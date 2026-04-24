@@ -580,6 +580,23 @@ export class WebGPURenderer implements Renderer {
       view.setFloat32(base + 4, o ? o[1] : 0, true);
     }
 
+    // pathMode at 192..208, pathStrokeHalfW at 208..224. Mirrors the
+    // sample pipeline so stroked paths enter the glass shader as their
+    // sausage SDF (abs(d) - halfW) rather than solid silhouettes. "both"
+    // (2) is treated as fill by the shader — glass refracts through the
+    // filled silhouette; an additional stroke overlay doesn't read well
+    // through a lens.
+    const modes = u.pathModes ?? [];
+    for (let i = 0; i < 4; i++) {
+      const m = modes[i];
+      const v = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
+      view.setUint32(192 + i * 4, v, true);
+    }
+    const halfW = u.pathStrokeHalfW ?? [];
+    for (let i = 0; i < 4; i++) {
+      view.setFloat32(208 + i * 4, halfW[i] ?? 0, true);
+    }
+
     device.queue.writeBuffer(buffer, 0, this.glassUniformData);
 
     const encoder = device.createCommandEncoder();

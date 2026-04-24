@@ -9,6 +9,14 @@
  * without looking fake. Crank `refractionStrength` and `chromaticStrength`
  * to exaggerate; lean on `tintStrength` to push toward a colored glass.
  *
+ * Stroked paths (line icons): the effect renders as illuminated glass
+ * filaments rather than refracting lenses. This is inherent to the
+ * geometry — a thin sausage (typical stroke widths of 2–4px) doesn't
+ * have enough interior area for the full glass effect (frost, heavy
+ * refraction, rim-vs-interior contrast) to read as lens-like, so the
+ * whole sausage reads as "at the rim." Both aesthetics are valid; pick
+ * filled SVGs for lens refraction, stroked SVGs for glass-tube lighting.
+ *
  * See `packages/core/src/shaders/webgl.ts :: WEBGL_GLASS_FRAG` for the
  * full ingredient list and what each knob does.
  *

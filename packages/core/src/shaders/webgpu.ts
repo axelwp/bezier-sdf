@@ -9,9 +9,9 @@ export const WEBGPU_BAKE_SIZE = 1024;
 export const WEBGPU_BAKE_BOUND = 1.2;
 
 /**
- * Uniform buffer layout for the glass sample pipeline. Tight 80-byte
- * struct; WGSL vec3 has align 16 / size 12, so `bound` gets packed into
- * the 4 bytes after `rimColor` within its 16-byte slot.
+ * Uniform buffer layout for the glass sample pipeline. WGSL vec3 has
+ * align 16 / size 12, so `bound` gets packed into the 4 bytes after
+ * `rimColor` within its 16-byte slot.
  *
  *   resolution         : vec2<f32>   // 0   (8)
  *   zoom               : f32         // 8   (4)
@@ -32,9 +32,11 @@ export const WEBGPU_BAKE_BOUND = 1.2;
  *   cursorRadius       : f32         // 92  (4)
  *   ripples            : array<vec4<f32>, 4> // 96 (64)
  *   pathOffset0..3     : vec2<f32>[4] // 160 (32)
- * Total: 192 bytes, 16-aligned.
+ *   pathMode           : vec4<u32>   // 192 (16)
+ *   pathStrokeHalfW    : vec4<f32>   // 208 (16)
+ * Total: 224 bytes, 16-aligned.
  */
-export const WEBGPU_GLASS_UNIFORM_SIZE = 192;
+export const WEBGPU_GLASS_UNIFORM_SIZE = 224;
 
 /**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
@@ -338,6 +340,14 @@ struct GlassUniforms {
   pathOffset1: vec2<f32>,
   pathOffset2: vec2<f32>,
   pathOffset3: vec2<f32>,
+  // Per-path render mode (0=fill, 1=stroke, 2=both) and stroke half-width.
+  // Mirrors the sample pipeline so strokes render as glass sausages
+  // (abs(d) - halfW, a proper 2D fill SDF) instead of solid silhouettes.
+  // For mode 2 ("both"), glass treats the path as a fill — the filled
+  // silhouette is what the lens refracts through; a stroke on top of
+  // glass rarely reads visually.
+  pathMode: vec4<u32>,
+  pathStrokeHalfW: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> U: GlassUniforms;
@@ -382,12 +392,34 @@ fn sampleSdf(i: u32, uv: vec2<f32>) -> f32 {
   return textureSample(tex3, samp, t).r;
 }
 
-fn combinedSdf(uv: vec2<f32>) -> f32 {
+// Converts a raw per-path SDF to the right fill-SDF for glass rendering:
+//   - fill (0) or both (2): the scene SDF as-is
+//   - stroke (1):           abs(d) - halfW, the SDF of the curve dilated
+//                           by halfW, i.e. the "sausage" region — itself a
+//                           proper 2D fill SDF, so all the glass math
+//                           (height field, normals, refraction, Fresnel)
+//                           works on it unchanged.
+// Then smooth-unions across all active paths. Replaces the previous
+// combinedSdf, which assumed every path was a fill.
+fn shapeSdf(uv: vec2<f32>) -> f32 {
   let k = max(U.sminK, 1e-4);
-  var d = sampleSdf(0u, uv);
-  if (U.pathCount > 1u) { d = smin(d, sampleSdf(1u, uv), k); }
-  if (U.pathCount > 2u) { d = smin(d, sampleSdf(2u, uv), k); }
-  if (U.pathCount > 3u) { d = smin(d, sampleSdf(3u, uv), k); }
+  let d0 = sampleSdf(0u, uv);
+  var d = select(d0, abs(d0) - U.pathStrokeHalfW[0], U.pathMode[0] == 1u);
+  if (U.pathCount > 1u) {
+    let d1 = sampleSdf(1u, uv);
+    let c1 = select(d1, abs(d1) - U.pathStrokeHalfW[1], U.pathMode[1] == 1u);
+    d = smin(d, c1, k);
+  }
+  if (U.pathCount > 2u) {
+    let d2 = sampleSdf(2u, uv);
+    let c2 = select(d2, abs(d2) - U.pathStrokeHalfW[2], U.pathMode[2] == 1u);
+    d = smin(d, c2, k);
+  }
+  if (U.pathCount > 3u) {
+    let d3 = sampleSdf(3u, uv);
+    let c3 = select(d3, abs(d3) - U.pathStrokeHalfW[3], U.pathMode[3] == 1u);
+    d = smin(d, c3, k);
+  }
   return d;
 }
 
@@ -418,7 +450,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv * (2.0 / U.zoom);
   uv = uv - U.offset;
 
-  let d = combinedSdf(uv) - effectsField(uv);
+  let d = shapeSdf(uv) - effectsField(uv);
   let aa = fwidth(d) * 1.2;
   let insideMask = 1.0 - smoothstep(-aa, aa, d);
 
@@ -434,15 +466,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let SOFT_EDGE: f32 = 0.03;
   let D:         f32 = 0.70710678 * SDF_BLUR;  // = SDF_BLUR / √2
 
-  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv) - effectsField(uv))) * 2.0;
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv + vec2<f32>(SDF_BLUR, 0.0)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv - vec2<f32>(SDF_BLUR, 0.0)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv + vec2<f32>(0.0, SDF_BLUR)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv - vec2<f32>(0.0, SDF_BLUR)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D,  D)) - effectsField(uv + vec2<f32>( D,  D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D, -D)) - effectsField(uv + vec2<f32>( D, -D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D,  D)) - effectsField(uv + vec2<f32>(-D,  D)));
-  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D, -D)) - effectsField(uv + vec2<f32>(-D, -D)));
+  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv) - effectsField(uv))) * 2.0;
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv + vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv - vec2<f32>(SDF_BLUR, 0.0)) - effectsField(uv - vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv + vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv - vec2<f32>(0.0, SDF_BLUR)) - effectsField(uv - vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>( D,  D)) - effectsField(uv + vec2<f32>( D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>( D, -D)) - effectsField(uv + vec2<f32>( D, -D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(-D,  D)) - effectsField(uv + vec2<f32>(-D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, shapeSdf(uv + vec2<f32>(-D, -D)) - effectsField(uv + vec2<f32>(-D, -D)));
   h = h / 10.0;
 
   let grad = vec2<f32>(dpdx(h), dpdy(h));
