@@ -2,6 +2,7 @@ import {
   StrictMode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -15,10 +16,65 @@ import {
 } from '@bezier-sdf/react';
 import './styles.css';
 
-// The gallery's tunable effects are the frame-based ones. `liquid-glass`
-// is a material with its own demo (examples/liquid-glass), so it's
-// excluded from the playground type to keep record shapes closed.
+// The playground's tunable effects are the frame-based ones. `liquid-glass`
+// is a material (separate GPU pipeline) with its own card and static
+// defaults, so it's excluded from the playground's record shapes.
 type FrameEffectName = Exclude<BezierLogoEffectName, 'liquid-glass'>;
+
+const GLASS_DEFAULTS = {
+  refractionStrength: 0.05,
+  chromaticStrength:  0.015,
+  fresnelStrength:    0.3,
+  tintStrength:       0.1,
+  frostStrength:      2.5,
+  rimColor:  '#ffffff',
+  tintColor: '#e8f0ff',
+} as const;
+
+// Colorful gradient + blobs + grid so refraction has something to bend.
+// Matches the dedicated liquid-glass demo so both read consistently.
+function makeGlassBackdrop(): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = 1280;
+  c.height = 720;
+  const ctx = c.getContext('2d')!;
+
+  const g = ctx.createLinearGradient(0, 0, c.width, c.height);
+  g.addColorStop(0,    '#1b2a6b');
+  g.addColorStop(0.45, '#c2185b');
+  g.addColorStop(1,    '#ffb74d');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, c.width, c.height);
+
+  const blobs: Array<[number, number, number, string]> = [
+    [0.22, 0.28, 280, '#00e5ff'],
+    [0.72, 0.18, 240, '#ffd54f'],
+    [0.50, 0.68, 320, '#ff4081'],
+    [0.85, 0.78, 220, '#b388ff'],
+    [0.12, 0.82, 200, '#69f0ae'],
+  ];
+  for (const [fx, fy, r, color] of blobs) {
+    const cx = fx * c.width;
+    const cy = fy * c.height;
+    const rg = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    rg.addColorStop(0, color);
+    rg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+  }
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+  ctx.lineWidth = 2;
+  const step = 60;
+  for (let x = 0; x <= c.width; x += step) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, c.height); ctx.stroke();
+  }
+  for (let y = 0; y <= c.height; y += step) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(c.width, y); ctx.stroke();
+  }
+
+  return c;
+}
 
 const DEFAULT_SRC = '/logo.svg';
 const THEME_KEY = 'bezier-sdf:theme';
@@ -42,6 +98,8 @@ interface CardSpec {
   code: string;
   hint?: string;
   replay?: boolean;
+  /** Provide a backdrop canvas for the liquid-glass material to refract. */
+  backdrop?: boolean;
 }
 
 const CARDS: CardSpec[] = [
@@ -89,6 +147,15 @@ const CARDS: CardSpec[] = [
     effect: ['liquid-cursor', 'ripple'],
     code: `<BezierLogo effect={['liquid-cursor','ripple']} />`,
     hint: 'hover, then click',
+  },
+  {
+    id: 'liquid-glass',
+    number: '06',
+    title: 'Liquid glass',
+    effect: { name: 'liquid-glass', ...GLASS_DEFAULTS },
+    code: `<BezierLogo effect={{ name: 'liquid-glass' }} backdrop={img} />`,
+    hint: 'refracts the backdrop',
+    backdrop: true,
   },
 ];
 
@@ -413,6 +480,22 @@ function ShowcaseCard({
   onError: (err: Error) => void;
 }) {
   const ref = useRef<BezierLogoHandle>(null);
+  const backdrop = useMemo<HTMLCanvasElement | null>(
+    () => (spec.backdrop ? makeGlassBackdrop() : null),
+    [spec.backdrop],
+  );
+  const backdropUrl = useMemo(
+    () => backdrop?.toDataURL() ?? null,
+    [backdrop],
+  );
+
+  const surfaceStyle = backdropUrl
+    ? {
+        backgroundImage: `url(${backdropUrl})`,
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+      }
+    : undefined;
 
   return (
     <article className="card">
@@ -421,13 +504,14 @@ function ShowcaseCard({
         <span className="card-num">{spec.number}</span>
       </header>
 
-      <div className="card-surface">
+      <div className="card-surface" style={surfaceStyle}>
         <BezierLogo
           key={`${spec.id}:${bakeKey}`}
           ref={ref}
           src={src}
           color={spec.color}
           effect={spec.effect}
+          backdrop={backdrop ?? undefined}
           autoPlay={spec.autoPlay}
           ariaLabel={spec.title}
           onError={onError}
