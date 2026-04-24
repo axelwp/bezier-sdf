@@ -1,13 +1,14 @@
 import { parseSvgPath } from './parseSvgPath';
 import { parseColor, parseColorAlpha } from './parseColor';
-import { type Mark, type Path, type PathMode, type RgbColor, makePath } from './types';
+import { type CubicSegment, type Mark, type Path, type PathMode, type RgbColor, makePath } from './types';
 
 export interface ParseSvgDocumentOptions {
   /**
-   * Maximum number of paths to return. SVGs with more paths are not
-   * rejected — excess paths are silently dropped so the renderer's
-   * 4-path ceiling doesn't have to leak into user-facing errors here.
-   * @default 4
+   * Maximum number of `<path>` elements to return (one {@link Path} per
+   * element, with multi-M subpaths merged). SVGs that exceed this cap
+   * emit a `console.warn` naming the total and render only the first N
+   * in source order — a broken component is worse than a partial one.
+   * @default 16
    */
   maxPaths?: number;
   /**
@@ -38,12 +39,24 @@ export interface ParseSvgDocumentOptions {
  * gradient paint servers, non-`<path>` shapes. These fall through to the
  * caller-provided `currentColor` or their SVG defaults.
  *
- * The renderer's per-pass 4-path cap is enforced by `maxPaths`, so SVGs
- * with more paths (common in line-icon libraries where an icon is many
- * small strokes) render a best-effort subset instead of throwing.
+ * The renderer's per-pass 16-path cap is enforced by `maxPaths`. SVGs
+ * that exceed it render a best-effort prefix and emit a `console.warn`
+ * — common for line-icon libraries where an icon is many small strokes.
+ *
+ * Multi-subpath `<path>` elements (those whose `d` contains more than
+ * one M/m) flatten to a single {@link Path} carrying the concatenated
+ * cubic segments. The bake pass evaluates insideness with even-odd ray
+ * crossings, which is what actually makes SVG's "outer + inner with
+ * opposite winding" ring idiom work: one crossing in the donut (odd →
+ * inside), two in the hole (even → outside). Splitting subpaths into
+ * separate Paths would re-paint the hole in the same fill color and
+ * collapse rings to solid disks; keeping them merged also renders
+ * disjoint compound shapes correctly since each closed contour
+ * contributes one crossing to points inside it and zero to points
+ * outside.
  */
 export function parseSvgDocument(text: string, options: ParseSvgDocumentOptions = {}): Mark {
-  const { maxPaths = 4, currentColor = [0, 0, 0] as RgbColor } = options;
+  const { maxPaths = 16, currentColor = [0, 0, 0] as RgbColor } = options;
 
   const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
   const parseErr = doc.querySelector('parsererror');
@@ -56,19 +69,31 @@ export function parseSvgDocument(text: string, options: ParseSvgDocumentOptions 
   }
 
   const paths: Path[] = [];
+  let skipped = 0;
   for (const el of pathEls) {
-    if (paths.length >= maxPaths) break;
     const d = el.getAttribute('d');
     if (!d) continue;
-    const meta = resolvePaintAttrs(el, currentColor);
+    // Concatenate every subpath's segments into one segment list so the
+    // shared bake pass sees the whole `<path>` as one shape (see doc
+    // comment above — even-odd crossings do the hole / compound work
+    // for free).
     const sub = parseSvgPath(d);
-    for (const p of sub.paths) {
-      if (paths.length >= maxPaths) break;
-      paths.push(makePath(p.segments, meta));
+    const merged = sub.paths.flatMap((p) => p.segments as CubicSegment[]);
+    if (merged.length === 0) continue;
+    if (paths.length >= maxPaths) {
+      skipped += 1;
+      continue;
     }
+    const meta = resolvePaintAttrs(el, currentColor);
+    paths.push(makePath(merged, meta));
   }
   if (paths.length === 0) {
     throw new Error('SVG <path> elements had no usable `d` data.');
+  }
+  if (skipped > 0) {
+    console.warn(
+      `[bezier-sdf] SVG has ${paths.length + skipped} paths, exceeds renderer limit of ${maxPaths}. Rendering first ${maxPaths}.`,
+    );
   }
 
   return { paths };

@@ -145,7 +145,14 @@ export interface BezierLogoProps {
   material?: 'glass';
 }
 
-const DEFAULT_SMIN_K = 0.08;
+// Soft-union radius used by the legacy single-color shader branch. Kept
+// low enough to be imperceptible across the typical gap between distinct
+// `<path>` elements in an icon SVG — e.g. the ~1–3% gaps between a gene-
+// icon's connector lines and hexagons used to blob together at the old
+// 0.08 default. Effects that *want* visible rubber-band union (reveal's
+// morph-into-one-silhouette animation) set their own sminK in effect
+// frames, so this only governs the "no effects, just tint" case.
+const DEFAULT_SMIN_K = 0.005;
 
 /**
  * Effect definitions for frame-based effects. `liquid-glass` is

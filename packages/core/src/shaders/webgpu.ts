@@ -9,34 +9,103 @@ export const WEBGPU_BAKE_SIZE = 1024;
 export const WEBGPU_BAKE_BOUND = 1.2;
 
 /**
- * Uniform buffer layout for the glass sample pipeline. WGSL vec3 has
- * align 16 / size 12, so `bound` gets packed into the 4 bytes after
- * `rimColor` within its 16-byte slot.
- *
- *   resolution         : vec2<f32>   // 0   (8)
- *   zoom               : f32         // 8   (4)
- *   sminK              : f32         // 12  (4)
- *   offset             : vec2<f32>   // 16  (8)
- *   pathCount          : u32         // 24  (4)
- *   opacity            : f32         // 28  (4)
- *   refractionStrength : f32         // 32  (4)
- *   chromaticStrength  : f32         // 36  (4)
- *   fresnelStrength    : f32         // 40  (4)
- *   tintStrength       : f32         // 44  (4)
- *   rimColor           : vec3<f32>   // 48  (12)
- *   bound              : f32         // 60  (4)
- *   tintColor          : vec3<f32>   // 64  (12)
- *   frostStrength      : f32         // 76  (4)
- *   cursor             : vec2<f32>   // 80  (8)
- *   cursorPull         : f32         // 88  (4)
- *   cursorRadius       : f32         // 92  (4)
- *   ripples            : array<vec4<f32>, 4> // 96 (64)
- *   pathOffset0..3     : vec2<f32>[4] // 160 (32)
- *   pathMode           : vec4<u32>   // 192 (16)
- *   pathStrokeHalfW    : vec4<f32>   // 208 (16)
- * Total: 224 bytes, 16-aligned.
+ * Upper bound on paths per mark. Mirrors the GLSL shader's MAX_PATHS;
+ * raising this lets multi-subpath `<path>` elements (rings, holes,
+ * compound icons) render every subpath. Each adds one sampled-texture
+ * binding to both the sample and glass bind groups.
  */
-export const WEBGPU_GLASS_UNIFORM_SIZE = 224;
+export const MAX_PATHS = 16;
+/** Number of vec4 slots that hold MAX_PATHS packed scalars (u32 or f32). */
+const PATH_V4 = MAX_PATHS / 4;
+
+/**
+ * Uniform buffer layout for the sample pipeline. Computed per WGSL's
+ * layout rules (vec3 align 16 / size 12; array<vec4<T>, N> align 16
+ * stride 16 — `array<vec2, N>` would need stride 16 too, so we pack
+ * two vec2 per vec4 instead).
+ *
+ *   resolution         : vec2<f32>   // 0
+ *   zoom               : f32         // 8
+ *   sminK              : f32         // 12
+ *   offset             : vec2<f32>   // 16
+ *   compositeMode      : u32         // 24
+ *   pathCount          : u32         // 28
+ *   color              : vec3<f32>   // 32  (vec3 needs align 16)
+ *   opacity            : f32         // 44
+ *   bound              : f32         // 48
+ *   _pad0              : f32         // 52
+ *   cursor             : vec2<f32>   // 56
+ *   cursorPull         : f32         // 64
+ *   cursorRadius       : f32         // 68
+ *   _padR              : vec2<f32>   // 72
+ *   ripples            : array<vec4<f32>, 4>      // 80   (64B)
+ *   pathMode           : array<vec4<u32>, PATH_V4>// 144  (PATH_V4*16)
+ *   pathStrokeHalfW    : array<vec4<f32>, PATH_V4>// 208
+ *   pathFillOpacity    : array<vec4<f32>, PATH_V4>// 272
+ *   pathStrokeOpacity  : array<vec4<f32>, PATH_V4>// 336
+ *   pathFillColor      : array<vec4<f32>, MAX>    // 400  (MAX_PATHS*16)
+ *   pathStrokeColor    : array<vec4<f32>, MAX>    // 400 + MAX*16
+ *   pathOffsets        : array<vec4<f32>, MAX/2>  // last — two vec2 per vec4
+ */
+const SAMPLE_OFF = {
+  resolution: 0,
+  zoom: 8,
+  sminK: 12,
+  offset: 16,
+  compositeMode: 24,
+  pathCount: 28,
+  color: 32,
+  opacity: 44,
+  bound: 48,
+  cursor: 56,
+  cursorPull: 64,
+  cursorRadius: 68,
+  ripples: 80,
+  pathMode: 80 + 64,
+  pathStrokeHalfW: 80 + 64 + PATH_V4 * 16,
+  pathFillOpacity: 80 + 64 + PATH_V4 * 16 * 2,
+  pathStrokeOpacity: 80 + 64 + PATH_V4 * 16 * 3,
+  pathFillColor: 80 + 64 + PATH_V4 * 16 * 4,
+  pathStrokeColor: 80 + 64 + PATH_V4 * 16 * 4 + MAX_PATHS * 16,
+  pathOffsets: 80 + 64 + PATH_V4 * 16 * 4 + MAX_PATHS * 16 * 2,
+} as const;
+
+export const WEBGPU_SAMPLE_OFFSETS = SAMPLE_OFF;
+export const WEBGPU_SAMPLE_UNIFORM_SIZE =
+  SAMPLE_OFF.pathOffsets + (MAX_PATHS / 2) * 16;
+
+/**
+ * Uniform buffer layout for the glass sample pipeline — no compositeMode
+ * / paint-color inputs, but carries the refraction/fresnel/tint scalars
+ * and still needs the full per-path mode+strokeHalfW+offsets for strokes.
+ */
+const GLASS_OFF = {
+  resolution: 0,
+  zoom: 8,
+  sminK: 12,
+  offset: 16,
+  pathCount: 24,
+  opacity: 28,
+  refractionStrength: 32,
+  chromaticStrength: 36,
+  fresnelStrength: 40,
+  tintStrength: 44,
+  rimColor: 48,    // vec3 @ 48..60
+  bound: 60,
+  tintColor: 64,   // vec3 @ 64..76
+  frostStrength: 76,
+  cursor: 80,
+  cursorPull: 88,
+  cursorRadius: 92,
+  ripples: 96,                                    // 96..160   (64B)
+  pathMode: 160,                                  // 160..160+PATH_V4*16
+  pathStrokeHalfW: 160 + PATH_V4 * 16,            // next
+  pathOffsets: 160 + PATH_V4 * 16 * 2,            // two vec2 per vec4
+} as const;
+
+export const WEBGPU_GLASS_OFFSETS = GLASS_OFF;
+export const WEBGPU_GLASS_UNIFORM_SIZE =
+  GLASS_OFF.pathOffsets + (MAX_PATHS / 2) * 16;
 
 /**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
@@ -146,10 +215,31 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 `;
 
 /**
- * Sample shader. Fixed-count texture bindings (4) because WGSL doesn't
- * let us index sampler arrays at draw time on all platforms. Unused
- * slots are still bound (to a 1x1 dummy) but pathCount gates the
- * composition loop.
+ * WGSL forbids dynamic-index access to resource bindings, so dispatching
+ * a runtime path index to the right SDF texture means an unrolled if-
+ * chain — same pattern as the GLSL shader. Generate both the binding
+ * declarations and the dispatch body from MAX_PATHS so we don't have to
+ * hand-maintain them.
+ *
+ * Textures bind starting at @binding(2) so @binding(0) can stay on the
+ * uniform buffer and @binding(1) on the sampler (matching the original
+ * 4-path layout). Backdrop, when present, binds immediately past them.
+ */
+const SDF_BINDING_START = 2;
+const SDF_TEXTURE_BINDINGS = Array.from({ length: MAX_PATHS }, (_, i) =>
+  `@group(0) @binding(${SDF_BINDING_START + i}) var tex${i}: texture_2d<f32>;`,
+).join('\n');
+
+export const WEBGPU_BACKDROP_BINDING = SDF_BINDING_START + MAX_PATHS;
+
+const SAMPLE_SDF_DISPATCH = Array.from({ length: MAX_PATHS }, (_, i) =>
+  `  if (i == ${i}u) { return textureSample(tex${i}, samp, t).r; }`,
+).join('\n');
+
+/**
+ * Sample shader. 16 texture bindings because WGSL doesn't let us index
+ * a resource binding at runtime on all platforms; unused slots still
+ * get bound (to a 1x1 dummy) but `pathCount` gates the composition loop.
  *
  * Two composition modes, selected by `compositeMode`:
  *   0 — legacy: smooth-union all paths, paint in `color`. Used by the
@@ -165,34 +255,33 @@ struct Uniforms {
   sminK: f32,
   offset: vec2<f32>,
   compositeMode: u32,
-  _pad0: u32,
-  pathOffset0: vec2<f32>,
-  pathOffset1: vec2<f32>,
-  pathOffset2: vec2<f32>,
-  pathOffset3: vec2<f32>,
+  pathCount: u32,
   color: vec3<f32>,
   opacity: f32,
   bound: f32,
-  pathCount: u32,
+  _pad0: f32,
   cursor: vec2<f32>,
   cursorPull: f32,
   cursorRadius: f32,
   _padR: vec2<f32>,
   ripples: array<vec4<f32>, 4>,
-  pathMode: vec4<u32>,
-  pathStrokeHalfW: vec4<f32>,
-  pathFillOpacity: vec4<f32>,
-  pathStrokeOpacity: vec4<f32>,
-  pathFillColor: array<vec4<f32>, 4>,
-  pathStrokeColor: array<vec4<f32>, 4>,
+  // Scalar-per-path values packed four-wide to satisfy WGSL's 16-byte
+  // uniform-array stride; pathXyz[i / 4][i % 4] is the per-path value.
+  pathMode: array<vec4<u32>, ${PATH_V4}>,
+  pathStrokeHalfW: array<vec4<f32>, ${PATH_V4}>,
+  pathFillOpacity: array<vec4<f32>, ${PATH_V4}>,
+  pathStrokeOpacity: array<vec4<f32>, ${PATH_V4}>,
+  // Colors padded to vec4 (.rgb used, .a ignored) — vec3 arrays need
+  // stride 16 anyway, so padding explicitly keeps the JS writer honest.
+  pathFillColor: array<vec4<f32>, ${MAX_PATHS}>,
+  pathStrokeColor: array<vec4<f32>, ${MAX_PATHS}>,
+  // Two vec2 per vec4: pathOffsets[i >> 1].xy for even i, .zw for odd.
+  pathOffsets: array<vec4<f32>, ${MAX_PATHS / 2}>,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
 @group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var tex0: texture_2d<f32>;
-@group(0) @binding(3) var tex1: texture_2d<f32>;
-@group(0) @binding(4) var tex2: texture_2d<f32>;
-@group(0) @binding(5) var tex3: texture_2d<f32>;
+${SDF_TEXTURE_BINDINGS}
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -215,17 +304,17 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
   return min(a, b) - h * h * k * 0.25;
 }
 
+fn pathOffset(i: u32) -> vec2<f32> {
+  let v = U.pathOffsets[i / 2u];
+  return select(v.zw, v.xy, (i & 1u) == 0u);
+}
+
 fn sampleIdx(i: u32, uv: vec2<f32>) -> f32 {
-  var po = U.pathOffset0;
-  if (i == 1u) { po = U.pathOffset1; }
-  else if (i == 2u) { po = U.pathOffset2; }
-  else if (i == 3u) { po = U.pathOffset3; }
+  let po = pathOffset(i);
   let local = uv - po;
   let t = clamp((local / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-  if (i == 0u) { return textureSample(tex0, samp, t).r; }
-  if (i == 1u) { return textureSample(tex1, samp, t).r; }
-  if (i == 2u) { return textureSample(tex2, samp, t).r; }
-  return textureSample(tex3, samp, t).r;
+${SAMPLE_SDF_DISPATCH}
+  return 0.0;
 }
 
 // Total subtractive deformation field at uv — cursor pull (Gaussian)
@@ -261,9 +350,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   if (U.compositeMode == 0u) {
     let k = max(U.sminK, 1e-4);
     var d = sampleIdx(0u, uv);
-    if (U.pathCount > 1u) { d = smin(d, sampleIdx(1u, uv), k); }
-    if (U.pathCount > 2u) { d = smin(d, sampleIdx(2u, uv), k); }
-    if (U.pathCount > 3u) { d = smin(d, sampleIdx(3u, uv), k); }
+    for (var i: u32 = 1u; i < ${MAX_PATHS}u; i = i + 1u) {
+      if (i >= U.pathCount) { break; }
+      d = smin(d, sampleIdx(i, uv), k);
+    }
     d = d - field;
     let aa = fwidth(d) * 1.2;
     let mask = 1.0 - smoothstep(-aa, aa, d);
@@ -273,26 +363,30 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   // Per-path composite: accumulate with Porter-Duff "over" in premultiplied
   // alpha, convert back to straight alpha at the end.
   var acc = vec4<f32>(0.0);
-  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+  for (var i: u32 = 0u; i < ${MAX_PATHS}u; i = i + 1u) {
     if (i >= U.pathCount) { break; }
     let d = sampleIdx(i, uv);
-    let mode = U.pathMode[i];
+    let slot = i / 4u;
+    let sub = i % 4u;
+    let mode = U.pathMode[slot][sub];
+    let fillOp = U.pathFillOpacity[slot][sub];
+    let strokeOp = U.pathStrokeOpacity[slot][sub];
+    let halfW = U.pathStrokeHalfW[slot][sub];
 
     // Fill layer (mode 0 or 2). Distort the scene SDF directly.
     if (mode != 1u) {
       let dFill = d - field;
       let aa = fwidth(dFill) * 1.2;
-      let a = (1.0 - smoothstep(-aa, aa, dFill)) * U.pathFillOpacity[i];
+      let a = (1.0 - smoothstep(-aa, aa, dFill)) * fillOp;
       let src = vec4<f32>(U.pathFillColor[i].rgb * a, a);
       acc = src + acc * (1.0 - src.a);
     }
     // Stroke layer (mode 1 or 2). Distort the sausage SDF — the proper
     // fill SDF of the curve dilated by halfW — rather than d itself.
     if (mode != 0u) {
-      let halfW = U.pathStrokeHalfW[i];
       let de = abs(d) - halfW - field;
       let aaS = fwidth(de) * 1.2;
-      let a = (1.0 - smoothstep(-aaS, aaS, de)) * U.pathStrokeOpacity[i];
+      let a = (1.0 - smoothstep(-aaS, aaS, de)) * strokeOp;
       let src = vec4<f32>(U.pathStrokeColor[i].rgb * a, a);
       acc = src + acc * (1.0 - src.a);
     }
@@ -303,6 +397,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `;
 
+const GLASS_SDF_DISPATCH = Array.from({ length: MAX_PATHS }, (_, i) =>
+  `  if (i == ${i}u) { return textureSample(tex${i}, samp, t).r; }`,
+).join('\n');
+
 /**
  * Liquid-glass sample pipeline. Same shape-compositing as the legacy
  * smin branch — all paths smooth-unioned into one silhouette — but uses
@@ -311,10 +409,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
  * shaders/webgl.ts for the full rationale of each ingredient.
  *
  * Bindings:
- *   0: uniforms (GlassUniforms, 80 bytes)
+ *   0: uniforms (GlassUniforms)
  *   1: sampler (linear, clamp — shared by SDF and backdrop)
- *   2..5: baked SDF textures (tex0..tex3)
- *   6: backdrop texture
+ *   2..${SDF_BINDING_START + MAX_PATHS - 1}: baked SDF textures (texN)
+ *   ${WEBGPU_BACKDROP_BINDING}: backdrop texture
  */
 export const WEBGPU_GLASS_SHADER = /* wgsl */ `
 struct GlassUniforms {
@@ -336,27 +434,23 @@ struct GlassUniforms {
   cursorPull: f32,
   cursorRadius: f32,
   ripples: array<vec4<f32>, 4>,
-  pathOffset0: vec2<f32>,
-  pathOffset1: vec2<f32>,
-  pathOffset2: vec2<f32>,
-  pathOffset3: vec2<f32>,
   // Per-path render mode (0=fill, 1=stroke, 2=both) and stroke half-width.
   // Mirrors the sample pipeline so strokes render as glass sausages
   // (abs(d) - halfW, a proper 2D fill SDF) instead of solid silhouettes.
   // For mode 2 ("both"), glass treats the path as a fill — the filled
   // silhouette is what the lens refracts through; a stroke on top of
-  // glass rarely reads visually.
-  pathMode: vec4<u32>,
-  pathStrokeHalfW: vec4<f32>,
+  // glass rarely reads visually. Scalars packed four-wide to satisfy
+  // WGSL's 16-byte uniform-array stride.
+  pathMode: array<vec4<u32>, ${PATH_V4}>,
+  pathStrokeHalfW: array<vec4<f32>, ${PATH_V4}>,
+  // Two vec2 per vec4, indexed via pathOffset() helper below.
+  pathOffsets: array<vec4<f32>, ${MAX_PATHS / 2}>,
 };
 
 @group(0) @binding(0) var<uniform> U: GlassUniforms;
 @group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var tex0: texture_2d<f32>;
-@group(0) @binding(3) var tex1: texture_2d<f32>;
-@group(0) @binding(4) var tex2: texture_2d<f32>;
-@group(0) @binding(5) var tex3: texture_2d<f32>;
-@group(0) @binding(6) var backdrop: texture_2d<f32>;
+${SDF_TEXTURE_BINDINGS}
+@group(0) @binding(${WEBGPU_BACKDROP_BINDING}) var backdrop: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -379,17 +473,17 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
   return min(a, b) - h * h * k * 0.25;
 }
 
+fn pathOffset(i: u32) -> vec2<f32> {
+  let v = U.pathOffsets[i / 2u];
+  return select(v.zw, v.xy, (i & 1u) == 0u);
+}
+
 fn sampleSdf(i: u32, uv: vec2<f32>) -> f32 {
-  var po = U.pathOffset0;
-  if (i == 1u) { po = U.pathOffset1; }
-  else if (i == 2u) { po = U.pathOffset2; }
-  else if (i == 3u) { po = U.pathOffset3; }
+  let po = pathOffset(i);
   let local = uv - po;
   let t = clamp((local / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-  if (i == 0u) { return textureSample(tex0, samp, t).r; }
-  if (i == 1u) { return textureSample(tex1, samp, t).r; }
-  if (i == 2u) { return textureSample(tex2, samp, t).r; }
-  return textureSample(tex3, samp, t).r;
+${GLASS_SDF_DISPATCH}
+  return 0.0;
 }
 
 // Converts a raw per-path SDF to the right fill-SDF for glass rendering:
@@ -404,21 +498,16 @@ fn sampleSdf(i: u32, uv: vec2<f32>) -> f32 {
 fn shapeSdf(uv: vec2<f32>) -> f32 {
   let k = max(U.sminK, 1e-4);
   let d0 = sampleSdf(0u, uv);
-  var d = select(d0, abs(d0) - U.pathStrokeHalfW[0], U.pathMode[0] == 1u);
-  if (U.pathCount > 1u) {
-    let d1 = sampleSdf(1u, uv);
-    let c1 = select(d1, abs(d1) - U.pathStrokeHalfW[1], U.pathMode[1] == 1u);
-    d = smin(d, c1, k);
-  }
-  if (U.pathCount > 2u) {
-    let d2 = sampleSdf(2u, uv);
-    let c2 = select(d2, abs(d2) - U.pathStrokeHalfW[2], U.pathMode[2] == 1u);
-    d = smin(d, c2, k);
-  }
-  if (U.pathCount > 3u) {
-    let d3 = sampleSdf(3u, uv);
-    let c3 = select(d3, abs(d3) - U.pathStrokeHalfW[3], U.pathMode[3] == 1u);
-    d = smin(d, c3, k);
+  let m0 = U.pathMode[0][0];
+  let h0 = U.pathStrokeHalfW[0][0];
+  var d = select(d0, abs(d0) - h0, m0 == 1u);
+  for (var i: u32 = 1u; i < ${MAX_PATHS}u; i = i + 1u) {
+    if (i >= U.pathCount) { break; }
+    let di = sampleSdf(i, uv);
+    let mi = U.pathMode[i / 4u][i % 4u];
+    let hi = U.pathStrokeHalfW[i / 4u][i % 4u];
+    let ci = select(di, abs(di) - hi, mi == 1u);
+    d = smin(d, ci, k);
   }
   return d;
 }

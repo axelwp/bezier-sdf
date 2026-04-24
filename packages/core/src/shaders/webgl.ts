@@ -23,12 +23,32 @@
  * that, edges of the baked texture will clamp.
  */
 
-export const MAX_SEGS = 32;
-export const MAX_PATHS = 4;
+/**
+ * Upper bound on cubic segments per path. Bumped from 32 so one `<path>`
+ * element with multiple subpaths merged (the normal SVG pattern for
+ * rings/holes/compound shapes — see parseSvgDocument) fits in a single
+ * bake. 128 covers the complex SVGs we've tested (gene icons at ~78,
+ * connector-line icons at ~51) with headroom. Cost is two 128-slot
+ * `vec4` uniform arrays in the bake shader; well under the 256 vector
+ * floor that modern WebGL drivers expose.
+ */
+export const MAX_SEGS = 128;
+/**
+ * Upper bound on paths per mark (== baked SDF textures bound to the
+ * sample/glass programs). Raised from 4 so multi-subpath SVGs — shapes
+ * with holes, rings, compound icons that use multiple M commands in one
+ * `<path>` — render every subpath instead of being truncated.
+ *
+ * Uses one fragment texture unit per path; glass additionally needs one
+ * for the backdrop, so the programs consume up to 17 units. WebGL 1
+ * guarantees ≥ 8, but every GPU shipped this decade exposes ≥ 16, so
+ * link failure in practice only means a non-conformant driver.
+ */
+export const MAX_PATHS = 16;
 
 /** Shared SDF evaluator, consumes u_segA/u_segB/u_segCount. */
 const SDF_BODY = /* glsl */ `
-#define MAX_SEGS 32
+#define MAX_SEGS 128
 uniform int  u_segCount;
 uniform vec4 u_segA[MAX_SEGS];
 uniform vec4 u_segB[MAX_SEGS];
@@ -124,6 +144,23 @@ void main() {
 `;
 
 /**
+ * GLSL ES 1.00 can't dynamically index a sampler2D array — the spec only
+ * permits "constant-index-expressions" (constants, loop indices in a
+ * for-loop with a constant bound, …). Our composition loop has pathCount
+ * as a runtime-bounded upper limit, so the classic workaround is to name
+ * each sampler individually and dispatch with an unrolled if-chain. These
+ * strings build that unrolled plumbing at module-load time, keyed off
+ * {@link MAX_PATHS} so bumping it doesn't mean hand-editing 16+ branches.
+ */
+const SDF_SAMPLER_DECLS = Array.from({ length: MAX_PATHS }, (_, i) =>
+  `uniform sampler2D u_sdf${i};`,
+).join('\n');
+
+const SAMPLE_IDX_BRANCHES = Array.from({ length: MAX_PATHS }, (_, i) =>
+  `  if (i == ${i}) return texture2D(u_sdf${i}, t).r;`,
+).join('\n');
+
+/**
  * Sample fragment. Reads up to MAX_PATHS baked SDFs, each translated by
  * its own offset. Supports two composition modes:
  *
@@ -139,12 +176,18 @@ void main() {
  *     have per-path paint. smin is not applied across paths in this mode
  *     — see KNOWN_LIMITATIONS.md.
  *
- * We can't index samplers dynamically in GLSL ES 1.00, so sampler and
- * per-path offset access is unrolled in `sampleIdx`.
+ * Per-path scalars (mode, strokeHalfW, fill/stroke opacity) are packed
+ * into four-wide vec4/ivec4 arrays so a single uniform handles 16 paths
+ * in four slots; the helpers `v4Idx`/`i4Idx` unpack `array[i>>2][i&3]`.
+ * Fill/stroke colors live in dynamically-indexable vec3 arrays (allowed
+ * in GLSL ES 1.00 for non-sampler uniforms).
  */
 export const WEBGL_SAMPLE_FRAG = /* glsl */ `
 #extension GL_OES_standard_derivatives : enable
 precision highp float;
+
+#define MAX_PATHS ${MAX_PATHS}
+#define MAX_PATH_VEC4 ${MAX_PATHS / 4}
 
 uniform vec2  u_res;
 uniform float u_zoom;
@@ -157,33 +200,22 @@ uniform float u_sminK;
 
 uniform float u_bound;
 uniform int   u_pathCount;
-uniform sampler2D u_sdf0;
-uniform sampler2D u_sdf1;
-uniform sampler2D u_sdf2;
-uniform sampler2D u_sdf3;
-uniform vec2 u_pathOffset0;
-uniform vec2 u_pathOffset1;
-uniform vec2 u_pathOffset2;
-uniform vec2 u_pathOffset3;
+${SDF_SAMPLER_DECLS}
+uniform vec2  u_pathOffset[MAX_PATHS];
 uniform vec2  u_cursor;
 uniform float u_cursorPull;
 uniform float u_cursorRadius;
 uniform vec4  u_ripples[4];  // (x, y, age, amplitude) per slot
 
 // Per-path composite uniforms (only meaningful when u_compositeMode != 0).
+// Scalar-per-path values pack four per vec4/ivec4, indexed by v4Idx/i4Idx.
 uniform int   u_compositeMode;
-uniform ivec4 u_pathMode;            // 0=fill, 1=stroke, 2=both
-uniform vec4  u_pathStrokeHalfW;
-uniform vec4  u_pathFillOpacity;
-uniform vec4  u_pathStrokeOpacity;
-uniform vec3  u_pathFillColor0;
-uniform vec3  u_pathFillColor1;
-uniform vec3  u_pathFillColor2;
-uniform vec3  u_pathFillColor3;
-uniform vec3  u_pathStrokeColor0;
-uniform vec3  u_pathStrokeColor1;
-uniform vec3  u_pathStrokeColor2;
-uniform vec3  u_pathStrokeColor3;
+uniform ivec4 u_pathMode[MAX_PATH_VEC4];          // 0=fill, 1=stroke, 2=both
+uniform vec4  u_pathStrokeHalfW[MAX_PATH_VEC4];
+uniform vec4  u_pathFillOpacity[MAX_PATH_VEC4];
+uniform vec4  u_pathStrokeOpacity[MAX_PATH_VEC4];
+uniform vec3  u_pathFillColor[MAX_PATHS];
+uniform vec3  u_pathStrokeColor[MAX_PATHS];
 
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
@@ -192,32 +224,16 @@ float smin(float a, float b, float k) {
 
 float sampleIdx(int i, vec2 uv) {
   // Unrolled per-index fetch — GLSL ES 1.00 disallows dynamic indexing
-  // of sampler arrays, and per-path offsets are kept as peer uniforms
-  // so all four have the same packing.
-  vec2 po = u_pathOffset0;
-  if (i == 1) po = u_pathOffset1;
-  else if (i == 2) po = u_pathOffset2;
-  else if (i == 3) po = u_pathOffset3;
+  // of sampler arrays, so the if-chain dispatches to MAX_PATHS named
+  // samplers declared above. Per-path offset lookup uses a non-sampler
+  // array, which dynamic indexing *is* allowed on.
+  vec2 po = u_pathOffset[i];
   vec2 local = uv - po;
   vec2 t = clamp((local / u_bound) * 0.5 + 0.5, 0.0, 1.0);
-  if (i == 0) return texture2D(u_sdf0, t).r;
-  if (i == 1) return texture2D(u_sdf1, t).r;
-  if (i == 2) return texture2D(u_sdf2, t).r;
-  return texture2D(u_sdf3, t).r;
+${SAMPLE_IDX_BRANCHES}
+  return 0.0;
 }
 
-vec3 fillColorIdx(int i) {
-  if (i == 0) return u_pathFillColor0;
-  if (i == 1) return u_pathFillColor1;
-  if (i == 2) return u_pathFillColor2;
-  return u_pathFillColor3;
-}
-vec3 strokeColorIdx(int i) {
-  if (i == 0) return u_pathStrokeColor0;
-  if (i == 1) return u_pathStrokeColor1;
-  if (i == 2) return u_pathStrokeColor2;
-  return u_pathStrokeColor3;
-}
 float v4Idx(vec4 v, int i) {
   if (i == 0) return v.x;
   if (i == 1) return v.y;
@@ -274,9 +290,10 @@ void main() {
   if (u_compositeMode == 0) {
     float k = max(u_sminK, 1e-4);
     float d = sampleIdx(0, uv);
-    if (u_pathCount > 1) d = smin(d, sampleIdx(1, uv), k);
-    if (u_pathCount > 2) d = smin(d, sampleIdx(2, uv), k);
-    if (u_pathCount > 3) d = smin(d, sampleIdx(3, uv), k);
+    for (int i = 1; i < MAX_PATHS; i++) {
+      if (i >= u_pathCount) break;
+      d = smin(d, sampleIdx(i, uv), k);
+    }
     d -= field;
     float aa = fwidth(d) * 1.2;
     float mask = 1.0 - smoothstep(-aa, aa, d);
@@ -288,18 +305,21 @@ void main() {
   // alpha, convert back to straight alpha for the straight-alpha blend
   // func configured on the GL context.
   vec4 acc = vec4(0.0);
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < MAX_PATHS; i++) {
     if (i >= u_pathCount) break;
     float d = sampleIdx(i, uv);
-    int mode = i4Idx(u_pathMode, i);
+    int mode = i4Idx(u_pathMode[i / 4], i - (i / 4) * 4);
+    float fillOp   = v4Idx(u_pathFillOpacity[i / 4],   i - (i / 4) * 4);
+    float strokeOp = v4Idx(u_pathStrokeOpacity[i / 4], i - (i / 4) * 4);
+    float halfW    = v4Idx(u_pathStrokeHalfW[i / 4],   i - (i / 4) * 4);
 
     // Fill layer (mode 0 or 2). Distort the scene SDF directly — the
     // boundary bulges toward the cursor.
     if (mode != 1) {
       float dFill = d - field;
       float aa = fwidth(dFill) * 1.2;
-      float a = (1.0 - smoothstep(-aa, aa, dFill)) * v4Idx(u_pathFillOpacity, i);
-      vec4 src = vec4(fillColorIdx(i) * a, a);
+      float a = (1.0 - smoothstep(-aa, aa, dFill)) * fillOp;
+      vec4 src = vec4(u_pathFillColor[i] * a, a);
       acc = src + acc * (1.0 - src.a);
     }
     // Stroke layer (mode 1 or 2). Compute the sausage SDF first
@@ -307,11 +327,10 @@ void main() {
     // distort that. Same math shape as the fill case, applied to a
     // proper 2D region instead of a 1D level set, so no amoeba blobs.
     if (mode != 0) {
-      float halfW = v4Idx(u_pathStrokeHalfW, i);
       float de = abs(d) - halfW - field;
       float aaS = fwidth(de) * 1.2;
-      float a = (1.0 - smoothstep(-aaS, aaS, de)) * v4Idx(u_pathStrokeOpacity, i);
-      vec4 src = vec4(strokeColorIdx(i) * a, a);
+      float a = (1.0 - smoothstep(-aaS, aaS, de)) * strokeOp;
+      vec4 src = vec4(u_pathStrokeColor[i] * a, a);
       acc = src + acc * (1.0 - src.a);
     }
   }
@@ -345,6 +364,9 @@ export const WEBGL_GLASS_FRAG = /* glsl */ `
 #extension GL_OES_standard_derivatives : enable
 precision highp float;
 
+#define MAX_PATHS ${MAX_PATHS}
+#define MAX_PATH_VEC4 ${MAX_PATHS / 4}
+
 uniform vec2  u_res;
 uniform float u_zoom;
 uniform vec2  u_offset;
@@ -352,10 +374,7 @@ uniform float u_opacity;
 uniform float u_sminK;
 uniform float u_bound;
 uniform int   u_pathCount;
-uniform sampler2D u_sdf0;
-uniform sampler2D u_sdf1;
-uniform sampler2D u_sdf2;
-uniform sampler2D u_sdf3;
+${SDF_SAMPLER_DECLS}
 
 uniform sampler2D u_backdrop;
 uniform float u_refractionStrength;
@@ -370,18 +389,15 @@ uniform vec2  u_cursor;
 uniform float u_cursorPull;
 uniform float u_cursorRadius;
 uniform vec4  u_ripples[4];
-uniform vec2  u_pathOffset0;
-uniform vec2  u_pathOffset1;
-uniform vec2  u_pathOffset2;
-uniform vec2  u_pathOffset3;
+uniform vec2  u_pathOffset[MAX_PATHS];
 
 // Per-path render mode (0=fill, 1=stroke, 2=both) and stroke half-width.
 // Mirrors the sample pipeline so stroked paths enter the glass shader as
 // their sausage SDF (abs(d) - halfW, a proper 2D fill SDF). "both" is
 // treated as fill here — a stroke overlay on top of a glass lens doesn't
-// read visually.
-uniform ivec4 u_pathMode;
-uniform vec4  u_pathStrokeHalfW;
+// read visually. Packed four per vec4/ivec4 for 16 paths in 4 slots.
+uniform ivec4 u_pathMode[MAX_PATH_VEC4];
+uniform vec4  u_pathStrokeHalfW[MAX_PATH_VEC4];
 
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
@@ -389,16 +405,24 @@ float smin(float a, float b, float k) {
 }
 
 float sampleSdf(int i, vec2 uv) {
-  vec2 po = u_pathOffset0;
-  if (i == 1) po = u_pathOffset1;
-  else if (i == 2) po = u_pathOffset2;
-  else if (i == 3) po = u_pathOffset3;
+  vec2 po = u_pathOffset[i];
   vec2 local = uv - po;
   vec2 t = clamp((local / u_bound) * 0.5 + 0.5, 0.0, 1.0);
-  if (i == 0) return texture2D(u_sdf0, t).r;
-  if (i == 1) return texture2D(u_sdf1, t).r;
-  if (i == 2) return texture2D(u_sdf2, t).r;
-  return texture2D(u_sdf3, t).r;
+${SAMPLE_IDX_BRANCHES}
+  return 0.0;
+}
+
+float v4Idx(vec4 v, int i) {
+  if (i == 0) return v.x;
+  if (i == 1) return v.y;
+  if (i == 2) return v.z;
+  return v.w;
+}
+int i4Idx(ivec4 v, int i) {
+  if (i == 0) return v.x;
+  if (i == 1) return v.y;
+  if (i == 2) return v.z;
+  return v.w;
 }
 
 // Converts a raw per-path SDF to the right fill-SDF for glass rendering:
@@ -413,21 +437,16 @@ float sampleSdf(int i, vec2 uv) {
 float shapeSdf(vec2 uv) {
   float k = max(u_sminK, 1e-4);
   float d0 = sampleSdf(0, uv);
-  float d = (u_pathMode.x == 1) ? (abs(d0) - u_pathStrokeHalfW.x) : d0;
-  if (u_pathCount > 1) {
-    float d1 = sampleSdf(1, uv);
-    float c1 = (u_pathMode.y == 1) ? (abs(d1) - u_pathStrokeHalfW.y) : d1;
-    d = smin(d, c1, k);
-  }
-  if (u_pathCount > 2) {
-    float d2 = sampleSdf(2, uv);
-    float c2 = (u_pathMode.z == 1) ? (abs(d2) - u_pathStrokeHalfW.z) : d2;
-    d = smin(d, c2, k);
-  }
-  if (u_pathCount > 3) {
-    float d3 = sampleSdf(3, uv);
-    float c3 = (u_pathMode.w == 1) ? (abs(d3) - u_pathStrokeHalfW.w) : d3;
-    d = smin(d, c3, k);
+  int m0 = i4Idx(u_pathMode[0], 0);
+  float h0 = v4Idx(u_pathStrokeHalfW[0], 0);
+  float d = (m0 == 1) ? (abs(d0) - h0) : d0;
+  for (int i = 1; i < MAX_PATHS; i++) {
+    if (i >= u_pathCount) break;
+    float di = sampleSdf(i, uv);
+    int mi = i4Idx(u_pathMode[i / 4], i - (i / 4) * 4);
+    float hi = v4Idx(u_pathStrokeHalfW[i / 4], i - (i / 4) * 4);
+    float ci = (mi == 1) ? (abs(di) - hi) : di;
+    d = smin(d, ci, k);
   }
   return d;
 }

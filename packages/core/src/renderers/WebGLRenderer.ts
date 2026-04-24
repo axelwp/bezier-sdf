@@ -1,4 +1,4 @@
-import type { Mark, Path, CubicSegment } from '../geometry/types';
+import type { Mark, Path, CubicSegment, RgbColor } from '../geometry/types';
 import {
   MAX_PATHS,
   MAX_SEGS,
@@ -22,6 +22,10 @@ const GLASS_DEFAULTS = {
   rimColor: [1, 1, 1] as const,
   tintColor: [0.91, 0.94, 1.0] as const,
 };
+
+/** Texture unit reserved for the backdrop — sits immediately past the
+ *  MAX_PATHS SDF bindings so raising MAX_PATHS only shifts it. */
+const BACKDROP_UNIT = MAX_PATHS;
 
 /**
  * WebGL 1 renderer.
@@ -53,6 +57,12 @@ export class WebGLRenderer implements Renderer {
   private _pathCount = 0;
   private disposed = false;
   private ripplesBuf = new Float32Array(16);
+  // Reusable scratch buffers for per-path uniform writes. Sized to
+  // MAX_PATHS once so render() doesn't allocate per frame.
+  private pathOffsetBuf = new Float32Array(MAX_PATHS * 2);
+  private pathModeBuf = new Int32Array(MAX_PATHS);
+  private pathScalarBuf = new Float32Array(MAX_PATHS);
+  private pathVec3Buf = new Float32Array(MAX_PATHS * 3);
   private halfFloatType = 0;
 
   get mode(): 'baked' | 'direct' { return this._mode; }
@@ -71,6 +81,18 @@ export class WebGLRenderer implements Renderer {
     this.gl = gl;
     if (!gl.getExtension('OES_standard_derivatives')) {
       throw new Error('OES_standard_derivatives not available');
+    }
+    // With MAX_PATHS=16 the sample shader binds 16 texture units; glass
+    // adds the backdrop for 17. Every modern GPU exposes at least 16,
+    // but the WebGL 1 spec floor is 8. Fail loudly if the driver can't
+    // bind enough rather than letting the render silently sample dummy
+    // textures.
+    const maxUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) as number;
+    const needed = backdrop ? MAX_PATHS + 1 : MAX_PATHS;
+    if (maxUnits < needed) {
+      throw new Error(
+        `this GPU exposes ${maxUnits} fragment texture units; bezier-sdf needs ${needed} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop' : ''})`,
+      );
     }
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -126,10 +148,6 @@ export class WebGLRenderer implements Renderer {
       sminK:     loc('u_sminK'),
       bound:     loc('u_bound'),
       pathCount: loc('u_pathCount'),
-      sdf0:      loc('u_sdf0'),
-      sdf1:      loc('u_sdf1'),
-      sdf2:      loc('u_sdf2'),
-      sdf3:      loc('u_sdf3'),
       backdrop:           loc('u_backdrop'),
       refractionStrength: loc('u_refractionStrength'),
       chromaticStrength:  loc('u_chromaticStrength'),
@@ -142,28 +160,24 @@ export class WebGLRenderer implements Renderer {
       cursorPull:         loc('u_cursorPull'),
       cursorRadius:       loc('u_cursorRadius'),
       ripples:            loc('u_ripples'),
-      pathOffset0:        loc('u_pathOffset0'),
-      pathOffset1:        loc('u_pathOffset1'),
-      pathOffset2:        loc('u_pathOffset2'),
-      pathOffset3:        loc('u_pathOffset3'),
-      pathMode:           loc('u_pathMode'),
-      pathStrokeHalfW:    loc('u_pathStrokeHalfW'),
+      pathOffset:         loc('u_pathOffset[0]'),
+      pathMode:           loc('u_pathMode[0]'),
+      pathStrokeHalfW:    loc('u_pathStrokeHalfW[0]'),
     };
-    // Texture-unit bindings: baked SDFs on 0..3 (same as the non-glass
-    // sample program so both can coexist without reshuffling), backdrop
-    // on 4.
-    gl.uniform1i(this.glassUniforms.sdf0!, 0);
-    gl.uniform1i(this.glassUniforms.sdf1!, 1);
-    gl.uniform1i(this.glassUniforms.sdf2!, 2);
-    gl.uniform1i(this.glassUniforms.sdf3!, 3);
-    gl.uniform1i(this.glassUniforms.backdrop!, 4);
+    // Texture-unit bindings: baked SDFs on 0..MAX_PATHS-1, backdrop just
+    // past them. Same layout as the sample program so both can share the
+    // bound textures without reshuffling between draws.
+    for (let i = 0; i < MAX_PATHS; i++) {
+      gl.uniform1i(loc(`u_sdf${i}`), i);
+    }
+    gl.uniform1i(this.glassUniforms.backdrop!, BACKDROP_UNIT);
     gl.uniform1f(this.glassUniforms.bound!, WEBGL_BAKE_BOUND);
     gl.uniform1i(this.glassUniforms.pathCount!, this._pathCount);
 
     // Backdrop texture. CORS-tainted sources throw here — caller should
     // catch and guide the user to same-origin or CORS-enabled hosting.
     const tex = gl.createTexture();
-    gl.activeTexture(gl.TEXTURE4);
+    gl.activeTexture(gl.TEXTURE0 + BACKDROP_UNIT);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -236,37 +250,28 @@ export class WebGLRenderer implements Renderer {
       bound:      loc('u_bound'),
       sminK:      loc('u_sminK'),
       pathCount:  loc('u_pathCount'),
-      sdf0:       loc('u_sdf0'),
-      sdf1:       loc('u_sdf1'),
-      sdf2:       loc('u_sdf2'),
-      sdf3:       loc('u_sdf3'),
-      pathOffset0: loc('u_pathOffset0'),
-      pathOffset1: loc('u_pathOffset1'),
-      pathOffset2: loc('u_pathOffset2'),
-      pathOffset3: loc('u_pathOffset3'),
       cursor:       loc('u_cursor'),
       cursorPull:   loc('u_cursorPull'),
       cursorRadius: loc('u_cursorRadius'),
       ripples:      loc('u_ripples'),
       compositeMode:     loc('u_compositeMode'),
-      pathMode:          loc('u_pathMode'),
-      pathStrokeHalfW:   loc('u_pathStrokeHalfW'),
-      pathFillOpacity:   loc('u_pathFillOpacity'),
-      pathStrokeOpacity: loc('u_pathStrokeOpacity'),
-      pathFillColor0:    loc('u_pathFillColor0'),
-      pathFillColor1:    loc('u_pathFillColor1'),
-      pathFillColor2:    loc('u_pathFillColor2'),
-      pathFillColor3:    loc('u_pathFillColor3'),
-      pathStrokeColor0:  loc('u_pathStrokeColor0'),
-      pathStrokeColor1:  loc('u_pathStrokeColor1'),
-      pathStrokeColor2:  loc('u_pathStrokeColor2'),
-      pathStrokeColor3:  loc('u_pathStrokeColor3'),
+      // GLSL uniform-array locations: query element [0] and pass the
+      // whole flat buffer to uniform{1,2,3,4}{f,i}v — the driver infers
+      // array length from the buffer size.
+      pathOffset:        loc('u_pathOffset[0]'),
+      pathMode:          loc('u_pathMode[0]'),
+      pathStrokeHalfW:   loc('u_pathStrokeHalfW[0]'),
+      pathFillOpacity:   loc('u_pathFillOpacity[0]'),
+      pathStrokeOpacity: loc('u_pathStrokeOpacity[0]'),
+      pathFillColor:     loc('u_pathFillColor[0]'),
+      pathStrokeColor:   loc('u_pathStrokeColor[0]'),
     };
-    // Bind sampler-to-texture-unit mapping once.
-    gl.uniform1i(this.sampleUniforms.sdf0!, 0);
-    gl.uniform1i(this.sampleUniforms.sdf1!, 1);
-    gl.uniform1i(this.sampleUniforms.sdf2!, 2);
-    gl.uniform1i(this.sampleUniforms.sdf3!, 3);
+    // Bind sampler-to-texture-unit mapping once per program. Each u_sdfN
+    // lives on texture unit N; setting it here means render() only has
+    // to bind the actual textures, not rewire samplers.
+    for (let i = 0; i < MAX_PATHS; i++) {
+      gl.uniform1i(loc(`u_sdf${i}`), i);
+    }
     gl.uniform1f(this.sampleUniforms.bound!, WEBGL_BAKE_BOUND);
     gl.uniform1i(this.sampleUniforms.pathCount!, paths.length);
     return true;
@@ -369,7 +374,7 @@ export class WebGLRenderer implements Renderer {
     const gl = this.gl;
     if (!gl || this.disposed) return;
     if (!this.backdropTexture) return; // no glass pipeline → nothing to update
-    gl.activeTexture(gl.TEXTURE4);
+    gl.activeTexture(gl.TEXTURE0 + BACKDROP_UNIT);
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTexture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(
@@ -402,6 +407,50 @@ export class WebGLRenderer implements Renderer {
     gl.uniform1i(this.directUniforms.segCount!, combined.length);
   }
 
+  /** Pack `MAX_PATHS` vec2 offsets into {@link pathOffsetBuf}. */
+  private fillPathOffsets(u: Uniforms): Float32Array {
+    const buf = this.pathOffsetBuf;
+    for (let i = 0; i < MAX_PATHS; i++) {
+      const o = u.pathOffsets[i];
+      buf[i * 2]     = o ? o[0] : 0;
+      buf[i * 2 + 1] = o ? o[1] : 0;
+    }
+    return buf;
+  }
+
+  /** Pack per-path mode values (fill=0 / stroke=1 / both=2). */
+  private fillPathModes(u: Uniforms): Int32Array {
+    const buf = this.pathModeBuf;
+    const modes = u.pathModes;
+    for (let i = 0; i < MAX_PATHS; i++) {
+      const m = modes?.[i];
+      buf[i] = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
+    }
+    return buf;
+  }
+
+  /** Pack an optional per-path scalar list into the shared scratch buffer. */
+  private fillPathScalars(
+    src: ReadonlyArray<number> | undefined,
+    fallback: number,
+  ): Float32Array {
+    const buf = this.pathScalarBuf;
+    for (let i = 0; i < MAX_PATHS; i++) buf[i] = src?.[i] ?? fallback;
+    return buf;
+  }
+
+  /** Pack per-path RGB colors into a flat vec3 array. */
+  private fillPathColors(src: ReadonlyArray<RgbColor> | undefined): Float32Array {
+    const buf = this.pathVec3Buf;
+    for (let i = 0; i < MAX_PATHS; i++) {
+      const c = src?.[i];
+      buf[i * 3]     = c?.[0] ?? 0;
+      buf[i * 3 + 1] = c?.[1] ?? 0;
+      buf[i * 3 + 2] = c?.[2] ?? 0;
+    }
+    return buf;
+  }
+
   render(u: Uniforms): void {
     const gl = this.gl;
     if (!gl || this.disposed) return;
@@ -411,12 +460,12 @@ export class WebGLRenderer implements Renderer {
 
     if (u.glass && this.glassProgram && this.backdropTexture) {
       gl.useProgram(this.glassProgram);
-      // Bind per-path SDFs on 0..3, backdrop on 4.
+      // Bind per-path SDFs on units 0..MAX_PATHS-1, backdrop on BACKDROP_UNIT.
       for (let i = 0; i < this.textures.length; i++) {
         gl.activeTexture(gl.TEXTURE0 + i);
         gl.bindTexture(gl.TEXTURE_2D, this.textures[i]!);
       }
-      gl.activeTexture(gl.TEXTURE4);
+      gl.activeTexture(gl.TEXTURE0 + BACKDROP_UNIT);
       gl.bindTexture(gl.TEXTURE_2D, this.backdropTexture);
 
       const gU = this.glassUniforms;
@@ -453,32 +502,13 @@ export class WebGLRenderer implements Renderer {
       }
       gl.uniform4fv(gU.ripples!, grb);
 
-      const gOffs = u.pathOffsets;
-      const setGOff = (key: string, i: number) => {
-        const o = gOffs[i];
-        gl.uniform2f(gU[key]!, o ? o[0] : 0, o ? o[1] : 0);
-      };
-      setGOff('pathOffset0', 0);
-      setGOff('pathOffset1', 1);
-      setGOff('pathOffset2', 2);
-      setGOff('pathOffset3', 3);
-
+      gl.uniform2fv(gU.pathOffset!, this.fillPathOffsets(u));
       // Per-path render mode + stroke half-width, so stroked paths go
       // through the glass shader as their sausage SDF (abs(d) - halfW)
       // instead of as solid silhouettes. Unset → treated as fills, which
       // matches legacy single-color smin behavior.
-      const gModes = u.pathModes ?? [];
-      const gModeVec = [0, 0, 0, 0];
-      for (let i = 0; i < 4; i++) {
-        const m = gModes[i];
-        gModeVec[i] = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
-      }
-      gl.uniform4i(gU.pathMode!, gModeVec[0]!, gModeVec[1]!, gModeVec[2]!, gModeVec[3]!);
-      const gHalfW = u.pathStrokeHalfW ?? [];
-      gl.uniform4f(
-        gU.pathStrokeHalfW!,
-        gHalfW[0] ?? 0, gHalfW[1] ?? 0, gHalfW[2] ?? 0, gHalfW[3] ?? 0,
-      );
+      gl.uniform4iv(gU.pathMode!, this.fillPathModes(u));
+      gl.uniform4fv(gU.pathStrokeHalfW!, this.fillPathScalars(u.pathStrokeHalfW, 0));
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
@@ -497,15 +527,7 @@ export class WebGLRenderer implements Renderer {
       gl.uniform3f(sU.color!, u.color[0], u.color[1], u.color[2]);
       gl.uniform1f(sU.opacity!, u.opacity);
       gl.uniform1f(sU.sminK!, u.sminK);
-      const offs = u.pathOffsets;
-      const setOff = (key: string, i: number) => {
-        const o = offs[i];
-        gl.uniform2f(sU[key]!, o ? o[0] : 0, o ? o[1] : 0);
-      };
-      setOff('pathOffset0', 0);
-      setOff('pathOffset1', 1);
-      setOff('pathOffset2', 2);
-      setOff('pathOffset3', 3);
+      gl.uniform2fv(sU.pathOffset!, this.fillPathOffsets(u));
       const cursor = u.cursor ?? [0, 0];
       gl.uniform2f(sU.cursor!, cursor[0], cursor[1]);
       gl.uniform1f(sU.cursorPull!, u.cursorPull ?? 0);
@@ -535,44 +557,12 @@ export class WebGLRenderer implements Renderer {
       gl.uniform1i(sU.compositeMode!, perPath ? 1 : 0);
 
       if (perPath) {
-        const modes = u.pathModes ?? [];
-        const modeVec = [0, 0, 0, 0];
-        for (let i = 0; i < 4; i++) {
-          const m = modes[i];
-          modeVec[i] = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
-        }
-        gl.uniform4i(sU.pathMode!, modeVec[0]!, modeVec[1]!, modeVec[2]!, modeVec[3]!);
-
-        const halfW = u.pathStrokeHalfW ?? [];
-        gl.uniform4f(
-          sU.pathStrokeHalfW!,
-          halfW[0] ?? 0, halfW[1] ?? 0, halfW[2] ?? 0, halfW[3] ?? 0,
-        );
-        const fo = u.pathFillOpacity ?? [];
-        gl.uniform4f(
-          sU.pathFillOpacity!,
-          fo[0] ?? 1, fo[1] ?? 1, fo[2] ?? 1, fo[3] ?? 1,
-        );
-        const so = u.pathStrokeOpacity ?? [];
-        gl.uniform4f(
-          sU.pathStrokeOpacity!,
-          so[0] ?? 1, so[1] ?? 1, so[2] ?? 1, so[3] ?? 1,
-        );
-
-        const setColor = (loc: WebGLUniformLocation | null, c?: readonly [number, number, number]) => {
-          if (!loc) return;
-          gl.uniform3f(loc, c?.[0] ?? 0, c?.[1] ?? 0, c?.[2] ?? 0);
-        };
-        const fc = u.pathFillColors;
-        setColor(sU.pathFillColor0!, fc?.[0]);
-        setColor(sU.pathFillColor1!, fc?.[1]);
-        setColor(sU.pathFillColor2!, fc?.[2]);
-        setColor(sU.pathFillColor3!, fc?.[3]);
-        const sc = u.pathStrokeColors;
-        setColor(sU.pathStrokeColor0!, sc?.[0]);
-        setColor(sU.pathStrokeColor1!, sc?.[1]);
-        setColor(sU.pathStrokeColor2!, sc?.[2]);
-        setColor(sU.pathStrokeColor3!, sc?.[3]);
+        gl.uniform4iv(sU.pathMode!, this.fillPathModes(u));
+        gl.uniform4fv(sU.pathStrokeHalfW!, this.fillPathScalars(u.pathStrokeHalfW, 0));
+        gl.uniform4fv(sU.pathFillOpacity!, this.fillPathScalars(u.pathFillOpacity, 1));
+        gl.uniform4fv(sU.pathStrokeOpacity!, this.fillPathScalars(u.pathStrokeOpacity, 1));
+        gl.uniform3fv(sU.pathFillColor!, this.fillPathColors(u.pathFillColors));
+        gl.uniform3fv(sU.pathStrokeColor!, this.fillPathColors(u.pathStrokeColors));
       }
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);

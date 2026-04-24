@@ -26,7 +26,7 @@ export function loadMark(src: string): Promise<Mark> {
       throw new Error(`failed to fetch ${src}: ${res.status} ${res.statusText}`);
     }
     const text = await res.text();
-    const mark = parseSvgDocument(text, { maxPaths: 4 });
+    const mark = parseSvgDocument(text);
     return normalizeMark(mark).mark;
   })();
 

@@ -1,10 +1,15 @@
-import type { Mark, Path } from '../geometry/types';
+import type { Mark, Path, RgbColor } from '../geometry/types';
 import {
+  MAX_PATHS,
+  WEBGPU_BACKDROP_BINDING,
   WEBGPU_BAKE_SHADER,
   WEBGPU_BAKE_SIZE,
+  WEBGPU_GLASS_OFFSETS,
   WEBGPU_GLASS_SHADER,
   WEBGPU_GLASS_UNIFORM_SIZE,
+  WEBGPU_SAMPLE_OFFSETS,
   WEBGPU_SAMPLE_SHADER,
+  WEBGPU_SAMPLE_UNIFORM_SIZE,
 } from '../shaders/webgpu';
 import { type Renderer, type RendererInitOptions, type Uniforms, validateMark } from './types';
 
@@ -30,41 +35,14 @@ function textureSourceSize(src: TexImageSource): [number, number] {
   return [anySrc.width, anySrc.height];
 }
 
-const MAX_PATHS = 4;
 // MAX_SEGS isn't enforced by WebGPU's dynamic storage buffer — it's just
 // the documented upper bound matching the WebGL shader.
-const MAX_SEGS = 32;
+const MAX_SEGS = 128;
 
-/**
- * Uniform buffer layout — matches the WGSL `Uniforms` struct in
- * shaders/webgpu.ts. Offsets are computed per the WGSL alignment rules
- * (vec3<f32> has align 16 / size 12; array<vec4> has 16-byte stride).
- *
- *   resolution      : vec2<f32>        // 0   (8)
- *   zoom            : f32              // 8   (4)
- *   sminK           : f32              // 12  (4)
- *   offset          : vec2<f32>        // 16  (8)
- *   compositeMode   : u32              // 24  (4)
- *   _pad0           : u32              // 28  (4)
- *   pathOffset0..3  : vec2<f32>[4]     // 32  (32)
- *   color           : vec3<f32>        // 64  (12)
- *   opacity         : f32              // 76  (4)
- *   bound           : f32              // 80  (4)
- *   pathCount       : u32              // 84  (4)
- *   cursor          : vec2<f32>        // 88  (8)
- *   cursorPull      : f32              // 96  (4)
- *   cursorRadius    : f32              // 100 (4)
- *   _padR           : vec2<f32>        // 104 (8)
- *   ripples[0..3]   : vec4<f32>[4]     // 112 (64)
- *   pathMode        : vec4<u32>        // 176 (16)
- *   pathStrokeHalfW : vec4<f32>        // 192 (16)
- *   pathFillOpacity : vec4<f32>        // 208 (16)
- *   pathStrokeOpacity:vec4<f32>        // 224 (16)
- *   pathFillColor   : vec4<f32>[4]     // 240 (64)
- *   pathStrokeColor : vec4<f32>[4]     // 304 (64)
- * Total: 368 bytes, 16-aligned.
- */
-const UNIFORM_BUFFER_SIZE = 368;
+/** First texture binding index for SDFs in both sample and glass layouts.
+ *  Binding 0 = uniform, 1 = sampler, then MAX_PATHS SDFs, then backdrop
+ *  (glass only) at {@link WEBGPU_BACKDROP_BINDING}. */
+const SDF_BINDING_START = 2;
 
 export class WebGPURenderer implements Renderer {
   readonly kind = 'webgpu' as const;
@@ -79,7 +57,7 @@ export class WebGPURenderer implements Renderer {
   private textures: GPUTexture[] = [];
   private dummyTexture: GPUTexture | null = null;
   private sampleBindGroup: GPUBindGroup | null = null;
-  private uniformData = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
+  private uniformData = new ArrayBuffer(WEBGPU_SAMPLE_UNIFORM_SIZE);
   private glassPipeline: GPURenderPipeline | null = null;
   private glassUniformBuffer: GPUBuffer | null = null;
   private glassBindGroup: GPUBindGroup | null = null;
@@ -102,7 +80,22 @@ export class WebGPURenderer implements Renderer {
     }
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
     if (!adapter) throw new Error('no WebGPU adapter');
-    const device = await adapter.requestDevice();
+    // Glass binds 16 SDF textures + backdrop = 17 sampled textures in one
+    // stage, one past the WebGPU default minimum of 16. Request the extra
+    // up front so requestDevice rejects on adapters that can't meet it —
+    // clearer than a later pipeline-creation failure. Every desktop GPU
+    // driver exposes thousands; the downgrade path only matters on very
+    // constrained embedded targets.
+    const sampledTextureLimit = backdrop ? MAX_PATHS + 1 : MAX_PATHS;
+    const adapterMax = adapter.limits.maxSampledTexturesPerShaderStage;
+    if (adapterMax < sampledTextureLimit) {
+      throw new Error(
+        `adapter exposes maxSampledTexturesPerShaderStage=${adapterMax}; bezier-sdf needs ${sampledTextureLimit} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop' : ''})`,
+      );
+    }
+    const device = await adapter.requestDevice({
+      requiredLimits: { maxSampledTexturesPerShaderStage: sampledTextureLimit },
+    });
     this.device = device;
     device.lost.then((info) => {
       if (this.disposed) return;
@@ -137,8 +130,8 @@ export class WebGPURenderer implements Renderer {
       this.runBakeIntoTexture(device, this.textures[i]!, mark.paths[i]!);
     }
 
-    // Dummy 1x1 texture for unused path slots — WebGPU requires all four
-    // texture bindings even when pathCount < 4.
+    // Dummy 1x1 texture for unused path slots — WebGPU requires every
+    // texture binding to be satisfied even when pathCount < MAX_PATHS.
     this.dummyTexture = device.createTexture({
       size: [1, 1],
       format: 'r16float',
@@ -161,7 +154,7 @@ export class WebGPURenderer implements Renderer {
 
     // --- Sample pipeline ---
     this.uniformBuffer = device.createBuffer({
-      size: UNIFORM_BUFFER_SIZE,
+      size: WEBGPU_SAMPLE_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const sampler = device.createSampler({
@@ -176,10 +169,11 @@ export class WebGPURenderer implements Renderer {
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        ...Array.from({ length: MAX_PATHS }, (_, i) => ({
+          binding: SDF_BINDING_START + i,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float' as const, viewDimension: '2d' as const },
+        })),
       ],
     });
     this.samplePipeline = device.createRenderPipeline({
@@ -206,10 +200,10 @@ export class WebGPURenderer implements Renderer {
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
         { binding: 1, resource: sampler },
-        { binding: 2, resource: viewFor(0) },
-        { binding: 3, resource: viewFor(1) },
-        { binding: 4, resource: viewFor(2) },
-        { binding: 5, resource: viewFor(3) },
+        ...Array.from({ length: MAX_PATHS }, (_, i) => ({
+          binding: SDF_BINDING_START + i,
+          resource: viewFor(i),
+        })),
       ],
     });
 
@@ -257,11 +251,16 @@ export class WebGPURenderer implements Renderer {
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        ...Array.from({ length: MAX_PATHS }, (_, i) => ({
+          binding: SDF_BINDING_START + i,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float' as const, viewDimension: '2d' as const },
+        })),
+        {
+          binding: WEBGPU_BACKDROP_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
       ],
     });
     this.glassBindGroupLayout = glassLayout;
@@ -282,16 +281,24 @@ export class WebGPURenderer implements Renderer {
       primitive: { topology: 'triangle-list' },
     });
 
-    this.glassBindGroup = device.createBindGroup({
-      layout: glassLayout,
+    this.glassBindGroup = this.buildGlassBindGroup(device, viewFor, backdropTexture);
+  }
+
+  private buildGlassBindGroup(
+    device: GPUDevice,
+    viewFor: (i: number) => GPUTextureView,
+    backdropTexture: GPUTexture,
+  ): GPUBindGroup {
+    return device.createBindGroup({
+      layout: this.glassBindGroupLayout!,
       entries: [
-        { binding: 0, resource: { buffer: glassUniformBuffer } },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: viewFor(0) },
-        { binding: 3, resource: viewFor(1) },
-        { binding: 4, resource: viewFor(2) },
-        { binding: 5, resource: viewFor(3) },
-        { binding: 6, resource: backdropTexture.createView() },
+        { binding: 0, resource: { buffer: this.glassUniformBuffer! } },
+        { binding: 1, resource: this.sampler! },
+        ...Array.from({ length: MAX_PATHS }, (_, i) => ({
+          binding: SDF_BINDING_START + i,
+          resource: viewFor(i),
+        })),
+        { binding: WEBGPU_BACKDROP_BINDING, resource: backdropTexture.createView() },
       ],
     });
   }
@@ -397,22 +404,9 @@ export class WebGPURenderer implements Renderer {
     );
     this.backdropTexture = next;
 
-    // Bind group holds the texture view by reference; rebuild so future
-    // render() calls sample the new texture.
     const viewFor = (i: number) =>
       (i < this.textures.length ? this.textures[i]! : this.dummyTexture!).createView();
-    this.glassBindGroup = device.createBindGroup({
-      layout: this.glassBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.glassUniformBuffer! } },
-        { binding: 1, resource: this.sampler },
-        { binding: 2, resource: viewFor(0) },
-        { binding: 3, resource: viewFor(1) },
-        { binding: 4, resource: viewFor(2) },
-        { binding: 5, resource: viewFor(3) },
-        { binding: 6, resource: next.createView() },
-      ],
-    });
+    this.glassBindGroup = this.buildGlassBindGroup(device, viewFor, next);
 
     old?.destroy();
   }
@@ -436,76 +430,37 @@ export class WebGPURenderer implements Renderer {
     // Zero-fill between writes so stale data from prior frames doesn't
     // leak (e.g. ripple slots that weren't re-populated).
     new Uint8Array(this.uniformData).fill(0);
+    const off = WEBGPU_SAMPLE_OFFSETS;
 
-    view.setFloat32(0,  u.width,    true);
-    view.setFloat32(4,  u.height,   true);
-    view.setFloat32(8,  u.zoom,     true);
-    view.setFloat32(12, u.sminK,    true);
-    view.setFloat32(16, u.offsetX,  true);
-    view.setFloat32(20, u.offsetY,  true);
-    view.setUint32(24, perPath ? 1 : 0, true);
-    // 28: _pad0
-
-    const writeOff = (slot: number, off?: readonly [number, number]) => {
-      const base = 32 + slot * 8;
-      view.setFloat32(base,     off ? off[0] : 0, true);
-      view.setFloat32(base + 4, off ? off[1] : 0, true);
-    };
-    writeOff(0, u.pathOffsets[0]);
-    writeOff(1, u.pathOffsets[1]);
-    writeOff(2, u.pathOffsets[2]);
-    writeOff(3, u.pathOffsets[3]);
-    view.setFloat32(64, u.color[0], true);
-    view.setFloat32(68, u.color[1], true);
-    view.setFloat32(72, u.color[2], true);
-    view.setFloat32(76, u.opacity,  true);
-    view.setFloat32(80, 1.2,        true); // bound (matches shader constant)
-    view.setUint32(84, this._pathCount, true);
+    view.setFloat32(off.resolution,     u.width,    true);
+    view.setFloat32(off.resolution + 4, u.height,   true);
+    view.setFloat32(off.zoom,           u.zoom,     true);
+    view.setFloat32(off.sminK,          u.sminK,    true);
+    view.setFloat32(off.offset,         u.offsetX,  true);
+    view.setFloat32(off.offset + 4,     u.offsetY,  true);
+    view.setUint32 (off.compositeMode,  perPath ? 1 : 0, true);
+    view.setUint32 (off.pathCount,      this._pathCount, true);
+    view.setFloat32(off.color,          u.color[0], true);
+    view.setFloat32(off.color + 4,      u.color[1], true);
+    view.setFloat32(off.color + 8,      u.color[2], true);
+    view.setFloat32(off.opacity,        u.opacity,  true);
+    view.setFloat32(off.bound,          1.2,        true); // WEBGPU_BAKE_BOUND
     const cursor = u.cursor ?? [0, 0];
-    view.setFloat32(88, cursor[0], true);
-    view.setFloat32(92, cursor[1], true);
-    view.setFloat32(96, u.cursorPull ?? 0, true);
-    view.setFloat32(100, u.cursorRadius ?? 1, true);
-    // ripples[0..3] at 112..176.
-    const ripples = u.ripples;
-    for (let i = 0; i < 4; i++) {
-      const r = ripples?.[i];
-      const base = 112 + i * 16;
-      view.setFloat32(base,      r ? r[0] : 0, true);
-      view.setFloat32(base + 4,  r ? r[1] : 0, true);
-      view.setFloat32(base + 8,  r ? r[2] : 0, true);
-      view.setFloat32(base + 12, r ? r[3] : 0, true);
-    }
+    view.setFloat32(off.cursor,         cursor[0], true);
+    view.setFloat32(off.cursor + 4,     cursor[1], true);
+    view.setFloat32(off.cursorPull,     u.cursorPull ?? 0, true);
+    view.setFloat32(off.cursorRadius,   u.cursorRadius ?? 1, true);
+
+    writeRipples(view, off.ripples, u.ripples);
+    writePathOffsets(view, off.pathOffsets, u.pathOffsets);
 
     if (perPath) {
-      const modes = u.pathModes ?? [];
-      for (let i = 0; i < 4; i++) {
-        const m = modes[i];
-        const v = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
-        view.setUint32(176 + i * 4, v, true);
-      }
-      const halfW = u.pathStrokeHalfW ?? [];
-      for (let i = 0; i < 4; i++) view.setFloat32(192 + i * 4, halfW[i] ?? 0, true);
-      const fo = u.pathFillOpacity ?? [];
-      for (let i = 0; i < 4; i++) view.setFloat32(208 + i * 4, fo[i] ?? 1, true);
-      const so = u.pathStrokeOpacity ?? [];
-      for (let i = 0; i < 4; i++) view.setFloat32(224 + i * 4, so[i] ?? 1, true);
-      const fc = u.pathFillColors;
-      for (let i = 0; i < 4; i++) {
-        const c = fc?.[i];
-        const base = 240 + i * 16;
-        view.setFloat32(base,      c?.[0] ?? 0, true);
-        view.setFloat32(base + 4,  c?.[1] ?? 0, true);
-        view.setFloat32(base + 8,  c?.[2] ?? 0, true);
-      }
-      const sc = u.pathStrokeColors;
-      for (let i = 0; i < 4; i++) {
-        const c = sc?.[i];
-        const base = 304 + i * 16;
-        view.setFloat32(base,      c?.[0] ?? 0, true);
-        view.setFloat32(base + 4,  c?.[1] ?? 0, true);
-        view.setFloat32(base + 8,  c?.[2] ?? 0, true);
-      }
+      writePathModes(view, off.pathMode, u.pathModes);
+      writePackedScalars(view, off.pathStrokeHalfW, u.pathStrokeHalfW, 0);
+      writePackedScalars(view, off.pathFillOpacity, u.pathFillOpacity, 1);
+      writePackedScalars(view, off.pathStrokeOpacity, u.pathStrokeOpacity, 1);
+      writePathColors(view, off.pathFillColor, u.pathFillColors);
+      writePathColors(view, off.pathStrokeColor, u.pathStrokeColors);
     }
 
     device.queue.writeBuffer(uniformBuffer, 0, this.uniformData);
@@ -533,69 +488,44 @@ export class WebGPURenderer implements Renderer {
 
     const view = new DataView(this.glassUniformData);
     new Uint8Array(this.glassUniformData).fill(0);
+    const off = WEBGPU_GLASS_OFFSETS;
 
-    view.setFloat32(0,  u.width,  true);
-    view.setFloat32(4,  u.height, true);
-    view.setFloat32(8,  u.zoom,   true);
-    view.setFloat32(12, u.sminK,  true);
-    view.setFloat32(16, u.offsetX, true);
-    view.setFloat32(20, u.offsetY, true);
-    view.setUint32 (24, this._pathCount, true);
-    view.setFloat32(28, u.opacity, true);
-    view.setFloat32(32, u.refractionStrength ?? GLASS_DEFAULTS.refractionStrength, true);
-    view.setFloat32(36, u.chromaticStrength  ?? GLASS_DEFAULTS.chromaticStrength, true);
-    view.setFloat32(40, u.fresnelStrength    ?? GLASS_DEFAULTS.fresnelStrength, true);
-    view.setFloat32(44, u.tintStrength       ?? GLASS_DEFAULTS.tintStrength, true);
+    view.setFloat32(off.resolution,     u.width,   true);
+    view.setFloat32(off.resolution + 4, u.height,  true);
+    view.setFloat32(off.zoom,           u.zoom,    true);
+    view.setFloat32(off.sminK,          u.sminK,   true);
+    view.setFloat32(off.offset,         u.offsetX, true);
+    view.setFloat32(off.offset + 4,     u.offsetY, true);
+    view.setUint32 (off.pathCount,      this._pathCount, true);
+    view.setFloat32(off.opacity,        u.opacity, true);
+    view.setFloat32(off.refractionStrength, u.refractionStrength ?? GLASS_DEFAULTS.refractionStrength, true);
+    view.setFloat32(off.chromaticStrength,  u.chromaticStrength  ?? GLASS_DEFAULTS.chromaticStrength, true);
+    view.setFloat32(off.fresnelStrength,    u.fresnelStrength    ?? GLASS_DEFAULTS.fresnelStrength, true);
+    view.setFloat32(off.tintStrength,       u.tintStrength       ?? GLASS_DEFAULTS.tintStrength, true);
     const rim = u.rimColor ?? GLASS_DEFAULTS.rimColor;
-    view.setFloat32(48, rim[0], true);
-    view.setFloat32(52, rim[1], true);
-    view.setFloat32(56, rim[2], true);
-    view.setFloat32(60, 1.2, true); // bound (matches WEBGPU_BAKE_BOUND)
+    view.setFloat32(off.rimColor,     rim[0], true);
+    view.setFloat32(off.rimColor + 4, rim[1], true);
+    view.setFloat32(off.rimColor + 8, rim[2], true);
+    view.setFloat32(off.bound, 1.2, true); // WEBGPU_BAKE_BOUND
     const tint = u.tintColor ?? GLASS_DEFAULTS.tintColor;
-    view.setFloat32(64, tint[0], true);
-    view.setFloat32(68, tint[1], true);
-    view.setFloat32(72, tint[2], true);
-    view.setFloat32(76, u.frostStrength ?? GLASS_DEFAULTS.frostStrength, true);
+    view.setFloat32(off.tintColor,     tint[0], true);
+    view.setFloat32(off.tintColor + 4, tint[1], true);
+    view.setFloat32(off.tintColor + 8, tint[2], true);
+    view.setFloat32(off.frostStrength, u.frostStrength ?? GLASS_DEFAULTS.frostStrength, true);
 
     const cursor = u.cursor ?? [0, 0];
-    view.setFloat32(80, cursor[0], true);
-    view.setFloat32(84, cursor[1], true);
-    view.setFloat32(88, u.cursorPull ?? 0, true);
-    view.setFloat32(92, u.cursorRadius ?? 1, true);
-    const ripples = u.ripples;
-    for (let i = 0; i < 4; i++) {
-      const r = ripples?.[i];
-      const base = 96 + i * 16;
-      view.setFloat32(base,      r ? r[0] : 0, true);
-      view.setFloat32(base + 4,  r ? r[1] : 0, true);
-      view.setFloat32(base + 8,  r ? r[2] : 0, true);
-      view.setFloat32(base + 12, r ? r[3] : 0, true);
-    }
+    view.setFloat32(off.cursor,       cursor[0], true);
+    view.setFloat32(off.cursor + 4,   cursor[1], true);
+    view.setFloat32(off.cursorPull,   u.cursorPull ?? 0, true);
+    view.setFloat32(off.cursorRadius, u.cursorRadius ?? 1, true);
+    writeRipples(view, off.ripples, u.ripples);
 
-    // pathOffset0..3 at 160..192 (vec2 each, 8 bytes, 8-aligned).
-    for (let i = 0; i < 4; i++) {
-      const o = u.pathOffsets[i];
-      const base = 160 + i * 8;
-      view.setFloat32(base,     o ? o[0] : 0, true);
-      view.setFloat32(base + 4, o ? o[1] : 0, true);
-    }
-
-    // pathMode at 192..208, pathStrokeHalfW at 208..224. Mirrors the
-    // sample pipeline so stroked paths enter the glass shader as their
-    // sausage SDF (abs(d) - halfW) rather than solid silhouettes. "both"
-    // (2) is treated as fill by the shader — glass refracts through the
-    // filled silhouette; an additional stroke overlay doesn't read well
-    // through a lens.
-    const modes = u.pathModes ?? [];
-    for (let i = 0; i < 4; i++) {
-      const m = modes[i];
-      const v = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
-      view.setUint32(192 + i * 4, v, true);
-    }
-    const halfW = u.pathStrokeHalfW ?? [];
-    for (let i = 0; i < 4; i++) {
-      view.setFloat32(208 + i * 4, halfW[i] ?? 0, true);
-    }
+    // Per-path mode + stroke half-width: stroke paths go through glass as
+    // their sausage SDF (abs(d) - halfW) rather than solid silhouettes.
+    // Unset → fills, matching legacy single-color smin behaviour.
+    writePathModes(view, off.pathMode, u.pathModes);
+    writePackedScalars(view, off.pathStrokeHalfW, u.pathStrokeHalfW, 0);
+    writePathOffsets(view, off.pathOffsets, u.pathOffsets);
 
     device.queue.writeBuffer(buffer, 0, this.glassUniformData);
 
@@ -640,5 +570,81 @@ export class WebGPURenderer implements Renderer {
     this.glassBindGroup = null;
     this.glassBindGroupLayout = null;
     this.sampler = null;
+  }
+}
+
+/* --- Uniform-write helpers ----------------------------------------------- */
+// These live outside the class so both render paths share the packing rules
+// and can't drift apart. All take base offsets computed from the shader's
+// struct layout in WEBGPU_SAMPLE_OFFSETS / WEBGPU_GLASS_OFFSETS.
+
+function writeRipples(
+  view: DataView,
+  base: number,
+  ripples: ReadonlyArray<readonly [number, number, number, number]> | undefined,
+): void {
+  for (let i = 0; i < 4; i++) {
+    const r = ripples?.[i];
+    const o = base + i * 16;
+    view.setFloat32(o,      r ? r[0] : 0, true);
+    view.setFloat32(o + 4,  r ? r[1] : 0, true);
+    view.setFloat32(o + 8,  r ? r[2] : 0, true);
+    view.setFloat32(o + 12, r ? r[3] : 0, true);
+  }
+}
+
+/** Pack two vec2 offsets into each vec4 slot: (x0,y0,x1,y1), (x2,y2,x3,y3)… */
+function writePathOffsets(
+  view: DataView,
+  base: number,
+  offsets: ReadonlyArray<readonly [number, number]>,
+): void {
+  for (let i = 0; i < MAX_PATHS; i++) {
+    const o = offsets[i];
+    const slot = i >> 1;
+    const sub = (i & 1) * 8;
+    const byte = base + slot * 16 + sub;
+    view.setFloat32(byte,     o ? o[0] : 0, true);
+    view.setFloat32(byte + 4, o ? o[1] : 0, true);
+  }
+}
+
+/** Pack 16 per-path mode codes (fill=0/stroke=1/both=2) four per vec4<u32>. */
+function writePathModes(
+  view: DataView,
+  base: number,
+  modes: ReadonlyArray<'fill' | 'stroke' | 'both'> | undefined,
+): void {
+  for (let i = 0; i < MAX_PATHS; i++) {
+    const m = modes?.[i];
+    const v = m === 'stroke' ? 1 : m === 'both' ? 2 : 0;
+    view.setUint32(base + i * 4, v, true);
+  }
+}
+
+/** Pack 16 floats four per vec4, with a default used for missing entries. */
+function writePackedScalars(
+  view: DataView,
+  base: number,
+  src: ReadonlyArray<number> | undefined,
+  fallback: number,
+): void {
+  for (let i = 0; i < MAX_PATHS; i++) {
+    view.setFloat32(base + i * 4, src?.[i] ?? fallback, true);
+  }
+}
+
+/** Write 16 RGB colors into their padded vec4 slots (.rgb set, .a=0). */
+function writePathColors(
+  view: DataView,
+  base: number,
+  src: ReadonlyArray<RgbColor> | undefined,
+): void {
+  for (let i = 0; i < MAX_PATHS; i++) {
+    const c = src?.[i];
+    const o = base + i * 16;
+    view.setFloat32(o,     c?.[0] ?? 0, true);
+    view.setFloat32(o + 4, c?.[1] ?? 0, true);
+    view.setFloat32(o + 8, c?.[2] ?? 0, true);
   }
 }
