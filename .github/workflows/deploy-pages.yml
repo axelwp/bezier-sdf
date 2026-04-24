@@ -1,4 +1,4 @@
-name: Deploy reveal example to Pages
+name: Deploy react example to Pages
 
 on:
   push:
@@ -23,7 +23,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm --filter @bezier-sdf/core build
-      - run: pnpm --filter @bezier-sdf/example-reveal build
+      - run: pnpm --filter @bezier-sdf/react build
+      - run: pnpm --filter @bezier-sdf/example-react build
 
       - name: Push build to axelwp.github.io
         uses: peaceiris/actions-gh-pages@v4
@@ -31,6 +32,6 @@ jobs:
           personal_token: ${{ secrets.PAGES_DEPLOY_TOKEN }}
           external_repository: axelwp/axelwp.github.io
           publish_branch: main
-          publish_dir: ./examples/reveal/dist
+          publish_dir: ./examples/react/dist
           force_orphan: true
           commit_message: "deploy from bezier-sdf@${{ github.sha }}"
