@@ -7,10 +7,21 @@ import {
   WEBGL_BAKE_SIZE,
   WEBGL_BAKE_VERT,
   WEBGL_DIRECT_FRAG,
+  WEBGL_GLASS_FRAG,
   WEBGL_SAMPLE_FRAG,
   WEBGL_VERT,
 } from '../shaders/webgl';
 import { type Renderer, type RendererInitOptions, type Uniforms, validateMark } from './types';
+
+const GLASS_DEFAULTS = {
+  refractionStrength: 0.05,
+  chromaticStrength: 0.015,
+  fresnelStrength: 0.3,
+  tintStrength: 0.1,
+  frostStrength: 2.5,
+  rimColor: [1, 1, 1] as const,
+  tintColor: [0.91, 0.94, 1.0] as const,
+};
 
 /**
  * WebGL 1 renderer.
@@ -32,9 +43,12 @@ export class WebGLRenderer implements Renderer {
   private bakeProgram: WebGLProgram | null = null;
   private sampleProgram: WebGLProgram | null = null;
   private directProgram: WebGLProgram | null = null;
+  private glassProgram: WebGLProgram | null = null;
   private textures: WebGLTexture[] = [];
+  private backdropTexture: WebGLTexture | null = null;
   private sampleUniforms: Record<string, WebGLUniformLocation | null> = {};
   private directUniforms: Record<string, WebGLUniformLocation | null> = {};
+  private glassUniforms: Record<string, WebGLUniformLocation | null> = {};
   private _mode: 'baked' | 'direct' = 'baked';
   private _pathCount = 0;
   private disposed = false;
@@ -44,7 +58,7 @@ export class WebGLRenderer implements Renderer {
   get mode(): 'baked' | 'direct' { return this._mode; }
   get pathCount(): number { return this._pathCount; }
 
-  async init({ canvas, mark }: RendererInitOptions): Promise<void> {
+  async init({ canvas, mark, backdrop }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGS);
 
     const gl = canvas.getContext('webgl', {
@@ -74,11 +88,91 @@ export class WebGLRenderer implements Renderer {
     this._pathCount = mark.paths.length;
     const bakeOk = this.tryInitBaked(gl, mark.paths);
     if (!bakeOk) {
+      if (backdrop) {
+        // Glass needs the baked SDF textures as the lens; we can't refract
+        // through the direct path. Surface this so the caller falls back
+        // cleanly (React → StaticFallback).
+        throw new Error(
+          'liquid-glass requires half-float texture extensions (unavailable in this context)',
+        );
+      }
       this._mode = 'direct';
       const combined = mark.paths.flatMap((p) => p.segments as CubicSegment[]);
       this.initDirect(gl, combined);
       // eslint-disable-next-line no-console
       console.info('[bezier-sdf] half-float textures unavailable, using direct shader (no per-path animation)');
+    }
+
+    if (backdrop) {
+      this.initGlass(gl, backdrop);
+    }
+  }
+
+  private initGlass(gl: WebGLRenderingContext, backdrop: TexImageSource): void {
+    const program = link(gl, WEBGL_VERT, WEBGL_GLASS_FRAG);
+    if (!program) throw new Error('liquid-glass shader failed to link');
+    this.glassProgram = program;
+    gl.useProgram(program);
+    const posLoc = gl.getAttribLocation(program, 'a_pos');
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+    const loc = (n: string) => gl.getUniformLocation(program, n);
+    this.glassUniforms = {
+      res:       loc('u_res'),
+      zoom:      loc('u_zoom'),
+      offset:    loc('u_offset'),
+      opacity:   loc('u_opacity'),
+      sminK:     loc('u_sminK'),
+      bound:     loc('u_bound'),
+      pathCount: loc('u_pathCount'),
+      sdf0:      loc('u_sdf0'),
+      sdf1:      loc('u_sdf1'),
+      sdf2:      loc('u_sdf2'),
+      sdf3:      loc('u_sdf3'),
+      backdrop:           loc('u_backdrop'),
+      refractionStrength: loc('u_refractionStrength'),
+      chromaticStrength:  loc('u_chromaticStrength'),
+      fresnelStrength:    loc('u_fresnelStrength'),
+      tintStrength:       loc('u_tintStrength'),
+      frostStrength:      loc('u_frostStrength'),
+      rimColor:           loc('u_rimColor'),
+      tintColor:          loc('u_tintColor'),
+    };
+    // Texture-unit bindings: baked SDFs on 0..3 (same as the non-glass
+    // sample program so both can coexist without reshuffling), backdrop
+    // on 4.
+    gl.uniform1i(this.glassUniforms.sdf0!, 0);
+    gl.uniform1i(this.glassUniforms.sdf1!, 1);
+    gl.uniform1i(this.glassUniforms.sdf2!, 2);
+    gl.uniform1i(this.glassUniforms.sdf3!, 3);
+    gl.uniform1i(this.glassUniforms.backdrop!, 4);
+    gl.uniform1f(this.glassUniforms.bound!, WEBGL_BAKE_BOUND);
+    gl.uniform1i(this.glassUniforms.pathCount!, this._pathCount);
+
+    // Backdrop texture. CORS-tainted sources throw here — caller should
+    // catch and guide the user to same-origin or CORS-enabled hosting.
+    const tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE,
+      backdrop as TexImageSource,
+    );
+    this.backdropTexture = tex;
+
+    // Restore the sample program's a_pos binding (init'd last in baked
+    // path), so the next render() call doesn't need to rebind.
+    if (this.sampleProgram) {
+      gl.useProgram(this.sampleProgram);
+      const sp = gl.getAttribLocation(this.sampleProgram, 'a_pos');
+      gl.enableVertexAttribArray(sp);
+      gl.vertexAttribPointer(sp, 2, gl.FLOAT, false, 0, 0);
     }
   }
 
@@ -292,6 +386,35 @@ export class WebGLRenderer implements Renderer {
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
+    if (u.glass && this.glassProgram && this.backdropTexture) {
+      gl.useProgram(this.glassProgram);
+      // Bind per-path SDFs on 0..3, backdrop on 4.
+      for (let i = 0; i < this.textures.length; i++) {
+        gl.activeTexture(gl.TEXTURE0 + i);
+        gl.bindTexture(gl.TEXTURE_2D, this.textures[i]!);
+      }
+      gl.activeTexture(gl.TEXTURE4);
+      gl.bindTexture(gl.TEXTURE_2D, this.backdropTexture);
+
+      const gU = this.glassUniforms;
+      gl.uniform2f(gU.res!, u.width, u.height);
+      gl.uniform1f(gU.zoom!, u.zoom);
+      gl.uniform2f(gU.offset!, u.offsetX, u.offsetY);
+      gl.uniform1f(gU.opacity!, u.opacity);
+      gl.uniform1f(gU.sminK!, u.sminK);
+      gl.uniform1f(gU.refractionStrength!, u.refractionStrength ?? GLASS_DEFAULTS.refractionStrength);
+      gl.uniform1f(gU.chromaticStrength!, u.chromaticStrength ?? GLASS_DEFAULTS.chromaticStrength);
+      gl.uniform1f(gU.fresnelStrength!, u.fresnelStrength ?? GLASS_DEFAULTS.fresnelStrength);
+      gl.uniform1f(gU.tintStrength!, u.tintStrength ?? GLASS_DEFAULTS.tintStrength);
+      gl.uniform1f(gU.frostStrength!, u.frostStrength ?? GLASS_DEFAULTS.frostStrength);
+      const rim = u.rimColor ?? GLASS_DEFAULTS.rimColor;
+      gl.uniform3f(gU.rimColor!, rim[0], rim[1], rim[2]);
+      const tint = u.tintColor ?? GLASS_DEFAULTS.tintColor;
+      gl.uniform3f(gU.tintColor!, tint[0], tint[1], tint[2]);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      return;
+    }
+
     if (this._mode === 'baked' && this.sampleProgram) {
       gl.useProgram(this.sampleProgram);
       for (let i = 0; i < this.textures.length; i++) {
@@ -407,7 +530,9 @@ export class WebGLRenderer implements Renderer {
       if (this.bakeProgram) gl.deleteProgram(this.bakeProgram);
       if (this.sampleProgram) gl.deleteProgram(this.sampleProgram);
       if (this.directProgram) gl.deleteProgram(this.directProgram);
+      if (this.glassProgram) gl.deleteProgram(this.glassProgram);
       this.textures.forEach((t) => gl.deleteTexture(t));
+      if (this.backdropTexture) gl.deleteTexture(this.backdropTexture);
       if (this.buffer) gl.deleteBuffer(this.buffer);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
@@ -415,7 +540,9 @@ export class WebGLRenderer implements Renderer {
     this.bakeProgram = null;
     this.sampleProgram = null;
     this.directProgram = null;
+    this.glassProgram = null;
     this.textures = [];
+    this.backdropTexture = null;
     this.buffer = null;
   }
 }

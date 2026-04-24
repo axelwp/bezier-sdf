@@ -9,6 +9,29 @@ export const WEBGPU_BAKE_SIZE = 1024;
 export const WEBGPU_BAKE_BOUND = 1.2;
 
 /**
+ * Uniform buffer layout for the glass sample pipeline. Tight 80-byte
+ * struct; WGSL vec3 has align 16 / size 12, so `bound` gets packed into
+ * the 4 bytes after `rimColor` within its 16-byte slot.
+ *
+ *   resolution         : vec2<f32>   // 0   (8)
+ *   zoom               : f32         // 8   (4)
+ *   sminK              : f32         // 12  (4)
+ *   offset             : vec2<f32>   // 16  (8)
+ *   pathCount          : u32         // 24  (4)
+ *   opacity            : f32         // 28  (4)
+ *   refractionStrength : f32         // 32  (4)
+ *   chromaticStrength  : f32         // 36  (4)
+ *   fresnelStrength    : f32         // 40  (4)
+ *   tintStrength       : f32         // 44  (4)
+ *   rimColor           : vec3<f32>   // 48  (12)
+ *   bound              : f32         // 60  (4)
+ *   tintColor          : vec3<f32>   // 64  (12)
+ *   frostStrength      : f32         // 76  (4)
+ * Total: 80 bytes, 16-aligned.
+ */
+export const WEBGPU_GLASS_UNIFORM_SIZE = 80;
+
+/**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
  * per bake pass; the fragment shader walks them for each pixel of a
  * 1024x1024 r16float render target.
@@ -270,5 +293,173 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   var rgb = vec3<f32>(0.0);
   if (acc.a > 1e-6) { rgb = acc.rgb / acc.a; }
   return vec4<f32>(rgb, acc.a * U.opacity);
+}
+`;
+
+/**
+ * Liquid-glass sample pipeline. Same shape-compositing as the legacy
+ * smin branch — all paths smooth-unioned into one silhouette — but uses
+ * the combined SDF's screen-space gradient as a surface normal to
+ * refract a backdrop texture through the shape. See the GLSL mirror in
+ * shaders/webgl.ts for the full rationale of each ingredient.
+ *
+ * Bindings:
+ *   0: uniforms (GlassUniforms, 80 bytes)
+ *   1: sampler (linear, clamp — shared by SDF and backdrop)
+ *   2..5: baked SDF textures (tex0..tex3)
+ *   6: backdrop texture
+ */
+export const WEBGPU_GLASS_SHADER = /* wgsl */ `
+struct GlassUniforms {
+  resolution: vec2<f32>,
+  zoom: f32,
+  sminK: f32,
+  offset: vec2<f32>,
+  pathCount: u32,
+  opacity: f32,
+  refractionStrength: f32,
+  chromaticStrength: f32,
+  fresnelStrength: f32,
+  tintStrength: f32,
+  rimColor: vec3<f32>,
+  bound: f32,
+  tintColor: vec3<f32>,
+  frostStrength: f32,
+};
+
+@group(0) @binding(0) var<uniform> U: GlassUniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var tex0: texture_2d<f32>;
+@group(0) @binding(3) var tex1: texture_2d<f32>;
+@group(0) @binding(4) var tex2: texture_2d<f32>;
+@group(0) @binding(5) var tex3: texture_2d<f32>;
+@group(0) @binding(6) var backdrop: texture_2d<f32>;
+
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0),
+  );
+  var out: VsOut;
+  out.pos = vec4<f32>(pos[vi], 0.0, 1.0);
+  return out;
+}
+
+fn smin(a: f32, b: f32, k: f32) -> f32 {
+  let h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
+}
+
+fn sampleSdf(i: u32, uv: vec2<f32>) -> f32 {
+  let t = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+  if (i == 0u) { return textureSample(tex0, samp, t).r; }
+  if (i == 1u) { return textureSample(tex1, samp, t).r; }
+  if (i == 2u) { return textureSample(tex2, samp, t).r; }
+  return textureSample(tex3, samp, t).r;
+}
+
+fn combinedSdf(uv: vec2<f32>) -> f32 {
+  let k = max(U.sminK, 1e-4);
+  var d = sampleSdf(0u, uv);
+  if (U.pathCount > 1u) { d = smin(d, sampleSdf(1u, uv), k); }
+  if (U.pathCount > 2u) { d = smin(d, sampleSdf(2u, uv), k); }
+  if (U.pathCount > 3u) { d = smin(d, sampleSdf(3u, uv), k); }
+  return d;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = U.resolution;
+  var uv = (fragCoord.xy - 0.5 * res) / min(res.x, res.y);
+  uv.y = -uv.y;
+  uv = uv * (2.0 / U.zoom);
+  uv = uv - U.offset;
+
+  let d = combinedSdf(uv);
+  let aa = fwidth(d) * 1.2;
+  let insideMask = 1.0 - smoothstep(-aa, aa, d);
+
+  // See the GLSL mirror for the full rationale: any height field that's
+  // a function of the SDF has a zero-gradient plateau along the shape's
+  // medial axis, which reads as hard refraction facets. The fix is to
+  // build the height field from a *blurred indicator* instead — smooth
+  // each SDF sample through a smoothstep to get 0-or-1 inside/outside
+  // values, then average 9 samples over a radial kernel. The result is
+  // a genuine smooth dome: flat plateau in the interior, smooth rising
+  // rim, no medial-axis creases.
+  let SDF_BLUR:  f32 = 0.08;
+  let SOFT_EDGE: f32 = 0.03;
+  let D:         f32 = 0.70710678 * SDF_BLUR;  // = SDF_BLUR / √2
+
+  var h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv))) * 2.0;
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(SDF_BLUR, 0.0)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2<f32>(0.0, SDF_BLUR)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>( D, -D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D,  D)));
+  h = h + 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2<f32>(-D, -D)));
+  h = h / 10.0;
+
+  let grad = vec2<f32>(dpdx(h), dpdy(h));
+  let gradMag = length(grad);
+  let normal = grad / max(gradMag, 1e-6);
+
+  // Lens intensity falls out of the smoothed height: 1 at the rim
+  // (h ≈ 0.5), 0 in the interior (h = 1). Doubled so the rim peak
+  // normalises to 1.
+  let lensAmount = clamp((1.0 - h) * 2.0, 0.0, 1.0);
+
+  // Interior proxy for tint and frost — derived from h so bands follow
+  // the smoothed height field rather than the SDF iso-contours, which
+  // would otherwise paint medial-axis cusps into the tint.
+  let interior = smoothstep(0.5, 1.0, h);
+
+  let sdfToUv = vec2<f32>(min(res.x, res.y)) / res;
+  let refractOffset = normal * lensAmount * U.refractionStrength * sdfToUv;
+
+  let backdropUv = fragCoord.xy / res;
+  let offR = backdropUv + refractOffset * (1.0 - U.chromaticStrength);
+  let offG = backdropUv + refractOffset;
+  let offB = backdropUv + refractOffset * (1.0 + U.chromaticStrength);
+
+  // Chromatic sample at the G offset returns rgb (center of the frost
+  // kernel too, so we don't re-fetch it). R and B channels get their
+  // own offset samples to produce the fringe.
+  let gRgb = textureSample(backdrop, samp, offG).rgb;
+  let rCh  = textureSample(backdrop, samp, offR).r;
+  let bCh  = textureSample(backdrop, samp, offB).b;
+  let chromaticColor = vec3<f32>(rCh, gRgb.g, bCh);
+
+  // 5-tap cross-blur frost, radius scaled by interior depth. Gives the
+  // "slightly frosted window" quality across the middle of the lens;
+  // at the rim the radius is near zero so chromatic refraction still
+  // reads sharply. Sampled unconditionally — a branch here would take
+  // textureSample out of uniform control flow and derivatives would
+  // go undefined.
+  let frostPx = U.frostStrength * interior;
+  let fs = vec2<f32>(frostPx) / res;
+  var frost = gRgb;
+  frost = frost + textureSample(backdrop, samp, offG + vec2<f32>(fs.x, 0.0)).rgb;
+  frost = frost + textureSample(backdrop, samp, offG - vec2<f32>(fs.x, 0.0)).rgb;
+  frost = frost + textureSample(backdrop, samp, offG + vec2<f32>(0.0, fs.y)).rgb;
+  frost = frost + textureSample(backdrop, samp, offG - vec2<f32>(0.0, fs.y)).rgb;
+  frost = frost * 0.2;
+
+  var color = mix(frost, chromaticColor, lensAmount);
+
+  let rim = 1.0 - smoothstep(0.0, 0.02, abs(d));
+  color = color + U.rimColor * rim * U.fresnelStrength;
+
+  color = mix(color, U.tintColor, clamp(interior * U.tintStrength, 0.0, 1.0));
+
+  return vec4<f32>(color, insideMask * U.opacity);
 }
 `;

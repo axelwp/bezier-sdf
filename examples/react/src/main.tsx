@@ -15,6 +15,11 @@ import {
 } from '@bezier-sdf/react';
 import './styles.css';
 
+// The gallery's tunable effects are the frame-based ones. `liquid-glass`
+// is a material with its own demo (examples/liquid-glass), so it's
+// excluded from the playground type to keep record shapes closed.
+type FrameEffectName = Exclude<BezierLogoEffectName, 'liquid-glass'>;
+
 const DEFAULT_SRC = '/logo.svg';
 const THEME_KEY = 'bezier-sdf:theme';
 type Theme = 'dark' | 'light';
@@ -109,7 +114,7 @@ interface SliderSpec {
   step: number;
 }
 
-const PARAM_UI: Record<BezierLogoEffectName, SliderSpec[]> = {
+const PARAM_UI: Record<FrameEffectName, SliderSpec[]> = {
   reveal: [
     { key: 'duration',    label: 'duration (ms)', min: 200, max: 4000, step: 50 },
     { key: 'startOffset', label: 'start offset',  min: 0,   max: 1,    step: 0.01 },
@@ -128,15 +133,15 @@ const PARAM_UI: Record<BezierLogoEffectName, SliderSpec[]> = {
   ],
 };
 
-const EFFECT_ORDER: BezierLogoEffectName[] = ['reveal', 'ripple', 'liquid-cursor'];
-const EFFECT_HINT: Record<BezierLogoEffectName, string> = {
+const EFFECT_ORDER: FrameEffectName[] = ['reveal', 'ripple', 'liquid-cursor'];
+const EFFECT_HINT: Record<FrameEffectName, string> = {
   reveal: 'autoplay or replay to see it',
   ripple: 'click the plate',
   'liquid-cursor': 'hover the plate',
 };
 
 function buildEffectProp(
-  active: Record<BezierLogoEffectName, boolean>,
+  active: Record<FrameEffectName, boolean>,
   params: PlaygroundParams,
   rippleDurationEnabled: boolean,
 ): BezierLogoProps['effect'] {
@@ -162,7 +167,7 @@ function Playground({
   bakeKey: number;
   onError: (err: Error) => void;
 }) {
-  const [active, setActive] = useState<Record<BezierLogoEffectName, boolean>>({
+  const [active, setActive] = useState<Record<FrameEffectName, boolean>>({
     reveal: false,
     ripple: true,
     'liquid-cursor': true,
@@ -177,11 +182,11 @@ function Playground({
 
   const effectProp = buildEffectProp(active, params, rippleDurationEnabled);
 
-  const toggleEffect = (name: BezierLogoEffectName) => {
+  const toggleEffect = (name: FrameEffectName) => {
     setActive((a) => ({ ...a, [name]: !a[name] }));
   };
 
-  const updateParam = <K extends BezierLogoEffectName>(
+  const updateParam = <K extends FrameEffectName>(
     name: K,
     key: string,
     value: number,

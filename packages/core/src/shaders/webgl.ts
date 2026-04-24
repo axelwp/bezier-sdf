@@ -321,6 +321,185 @@ void main() {
 `;
 
 /**
+ * Liquid-glass sample fragment. Uses the baked per-path SDF textures as
+ * the lens shape — smooth-unions all paths into one silhouette, computes
+ * the surface normal from the sampled SDF's screen-space gradient, and
+ * refracts a backdrop image through it. Per-path colors and animation
+ * offsets don't apply in glass mode (the shape is a material, not a
+ * painted silhouette).
+ *
+ * Ingredients, in order of visual weight:
+ *   1. Refraction — sample backdrop at an offset along the inward normal,
+ *      scaled by a smoothed "thickness" proxy (depth inside the shape).
+ *   2. Chromatic aberration — R/G/B sampled with slightly different
+ *      offset magnitudes. Produces subtle rainbow fringing on curvature.
+ *   3. Fresnel rim — narrow additive band along `|d| ≈ 0`.
+ *   4. Thickness tint — mix a faint color in proportion to depth.
+ *
+ * No discard: running textureSample(backdrop, ...) unconditionally keeps
+ * derivatives well-defined across quads and avoids implementation-
+ * defined behavior when half a quad falls outside the shape. The alpha
+ * channel handles masking.
+ */
+export const WEBGL_GLASS_FRAG = /* glsl */ `
+#extension GL_OES_standard_derivatives : enable
+precision highp float;
+
+uniform vec2  u_res;
+uniform float u_zoom;
+uniform vec2  u_offset;
+uniform float u_opacity;
+uniform float u_sminK;
+uniform float u_bound;
+uniform int   u_pathCount;
+uniform sampler2D u_sdf0;
+uniform sampler2D u_sdf1;
+uniform sampler2D u_sdf2;
+uniform sampler2D u_sdf3;
+
+uniform sampler2D u_backdrop;
+uniform float u_refractionStrength;
+uniform float u_chromaticStrength;
+uniform float u_fresnelStrength;
+uniform float u_tintStrength;
+uniform float u_frostStrength;
+uniform vec3  u_rimColor;
+uniform vec3  u_tintColor;
+
+float smin(float a, float b, float k) {
+  float h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
+}
+
+float sampleSdf(int i, vec2 uv) {
+  vec2 t = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
+  if (i == 0) return texture2D(u_sdf0, t).r;
+  if (i == 1) return texture2D(u_sdf1, t).r;
+  if (i == 2) return texture2D(u_sdf2, t).r;
+  return texture2D(u_sdf3, t).r;
+}
+
+float combinedSdf(vec2 uv) {
+  float k = max(u_sminK, 1e-4);
+  float d = sampleSdf(0, uv);
+  if (u_pathCount > 1) d = smin(d, sampleSdf(1, uv), k);
+  if (u_pathCount > 2) d = smin(d, sampleSdf(2, uv), k);
+  if (u_pathCount > 3) d = smin(d, sampleSdf(3, uv), k);
+  return d;
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
+  uv *= 2.0 / u_zoom;
+  uv -= u_offset;
+
+  float d = combinedSdf(uv);
+  float aa = fwidth(d) * 1.2;
+  float insideMask = 1.0 - smoothstep(-aa, aa, d);
+
+  // --- Lens height field ---
+  //
+  // Every function of the SDF has a zero-gradient set along the shape's
+  // medial axis — that's a property of the SDF itself (local extremum
+  // of depth), not something blurring can remove. Using such a field
+  // directly as a lens produces faceted refraction along the creases,
+  // no matter how finely you smooth.
+  //
+  // So we don't build the height field from the SDF. We build it from
+  // a *smoothed indicator function*: convert each SDF sample to a soft
+  // inside/outside value via smoothstep (1 inside, 0 outside), then
+  // average over a 9-tap radial kernel. The resulting h is a genuine
+  // smooth dome — flat plateau in the interior (indicator=1 everywhere
+  // in the neighborhood) and a smooth rising edge at the rim. Its
+  // gradient is rim-concentrated without medial-axis creases, which is
+  // the actual geometry of a liquid-glass bevel.
+  //
+  // 9 SDF evaluations per fragment, per path. For typical 1-path logos
+  // that's 9 texture reads; well within budget.
+  const float SDF_BLUR = 0.08;   // radial sample distance in SDF space
+  const float SOFT_EDGE = 0.03;  // half-width of the inside/outside ramp
+  const float D = 0.70710678 * SDF_BLUR;  // diagonal tap distance (= B/√2)
+
+  float h  = (1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv))) * 2.0;
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(SDF_BLUR, 0.0)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(SDF_BLUR, 0.0)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(0.0, SDF_BLUR)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv - vec2(0.0, SDF_BLUR)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D,  D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2( D, -D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D,  D)));
+  h += 1.0 - smoothstep(-SOFT_EDGE, SOFT_EDGE, combinedSdf(uv + vec2(-D, -D)));
+  h /= 10.0;  // center weight 2 + 8 outer = 10
+
+  // Gradient of the smoothed indicator. Points *inward* (toward the
+  // interior plateau where h → 1). Magnitude peaks at the rim and falls
+  // to zero in the interior — exactly the rim-concentrated profile we
+  // want, derived naturally rather than hand-tuned.
+  vec2 grad = vec2(dFdx(h), dFdy(h));
+  float gradMag = length(grad);
+  vec2 normal = grad / max(gradMag, 1e-6);
+
+  // Lens intensity: (1 - h) doubled. At the rim h≈0.5 so peaks at 1; in
+  // the flat interior h=1 so decays to 0. Replaces the old explicit
+  // exp(-depth*k) profile — this one falls out of the height field.
+  float lensAmount = clamp((1.0 - h) * 2.0, 0.0, 1.0);
+
+  // Interior proxy for tint and frost, also derived from h so tint
+  // bands follow the smoothed height field instead of the SDF's
+  // iso-contours (which have medial-axis cusps and would paint those
+  // same creases into the tint).
+  float interior = smoothstep(0.5, 1.0, h);
+
+  // Convert the isotropic SDF-space offset to backdrop-uv space and
+  // refract along the inward normal.
+  vec2 sdfToUv = vec2(min(u_res.x, u_res.y)) / u_res;
+  vec2 refractOffset = normal * lensAmount * u_refractionStrength * sdfToUv;
+
+  vec2 backdropUv = gl_FragCoord.xy / u_res;
+  vec2 offR = backdropUv + refractOffset * (1.0 - u_chromaticStrength);
+  vec2 offG = backdropUv + refractOffset;
+  vec2 offB = backdropUv + refractOffset * (1.0 + u_chromaticStrength);
+
+  // Backdrop color, two-part:
+  //   - Chromatic sample, sharp, used at the rim. Three taps at
+  //     channel-specific offsets. Chroma scales with lensAmount because
+  //     it rides on refractOffset, so the fringe only appears at the rim.
+  //   - Frosted sample, soft, used across the interior. A 5-tap cross
+  //     average at uvG gives a cheap box-ish blur. Radius scales with
+  //     interior so the rim stays sharp; full blur in the center reads
+  //     as the "slightly frosted window" liquid-glass look.
+  vec3 uvG_rgb = texture2D(u_backdrop, offG).rgb;
+  float rCh = texture2D(u_backdrop, offR).r;
+  float bCh = texture2D(u_backdrop, offB).b;
+  vec3 chromaticColor = vec3(rCh, uvG_rgb.g, bCh);
+
+  // Always sample unconditionally. When frostPx≈0 the four offsets
+  // collapse onto offG and the average is a no-op; keeping it out of a
+  // branch also dodges derivative-uniformity concerns in the WGSL twin.
+  float frostPx = u_frostStrength * interior;
+  vec2 fs = vec2(frostPx) / u_res;
+  vec3 frost = uvG_rgb;
+  frost += texture2D(u_backdrop, offG + vec2(fs.x, 0.0)).rgb;
+  frost += texture2D(u_backdrop, offG - vec2(fs.x, 0.0)).rgb;
+  frost += texture2D(u_backdrop, offG + vec2(0.0, fs.y)).rgb;
+  frost += texture2D(u_backdrop, offG - vec2(0.0, fs.y)).rgb;
+  frost *= 0.2;
+
+  // Blend: rim = crisp chromatic split, interior = frost.
+  vec3 color = mix(frost, chromaticColor, lensAmount);
+
+  // Fresnel rim — bright narrow band along the shape's edge.
+  float rim = 1.0 - smoothstep(0.0, 0.02, abs(d));
+  color += u_rimColor * rim * u_fresnelStrength;
+
+  // Interior tint — slight color wash in proportion to depth.
+  color = mix(color, u_tintColor, clamp(interior * u_tintStrength, 0.0, 1.0));
+
+  gl_FragColor = vec4(color, insideMask * u_opacity);
+}
+`;
+
+/**
  * Direct fragment — evaluates one combined SDF per pixel. Used when
  * half-float texture extensions are unavailable, or when the caller
  * explicitly opts out of baking (`mode: 'direct'`).

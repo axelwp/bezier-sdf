@@ -20,9 +20,10 @@ import { StaticFallback } from './StaticFallback';
 import { reveal, type RevealParams } from './effects/reveal';
 import { ripple, type RippleParams } from './effects/ripple';
 import { liquidCursor, type LiquidCursorParams } from './effects/liquid-cursor';
+import { DEFAULT_GLASS_PARAMS, type LiquidGlassParams } from './effects/liquid-glass';
 import type { EffectDefinition, EffectFrame, EffectRuntime } from './effects/types';
 
-export type BezierLogoEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor';
+export type BezierLogoEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor' | 'liquid-glass';
 
 export type BezierLogoEffectName = Exclude<BezierLogoEffect, 'none'>;
 
@@ -33,7 +34,11 @@ export type BezierLogoEffectName = Exclude<BezierLogoEffect, 'none'>;
 export type BezierLogoEffectSpec =
   | ({ name: 'reveal' } & RevealParams)
   | ({ name: 'ripple' } & RippleParams)
-  | ({ name: 'liquid-cursor' } & LiquidCursorParams);
+  | ({ name: 'liquid-cursor' } & LiquidCursorParams)
+  | ({ name: 'liquid-glass' } & LiquidGlassParams);
+
+/** Accepted shapes for the backdrop prop consumed in liquid-glass mode. */
+export type BezierLogoBackdrop = string | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
 
 /**
  * `effect` accepts: a single preset name, a single spec object, or an
@@ -90,11 +95,27 @@ export interface BezierLogoProps {
   className?: string;
   style?: CSSProperties;
   ariaLabel?: string;
+  /**
+   * Image to refract through the shape when `effect` includes
+   * `'liquid-glass'`. Accepts a URL (fetched with `crossOrigin=anonymous`)
+   * or a ready `HTMLImageElement` / `HTMLCanvasElement` / `ImageBitmap`.
+   *
+   * Static-only for now: the renderer uploads this once at init. Changing
+   * the value triggers a renderer re-init. Ignored unless glass is
+   * active.
+   */
+  backdrop?: BezierLogoBackdrop;
 }
 
 const DEFAULT_SMIN_K = 0.08;
 
-const DEFINITIONS: Record<BezierLogoEffectName, EffectDefinition> = {
+/**
+ * Effect definitions for frame-based effects. `liquid-glass` is
+ * deliberately not here — it's a material (different sample pipeline),
+ * not a frame-modulating runtime, and follows an entirely separate
+ * mount path below.
+ */
+const DEFINITIONS: Record<Exclude<BezierLogoEffectName, 'liquid-glass'>, EffectDefinition> = {
   'reveal': reveal,
   'ripple': ripple,
   'liquid-cursor': liquidCursor,
@@ -126,10 +147,13 @@ function resolveSpecs(prop: BezierLogoEffectProp): ResolvedSpec[] {
       ? [prop as BezierLogoEffectName]
       : [prop];
   // De-duplicate by name — repeating a preset would double its contribution.
+  // liquid-glass is handled separately (different pipeline entirely), so
+  // it's dropped from the frame-based effect list here.
   const seen = new Set<string>();
   const out: ResolvedSpec[] = [];
   for (const item of items) {
     const { name, params } = specToEntry(item);
+    if (name === 'liquid-glass') continue;
     if (seen.has(name)) continue;
     seen.add(name);
     out.push({ def: DEFINITIONS[name], params });
@@ -137,9 +161,34 @@ function resolveSpecs(prop: BezierLogoEffectProp): ResolvedSpec[] {
   return out;
 }
 
+/**
+ * Pick the glass spec out of the effect prop, ignoring other specs. When
+ * glass is combined with a frame-based effect, this returns the glass
+ * spec and the caller decides (we warn and render glass-only — see
+ * `extractGlassSpec` call site).
+ */
+function extractGlassSpec(prop: BezierLogoEffectProp): LiquidGlassParams | null {
+  if (prop === 'none') return null;
+  const items: Array<BezierLogoEffectName | BezierLogoEffectSpec> = Array.isArray(prop)
+    ? prop
+    : typeof prop === 'string'
+      ? [prop as BezierLogoEffectName]
+      : [prop];
+  for (const item of items) {
+    if (item === 'liquid-glass') return {};
+    if (typeof item === 'object' && 'name' in item && item.name === 'liquid-glass') {
+      const { name: _name, ...rest } = item;
+      return rest as LiquidGlassParams;
+    }
+  }
+  return null;
+}
+
 /** Stable identity key for the useEffect dep — names only, sorted. */
 function effectNamesKey(prop: BezierLogoEffectProp): string {
-  return resolveSpecs(prop).map((s) => s.def.name).sort().join(',');
+  const glass = extractGlassSpec(prop) ? ['liquid-glass'] : [];
+  const frame = resolveSpecs(prop).map((s) => s.def.name);
+  return [...glass, ...frame].sort().join(',');
 }
 
 /** Extract per-effect params map for live updates. */
@@ -214,6 +263,176 @@ function buildPerPath(mark: Mark): PerPathUniforms {
   };
 }
 
+/* ============================== liquid-glass ============================== */
+
+/**
+ * Resolve a raw `<BezierLogo backdrop>` value into a TexImageSource ready
+ * to hand to the renderer. URL strings become `HTMLImageElement` fetched
+ * with `crossOrigin='anonymous'`; passed-in elements/bitmaps are awaited
+ * for decode if they're not ready yet.
+ *
+ * CORS: the browser silently taints canvases built from cross-origin
+ * images that lack CORS headers; subsequent `texImage2D` / `copyExternal-
+ * ImageToTexture` throws `SecurityError`. We proactively set
+ * `crossOrigin='anonymous'` so the browser sends a CORS request; if the
+ * server doesn't respond with `Access-Control-Allow-Origin`, the load
+ * fails fast with a readable error instead of later at upload time.
+ */
+async function loadBackdrop(src: BezierLogoBackdrop): Promise<TexImageSource> {
+  if (typeof src === 'string') {
+    return new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => resolve(img);
+      img.onerror = () =>
+        reject(new Error(
+          `liquid-glass: failed to load backdrop "${src}". ` +
+          'The image must be same-origin or served with CORS headers.',
+        ));
+      img.src = src;
+    });
+  }
+  if (typeof HTMLImageElement !== 'undefined' && src instanceof HTMLImageElement && !src.complete) {
+    await new Promise<void>((res, rej) => {
+      src.addEventListener('load',  () => res(), { once: true });
+      src.addEventListener('error', () => rej(new Error('liquid-glass: backdrop image failed to load')), { once: true });
+    });
+  }
+  return src;
+}
+
+interface GlassUniformShape {
+  refractionStrength: number;
+  chromaticStrength: number;
+  fresnelStrength: number;
+  tintStrength: number;
+  frostStrength: number;
+  rimColor: [number, number, number];
+  tintColor: [number, number, number];
+}
+
+/** Merge a spec with defaults and parse CSS colors once per render. */
+function resolveGlassUniforms(spec: LiquidGlassParams): GlassUniformShape {
+  return {
+    refractionStrength: spec.refractionStrength ?? DEFAULT_GLASS_PARAMS.refractionStrength,
+    chromaticStrength:  spec.chromaticStrength  ?? DEFAULT_GLASS_PARAMS.chromaticStrength,
+    fresnelStrength:    spec.fresnelStrength    ?? DEFAULT_GLASS_PARAMS.fresnelStrength,
+    tintStrength:       spec.tintStrength       ?? DEFAULT_GLASS_PARAMS.tintStrength,
+    frostStrength:      spec.frostStrength      ?? DEFAULT_GLASS_PARAMS.frostStrength,
+    rimColor:  parseColor(spec.rimColor  ?? DEFAULT_GLASS_PARAMS.rimColor),
+    tintColor: parseColor(spec.tintColor ?? DEFAULT_GLASS_PARAMS.tintColor),
+  };
+}
+
+interface MountGlassOptions {
+  canvas: HTMLCanvasElement;
+  container: HTMLElement;
+  mark: Mark;
+  rendererKind: 'auto' | 'webgpu' | 'webgl';
+  backdrop: BezierLogoBackdrop;
+  state: {
+    color?: string;
+    opacity: number;
+    requestRender: () => void;
+    replay: () => void;
+    pushParams: (p: Record<string, Record<string, number>>) => void;
+  };
+  sizeCanvas: () => boolean;
+  initialSpec: LiquidGlassParams;
+  effectRef: { current: BezierLogoEffectProp };
+  onReady?: (info: { kind: 'webgpu' | 'webgl' }) => void;
+  onError?: (error: Error) => void;
+  setFallback: (v: boolean) => void;
+}
+
+/**
+ * Mount liquid-glass. Separate path from the frame-based effects mount
+ * because glass is a material (different sample pipeline) rather than a
+ * per-frame uniform modulator — no runtimes, no rAF, no pointer/scroll
+ * observers. We render once per resize and once per param change.
+ *
+ * Returns a cleanup function that disposes the renderer and observers.
+ */
+function mountGlass(opts: MountGlassOptions): () => void {
+  const { canvas, container, mark, rendererKind, backdrop, state,
+    sizeCanvas, initialSpec, effectRef, onReady, onError, setFallback } = opts;
+
+  let cancelled = false;
+  let renderer: Renderer | null = null;
+  let ro: ResizeObserver | null = null;
+
+  const render = () => {
+    if (!renderer) return;
+    const glassSpec = extractGlassSpec(effectRef.current) ?? initialSpec;
+    const u = resolveGlassUniforms(glassSpec);
+    renderer.render({
+      width: canvas.width,
+      height: canvas.height,
+      zoom: 1,
+      sminK: DEFAULT_SMIN_K,
+      offsetX: 0,
+      offsetY: 0,
+      pathOffsets: zeroOffsets(renderer.pathCount),
+      color: [0, 0, 0],
+      opacity: state.opacity,
+      glass: true,
+      refractionStrength: u.refractionStrength,
+      chromaticStrength:  u.chromaticStrength,
+      fresnelStrength:    u.fresnelStrength,
+      tintStrength:       u.tintStrength,
+      frostStrength:      u.frostStrength,
+      rimColor:           u.rimColor,
+      tintColor:          u.tintColor,
+    });
+  };
+
+  state.requestRender = render;
+  state.replay = render;
+  state.pushParams = render;
+
+  (async () => {
+    let src: TexImageSource;
+    try {
+      src = await loadBackdrop(backdrop);
+      if (cancelled) return;
+    } catch (err) {
+      if (cancelled) return;
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+      setFallback(true);
+      return;
+    }
+
+    sizeCanvas();
+    try {
+      const result = await createRenderer(rendererKind, { canvas, mark, backdrop: src });
+      if (cancelled) { result.renderer.dispose(); return; }
+      renderer = result.renderer;
+      onReady?.({ kind: result.actualKind });
+    } catch (err) {
+      if (cancelled) return;
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+      setFallback(true);
+      return;
+    }
+
+    render();
+
+    ro = new ResizeObserver(() => {
+      if (sizeCanvas()) render();
+    });
+    ro.observe(container);
+  })();
+
+  return () => {
+    cancelled = true;
+    state.requestRender = () => {};
+    state.replay = () => {};
+    state.pushParams = () => {};
+    ro?.disconnect();
+    renderer?.dispose();
+  };
+}
+
 /**
  * Drop-in GPU logo. Handles fetch, parse, normalization, DPR, resize,
  * WebGPU→WebGL→SVG fallback, optional intro and interactive effects, and
@@ -235,6 +454,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
     className,
     style,
     ariaLabel,
+    backdrop,
   },
   ref,
 ) {
@@ -309,6 +529,47 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       typeof window !== 'undefined' &&
       (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false);
 
+    const sizeCanvas = (): boolean => {
+      const rect = container.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.floor(rect.width * dpr));
+      const h = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width === w && canvas.height === h) return false;
+      canvas.width = w;
+      canvas.height = h;
+      return true;
+    };
+
+    /* --- Glass mount path (runs instead of the frame-based effect path below) --- */
+    const glassSpec = extractGlassSpec(effectRef.current);
+    if (glassSpec) {
+      // Warn if composed with frame-based effects — glass is exclusive for now.
+      if (resolveSpecs(effectRef.current).length > 0) {
+        // eslint-disable-next-line no-console
+        console.warn('[bezier-sdf] liquid-glass is mutually exclusive with other effects; others ignored.');
+      }
+      if (!backdrop) {
+        const err = new Error('liquid-glass requires a `backdrop` prop (URL or HTMLImageElement/HTMLCanvasElement/ImageBitmap)');
+        onError?.(err);
+        setFallback(true);
+        return;
+      }
+      return mountGlass({
+        canvas,
+        container,
+        mark,
+        rendererKind,
+        backdrop,
+        state,
+        sizeCanvas,
+        initialSpec: glassSpec,
+        effectRef,
+        onReady,
+        onError,
+        setFallback,
+      });
+    }
+
     // Snapshot current specs at mount. Param-only changes don't re-run
     // this effect (see `effectKey` dep); they flow in via `pushParams`.
     const specs = resolveSpecs(effectRef.current);
@@ -325,16 +586,6 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
     state.visible = true;
     state.rafId = 0;
 
-    const sizeCanvas = (): boolean => {
-      const rect = container.getBoundingClientRect();
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const w = Math.max(1, Math.floor(rect.width * dpr));
-      const h = Math.max(1, Math.floor(rect.height * dpr));
-      if (canvas.width === w && canvas.height === h) return false;
-      canvas.width = w;
-      canvas.height = h;
-      return true;
-    };
     sizeCanvas();
 
     const renderOnce = (now: number): boolean => {
@@ -561,7 +812,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
       renderer = null;
       runtimes = [];
     };
-  }, [mark, rendererKind, effectKey, autoPlay, onReady, onError]);
+  }, [mark, rendererKind, effectKey, autoPlay, onReady, onError, backdrop]);
 
   /* --------------- 3. React to color/opacity changes mid-life -------------- */
 
@@ -574,6 +825,17 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
   useEffect(() => {
     stateRef.current.pushParams(paramsMap);
   }, [paramsMap]);
+
+  // Glass params don't flow through the frame-based `paramsMap` pipeline
+  // (there's no runtime to push to). JSON-stringify the spec so this
+  // effect only fires when a value actually changes, not on every render.
+  const glassParamsKey = useMemo(() => {
+    const spec = extractGlassSpec(effect);
+    return spec ? JSON.stringify(spec) : '';
+  }, [effect]);
+  useEffect(() => {
+    if (glassParamsKey) stateRef.current.requestRender();
+  }, [glassParamsKey]);
 
   /* ---------------------------------- UI ----------------------------------- */
 

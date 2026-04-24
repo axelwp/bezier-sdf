@@ -55,11 +55,45 @@ export interface Uniforms {
   pathStrokeColors?: ReadonlyArray<RgbColor>;
   pathFillOpacity?: ReadonlyArray<number>;
   pathStrokeOpacity?: ReadonlyArray<number>;
+
+  /**
+   * Switch the render to the liquid-glass (refractive material) sample
+   * pipeline. Requires the renderer to have been init'd with a
+   * {@link RendererInitOptions.backdrop}; otherwise the glass pipeline
+   * isn't available and this flag is ignored.
+   *
+   * Glass is a material, not a painter: per-path colors, strokes,
+   * `color`, and animation offsets are ignored. All paths smooth-union
+   * into one silhouette used as the lens shape.
+   */
+  glass?: boolean;
+  /** See liquid-glass params in the shader. Defaults applied if omitted. */
+  refractionStrength?: number;
+  chromaticStrength?: number;
+  fresnelStrength?: number;
+  tintStrength?: number;
+  /** Radius (in physical pixels) of the box-ish blur applied across the
+   *  interior to give the backdrop a frosted quality. `0` disables. */
+  frostStrength?: number;
+  rimColor?: readonly [number, number, number];
+  tintColor?: readonly [number, number, number];
 }
 
 export interface RendererInitOptions {
   canvas: HTMLCanvasElement;
   mark: Mark;
+  /**
+   * Image to refract through the shape when rendering in liquid-glass
+   * mode. Uploaded once at init. Must be same-origin or served with
+   * appropriate CORS headers, otherwise texture upload will throw a
+   * security error.
+   *
+   * If provided, the renderer compiles the glass sample pipeline
+   * alongside the normal one; the caller decides per-frame which to use
+   * via {@link Uniforms.glass}. Prototype: static only — dynamic
+   * backdrops (video, updating canvas) need a re-init.
+   */
+  backdrop?: TexImageSource;
 }
 
 export interface Renderer {

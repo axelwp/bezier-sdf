@@ -2,9 +2,33 @@ import type { Mark, Path } from '../geometry/types';
 import {
   WEBGPU_BAKE_SHADER,
   WEBGPU_BAKE_SIZE,
+  WEBGPU_GLASS_SHADER,
+  WEBGPU_GLASS_UNIFORM_SIZE,
   WEBGPU_SAMPLE_SHADER,
 } from '../shaders/webgpu';
 import { type Renderer, type RendererInitOptions, type Uniforms, validateMark } from './types';
+
+const GLASS_DEFAULTS = {
+  refractionStrength: 0.05,
+  chromaticStrength: 0.015,
+  fresnelStrength: 0.3,
+  tintStrength: 0.1,
+  frostStrength: 2.5,
+  rimColor: [1, 1, 1] as const,
+  tintColor: [0.91, 0.94, 1.0] as const,
+};
+
+function textureSourceSize(src: TexImageSource): [number, number] {
+  // HTMLImageElement exposes naturalWidth/naturalHeight, which is the
+  // actual decoded size; `.width`/`.height` can be CSS-sized. Other
+  // accepted sources (HTMLCanvasElement, ImageBitmap) have width/height
+  // in pixels.
+  if (typeof HTMLImageElement !== 'undefined' && src instanceof HTMLImageElement) {
+    return [src.naturalWidth || src.width, src.naturalHeight || src.height];
+  }
+  const anySrc = src as { width: number; height: number };
+  return [anySrc.width, anySrc.height];
+}
 
 const MAX_PATHS = 4;
 // MAX_SEGS isn't enforced by WebGPU's dynamic storage buffer — it's just
@@ -56,13 +80,18 @@ export class WebGPURenderer implements Renderer {
   private dummyTexture: GPUTexture | null = null;
   private sampleBindGroup: GPUBindGroup | null = null;
   private uniformData = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
+  private glassPipeline: GPURenderPipeline | null = null;
+  private glassUniformBuffer: GPUBuffer | null = null;
+  private glassBindGroup: GPUBindGroup | null = null;
+  private backdropTexture: GPUTexture | null = null;
+  private glassUniformData = new ArrayBuffer(WEBGPU_GLASS_UNIFORM_SIZE);
   private _pathCount = 0;
   private disposed = false;
 
   readonly mode = 'baked' as const;
   get pathCount(): number { return this._pathCount; }
 
-  async init({ canvas, mark }: RendererInitOptions): Promise<void> {
+  async init({ canvas, mark, backdrop }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGS);
     this._pathCount = mark.paths.length;
 
@@ -180,6 +209,87 @@ export class WebGPURenderer implements Renderer {
         { binding: 5, resource: viewFor(3) },
       ],
     });
+
+    // --- Glass pipeline (only when a backdrop is supplied) ---
+    if (backdrop) {
+      this.initGlass(device, sampler, backdrop, viewFor);
+    }
+  }
+
+  private initGlass(
+    device: GPUDevice,
+    sampler: GPUSampler,
+    backdrop: TexImageSource,
+    viewFor: (i: number) => GPUTextureView,
+  ): void {
+    const [bw, bh] = textureSourceSize(backdrop);
+    if (!bw || !bh) {
+      throw new Error('liquid-glass: backdrop has zero size (not loaded yet?)');
+    }
+
+    // Backdrop texture — rgba8unorm handles photos/gradients just fine.
+    const backdropTexture = device.createTexture({
+      size: [bw, bh],
+      format: 'rgba8unorm',
+      usage:
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    device.queue.copyExternalImageToTexture(
+      { source: backdrop, flipY: false },
+      { texture: backdropTexture },
+      [bw, bh, 1],
+    );
+    this.backdropTexture = backdropTexture;
+
+    const glassUniformBuffer = device.createBuffer({
+      size: WEBGPU_GLASS_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.glassUniformBuffer = glassUniformBuffer;
+
+    const glassShader = device.createShaderModule({ code: WEBGPU_GLASS_SHADER });
+    const glassLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+      ],
+    });
+    this.glassPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [glassLayout] }),
+      vertex: { module: glassShader, entryPoint: 'vs_main' },
+      fragment: {
+        module: glassShader,
+        entryPoint: 'fs_main',
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
+    this.glassBindGroup = device.createBindGroup({
+      layout: glassLayout,
+      entries: [
+        { binding: 0, resource: { buffer: glassUniformBuffer } },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: viewFor(0) },
+        { binding: 3, resource: viewFor(1) },
+        { binding: 4, resource: viewFor(2) },
+        { binding: 5, resource: viewFor(3) },
+        { binding: 6, resource: backdropTexture.createView() },
+      ],
+    });
   }
 
   private allocBakeTexture(device: GPUDevice): GPUTexture {
@@ -256,6 +366,11 @@ export class WebGPURenderer implements Renderer {
   render(u: Uniforms): void {
     const { device, context, samplePipeline, uniformBuffer, sampleBindGroup } = this;
     if (!device || !context || !samplePipeline || !uniformBuffer || !sampleBindGroup || this.disposed) return;
+
+    if (u.glass && this.glassPipeline && this.glassBindGroup && this.glassUniformBuffer) {
+      this.renderGlass(device, context, u);
+      return;
+    }
 
     const perPath =
       u.pathModes !== undefined ||
@@ -357,22 +472,77 @@ export class WebGPURenderer implements Renderer {
     device.queue.submit([encoder.finish()]);
   }
 
+  private renderGlass(device: GPUDevice, context: GPUCanvasContext, u: Uniforms): void {
+    const pipeline = this.glassPipeline!;
+    const bindGroup = this.glassBindGroup!;
+    const buffer = this.glassUniformBuffer!;
+
+    const view = new DataView(this.glassUniformData);
+    new Uint8Array(this.glassUniformData).fill(0);
+
+    view.setFloat32(0,  u.width,  true);
+    view.setFloat32(4,  u.height, true);
+    view.setFloat32(8,  u.zoom,   true);
+    view.setFloat32(12, u.sminK,  true);
+    view.setFloat32(16, u.offsetX, true);
+    view.setFloat32(20, u.offsetY, true);
+    view.setUint32 (24, this._pathCount, true);
+    view.setFloat32(28, u.opacity, true);
+    view.setFloat32(32, u.refractionStrength ?? GLASS_DEFAULTS.refractionStrength, true);
+    view.setFloat32(36, u.chromaticStrength  ?? GLASS_DEFAULTS.chromaticStrength, true);
+    view.setFloat32(40, u.fresnelStrength    ?? GLASS_DEFAULTS.fresnelStrength, true);
+    view.setFloat32(44, u.tintStrength       ?? GLASS_DEFAULTS.tintStrength, true);
+    const rim = u.rimColor ?? GLASS_DEFAULTS.rimColor;
+    view.setFloat32(48, rim[0], true);
+    view.setFloat32(52, rim[1], true);
+    view.setFloat32(56, rim[2], true);
+    view.setFloat32(60, 1.2, true); // bound (matches WEBGPU_BAKE_BOUND)
+    const tint = u.tintColor ?? GLASS_DEFAULTS.tintColor;
+    view.setFloat32(64, tint[0], true);
+    view.setFloat32(68, tint[1], true);
+    view.setFloat32(72, tint[2], true);
+    view.setFloat32(76, u.frostStrength ?? GLASS_DEFAULTS.frostStrength, true);
+
+    device.queue.writeBuffer(buffer, 0, this.glassUniformData);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.uniformBuffer?.destroy();
+    this.glassUniformBuffer?.destroy();
     this.textures.forEach((t) => t.destroy());
     this.dummyTexture?.destroy();
+    this.backdropTexture?.destroy();
     this.context?.unconfigure();
     this.device?.destroy();
     this.uniformBuffer = null;
+    this.glassUniformBuffer = null;
     this.textures = [];
     this.dummyTexture = null;
+    this.backdropTexture = null;
     this.context = null;
     this.device = null;
     this.samplePipeline = null;
     this.sampleBindGroup = null;
     this.bakePipeline = null;
     this.bakeBindGroupLayout = null;
+    this.glassPipeline = null;
+    this.glassBindGroup = null;
   }
 }
