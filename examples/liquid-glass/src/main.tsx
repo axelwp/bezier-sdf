@@ -1,6 +1,6 @@
 import { StrictMode, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BezierLogo, type BezierLogoBackdrop } from '@bezier-sdf/react';
+import { LiveGraphic, type LiveGraphicBackdrop } from '@bezier-sdf/react';
 
 /**
  * Draw a colorful gradient-and-blob backdrop to a canvas and return it.
@@ -93,7 +93,7 @@ function App() {
   const [knobs, setKnobs] = useState<GlassKnobs>(DEFAULTS);
   const [userBackdrop, setUserBackdrop] = useState<HTMLImageElement | null>(null);
   const defaultBackdrop = useMemo(() => makeBackdropCanvas(), []);
-  const backdrop: BezierLogoBackdrop = userBackdrop ?? defaultBackdrop;
+  const backdrop: LiveGraphicBackdrop = userBackdrop ?? defaultBackdrop;
   const fileRef = useRef<HTMLInputElement>(null);
 
   const onPickImage = (file: File) => {
@@ -131,7 +131,7 @@ function App() {
           justifyContent: 'center',
         }}
       >
-        <BezierLogo
+        <LiveGraphic
           src="/logo.svg"
           effect={{ name: 'liquid-glass', ...knobs }}
           backdrop={backdrop}

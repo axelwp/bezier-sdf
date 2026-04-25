@@ -2,7 +2,7 @@ import { normalizeMark, parseSvgDocument, type Mark } from '@bezier-sdf/core';
 
 /**
  * Cache of `src` → parsed, normalized Mark. Keyed by the exact `src` string
- * passed to `<BezierLogo>`, so mounting the same logo in three places fetches
+ * passed to `<LiveGraphic>`, so mounting the same logo in three places fetches
  * and parses once.
  *
  * The promise is memoized, not the resolved value — that way concurrent

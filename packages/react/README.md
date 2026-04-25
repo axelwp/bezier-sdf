@@ -9,10 +9,10 @@ npm install @bezier-sdf/react @bezier-sdf/core
 ## Quick start
 
 ```tsx
-import { BezierLogo } from '@bezier-sdf/react';
+import { LiveGraphic } from '@bezier-sdf/react';
 
 export default function Logo() {
-  return <BezierLogo src="/logo.svg" color="#ff3a7a" />;
+  return <LiveGraphic src="/logo.svg" color="#ff3a7a" />;
 }
 ```
 
@@ -31,10 +31,10 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 | `'liquid-glass'` | none | Legacy alias for `material='glass'`. Prefer the [`material`](#material) prop for glass, and use the spec object form to tune. |
 
 ```tsx
-<BezierLogo src="/logo.svg" effect="reveal" />                 {/* scroll-triggered */}
-<BezierLogo src="/logo.svg" effect="reveal" autoPlay />        {/* plays on mount */}
-<BezierLogo src="/logo.svg" effect="ripple" color="#9af078" /> {/* click the canvas */}
-<BezierLogo src="/logo.svg" effect="liquid-cursor" />          {/* hover (or tap) */}
+<LiveGraphic src="/logo.svg" effect="reveal" />                 {/* scroll-triggered */}
+<LiveGraphic src="/logo.svg" effect="reveal" autoPlay />        {/* plays on mount */}
+<LiveGraphic src="/logo.svg" effect="ripple" color="#9af078" /> {/* click the canvas */}
+<LiveGraphic src="/logo.svg" effect="liquid-cursor" />          {/* hover (or tap) */}
 ```
 
 ### Spec-object form (tuning)
@@ -42,7 +42,7 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 Pass an object instead of a string to override an effect's defaults:
 
 ```tsx
-<BezierLogo
+<LiveGraphic
   src="/logo.svg"
   effect={{ name: 'reveal', duration: 2000, startOffset: 0.5 }}
 />
@@ -53,7 +53,7 @@ Pass an object instead of a string to override an effect's defaults:
 Pass an array to layer multiple presets. The built-ins use disjoint uniforms (reveal → path offsets; liquid-cursor → cursor field; ripple → ring buffer), so they compose without stepping on each other. Mix names and specs freely:
 
 ```tsx
-<BezierLogo
+<LiveGraphic
   src="/logo.svg"
   effect={['liquid-cursor', { name: 'ripple', speed: 3.5, amplitude: 0.1 }]}
 />
@@ -99,14 +99,14 @@ See [Material: glass](#material).
 The `material` prop switches the silhouette's sample pipeline to a dedicated shader. Currently one material is supported: `'glass'`.
 
 ```tsx
-<BezierLogo src="/logo.svg" material="glass" backdrop="/hero.jpg" />
+<LiveGraphic src="/logo.svg" material="glass" backdrop="/hero.jpg" />
 ```
 
 `material='glass'` composes with the frame-based effects. Combine it with `liquid-cursor` or `ripple` to get a glass lens that also deforms around the pointer:
 
 ```tsx
 {/* A glass lens that ripples on click */}
-<BezierLogo
+<LiveGraphic
   src="/logo.svg"
   material="glass"
   effect="ripple"
@@ -114,7 +114,7 @@ The `material` prop switches the silhouette's sample pipeline to a dedicated sha
 />
 
 {/* A glass lens that bulges under the pointer */}
-<BezierLogo
+<LiveGraphic
   src="/logo.svg"
   material="glass"
   effect="liquid-cursor"
@@ -127,7 +127,7 @@ The `material` prop switches the silhouette's sample pipeline to a dedicated sha
 The canonical composed effect. The glass lens refracts your backdrop; a pointerdown seeds a shockwave that propagates through the lens geometry, so the refraction itself distorts in sync with the ring. Pair it with a tuned ripple spec:
 
 ```tsx
-<BezierLogo
+<LiveGraphic
   src="/logo.svg"
   material="glass"
   effect={[
@@ -172,17 +172,17 @@ Stroked paths render as illuminated glass filaments rather than refracting lense
 
 ## Imperative handle
 
-Forward a ref to `BezierLogo` to replay animations on demand:
+Forward a ref to `LiveGraphic` to replay animations on demand:
 
 ```tsx
 import { useRef } from 'react';
-import { BezierLogo, type BezierLogoHandle } from '@bezier-sdf/react';
+import { LiveGraphic, type LiveGraphicHandle } from '@bezier-sdf/react';
 
 function ReplayableLogo() {
-  const ref = useRef<BezierLogoHandle>(null);
+  const ref = useRef<LiveGraphicHandle>(null);
   return (
     <>
-      <BezierLogo ref={ref} src="/logo.svg" effect="reveal" />
+      <LiveGraphic ref={ref} src="/logo.svg" effect="reveal" />
       <button onClick={() => ref.current?.replay()}>Replay</button>
     </>
   );
@@ -198,7 +198,7 @@ function ReplayableLogo() {
 | `src` | `string` | *required* | SVG URL or data URI. Fetched once and cached per-src across component instances. |
 | `color` | `string` | *none* | Optional global color override. When set, every path is painted with this color (legacy smin mode). Omit to honor the SVG's per-path fill/stroke. Ignored when `material='glass'`. |
 | `opacity` | `number` | `1` | 0..1 multiplier applied on top of any per-effect opacity. |
-| `effect` | `BezierLogoEffectProp` | `'none'` | Single preset name, spec object, or array of either. See [Effects](#effects). |
+| `effect` | `LiveGraphicEffectProp` | `'none'` | Single preset name, spec object, or array of either. See [Effects](#effects). |
 | `autoPlay` | `boolean` | `false` | For `reveal`: skip the scroll-into-view wait and play on mount. Ignored by reactive effects. |
 | `material` | `'glass'` | *none* | Switch the silhouette pipeline to a material shader. Composes with frame-based effects. See [Material](#material). |
 | `backdrop` | `string \| HTMLImageElement \| HTMLCanvasElement \| ImageBitmap` | *none* | Image to refract when glass is active. Required whenever glass is active. |
@@ -217,7 +217,7 @@ When `window.matchMedia('(prefers-reduced-motion: reduce)').matches`, effects sk
 
 ## Fallback
 
-If both WebGPU and WebGL fail to initialize, `<BezierLogo>` renders the parsed SVG through `<StaticFallback>` (pure-SVG `<path>` trace) so users on unsupported hardware still see the mark. `onError` fires with the renderer error in this case, but nothing is thrown.
+If both WebGPU and WebGL fail to initialize, `<LiveGraphic>` renders the parsed SVG through `<StaticFallback>` (pure-SVG `<path>` trace) so users on unsupported hardware still see the mark. `onError` fires with the renderer error in this case, but nothing is thrown.
 
 You can also import `StaticFallback` directly if you want to render the static form without attempting GPU init:
 
@@ -242,13 +242,13 @@ Known caveats:
 
 ## SSR
 
-`<BezierLogo>` is client-only (it touches `window`, `document`, and GPU APIs on mount). In Next.js, wrap the import:
+`<LiveGraphic>` is client-only (it touches `window`, `document`, and GPU APIs on mount). In Next.js, wrap the import:
 
 ```tsx
 import dynamic from 'next/dynamic';
 
-const BezierLogo = dynamic(
-  () => import('@bezier-sdf/react').then((m) => m.BezierLogo),
+const LiveGraphic = dynamic(
+  () => import('@bezier-sdf/react').then((m) => m.LiveGraphic),
   { ssr: false },
 );
 ```
@@ -259,16 +259,16 @@ In Remix, Astro, and other SSR frameworks, render the component inside a client-
 
 ```ts
 import {
-  BezierLogo,
+  LiveGraphic,
   StaticFallback,
   clearSvgCache,
-  type BezierLogoProps,
-  type BezierLogoHandle,
-  type BezierLogoEffect,
-  type BezierLogoEffectName,
-  type BezierLogoEffectProp,
-  type BezierLogoEffectSpec,
-  type BezierLogoBackdrop,
+  type LiveGraphicProps,
+  type LiveGraphicHandle,
+  type LiveGraphicEffect,
+  type LiveGraphicEffectName,
+  type LiveGraphicEffectProp,
+  type LiveGraphicEffectSpec,
+  type LiveGraphicBackdrop,
   type RevealParams,
   type RippleParams,
   type LiquidCursorParams,

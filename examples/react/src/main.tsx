@@ -8,18 +8,18 @@ import {
 } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  BezierLogo,
-  type BezierLogoEffectName,
-  type BezierLogoEffectSpec,
-  type BezierLogoHandle,
-  type BezierLogoProps,
+  LiveGraphic,
+  type LiveGraphicEffectName,
+  type LiveGraphicEffectSpec,
+  type LiveGraphicHandle,
+  type LiveGraphicProps,
 } from '@bezier-sdf/react';
 import './styles.css';
 
 // The playground's tunable effects are the frame-based ones. `liquid-glass`
 // is a material (separate GPU pipeline) with its own card and static
 // defaults, so it's excluded from the playground's record shapes.
-type FrameEffectName = Exclude<BezierLogoEffectName, 'liquid-glass'>;
+type FrameEffectName = Exclude<LiveGraphicEffectName, 'liquid-glass'>;
 
 const GLASS_DEFAULTS = {
   refractionStrength: 0.05,
@@ -93,7 +93,7 @@ interface CardSpec {
   title: string;
   /** Omit to render with the SVG's own per-path fill/stroke paint. */
   color?: string;
-  effect: BezierLogoProps['effect'];
+  effect: LiveGraphicProps['effect'];
   autoPlay?: boolean;
   code: string;
   hint?: string;
@@ -110,7 +110,7 @@ const CARDS: CardSpec[] = [
     number: '01',
     title: 'Native SVG paint',
     effect: 'none',
-    code: `<BezierLogo src={src} />`,
+    code: `<LiveGraphic src={src} />`,
     hint: 'per-path fills/strokes',
   },
   {
@@ -120,7 +120,7 @@ const CARDS: CardSpec[] = [
     color: '#ff3a7a',
     effect: 'reveal',
     autoPlay: true,
-    code: `<BezierLogo effect="reveal" autoPlay />`,
+    code: `<LiveGraphic effect="reveal" autoPlay />`,
     replay: true,
   },
   {
@@ -129,7 +129,7 @@ const CARDS: CardSpec[] = [
     title: 'Ripple',
     color: '#9af078',
     effect: 'ripple',
-    code: `<BezierLogo effect="ripple" />`,
+    code: `<LiveGraphic effect="ripple" />`,
     hint: 'click the plate',
   },
   {
@@ -138,7 +138,7 @@ const CARDS: CardSpec[] = [
     title: 'Liquid cursor',
     color: '#ffb84d',
     effect: 'liquid-cursor',
-    code: `<BezierLogo effect="liquid-cursor" />`,
+    code: `<LiveGraphic effect="liquid-cursor" />`,
     hint: 'hover the plate',
   },
   {
@@ -147,7 +147,7 @@ const CARDS: CardSpec[] = [
     title: 'Liquid cursor + ripple',
     color: '#d78aff',
     effect: ['liquid-cursor', 'ripple'],
-    code: `<BezierLogo effect={['liquid-cursor','ripple']} />`,
+    code: `<LiveGraphic effect={['liquid-cursor','ripple']} />`,
     hint: 'hover, then click',
   },
   {
@@ -155,7 +155,7 @@ const CARDS: CardSpec[] = [
     number: '06',
     title: 'Liquid glass',
     effect: { name: 'liquid-glass', ...GLASS_DEFAULTS },
-    code: `<BezierLogo effect={{ name: 'liquid-glass' }} backdrop={img} />`,
+    code: `<LiveGraphic effect={{ name: 'liquid-glass' }} backdrop={img} />`,
     hint: 'refracts the backdrop',
     backdrop: true,
     backdropUpload: true,
@@ -240,25 +240,25 @@ function buildEffectProp(
   rippleDurationEnabled: boolean,
   glass: boolean,
   glassColors: { rimColor: string; tintColor: string },
-): BezierLogoProps['effect'] {
-  const specs: BezierLogoEffectSpec[] = EFFECT_ORDER
+): LiveGraphicProps['effect'] {
+  const specs: LiveGraphicEffectSpec[] = EFFECT_ORDER
     .filter((name) => active[name])
     .map((name) => {
       if (name === 'ripple') {
         const duration = rippleDurationEnabled ? params.ripple.duration : Infinity;
-        return { name, ...params.ripple, duration } as BezierLogoEffectSpec;
+        return { name, ...params.ripple, duration } as LiveGraphicEffectSpec;
       }
-      return { name, ...params[name] } as BezierLogoEffectSpec;
+      return { name, ...params[name] } as LiveGraphicEffectSpec;
     });
   // Glass params ride alongside via a liquid-glass spec — extracted by
-  // BezierLogo's extractGlassSpec, then applied as glass uniforms. The
+  // LiveGraphic's extractGlassSpec, then applied as glass uniforms. The
   // `material='glass'` prop is what actually activates the pipeline.
   if (glass) {
     specs.push({
       name: 'liquid-glass',
       ...params.glass,
       ...glassColors,
-    } as BezierLogoEffectSpec);
+    } as LiveGraphicEffectSpec);
   }
   if (specs.length === 0) return 'none';
   return specs;
@@ -299,10 +299,10 @@ function Playground({
   }, [src]);
   const [opacity, setOpacity] = useState(1);
   const [autoPlay, setAutoPlay] = useState(false);
-  const logoRef = useRef<BezierLogoHandle>(null);
+  const logoRef = useRef<LiveGraphicHandle>(null);
 
   // Lazy backdrop — only built when glass is toggled on. If the user
-  // uploaded an image, hand its object URL straight to BezierLogo (it
+  // uploaded an image, hand its object URL straight to LiveGraphic (it
   // accepts string URLs). Otherwise use the generated grid+gradient
   // canvas. Re-using the same value across renders keeps the renderer's
   // texture upload to a single init pass per mount.
@@ -388,7 +388,7 @@ function Playground({
             backgroundPosition: 'center',
           } : undefined}
         >
-          <BezierLogo
+          <LiveGraphic
             key={bakeKey}
             ref={logoRef}
             src={src}
@@ -666,7 +666,7 @@ function ShowcaseCard({
   bakeKey: number;
   onError: (err: Error) => void;
 }) {
-  const ref = useRef<BezierLogoHandle>(null);
+  const ref = useRef<LiveGraphicHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadedUrl, setUploadedUrl] = useState<string | null>(null);
 
@@ -712,7 +712,7 @@ function ShowcaseCard({
       </header>
 
       <div className="card-surface" style={surfaceStyle}>
-        <BezierLogo
+        <LiveGraphic
           key={`${spec.id}:${bakeKey}`}
           ref={ref}
           src={src}

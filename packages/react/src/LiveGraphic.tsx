@@ -23,22 +23,22 @@ import { liquidCursor, type LiquidCursorParams } from './effects/liquid-cursor';
 import { DEFAULT_GLASS_PARAMS, type LiquidGlassParams } from './effects/liquid-glass';
 import type { EffectDefinition, EffectFrame, EffectRuntime } from './effects/types';
 
-export type BezierLogoEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor' | 'liquid-glass';
+export type LiveGraphicEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor' | 'liquid-glass';
 
-export type BezierLogoEffectName = Exclude<BezierLogoEffect, 'none'>;
+export type LiveGraphicEffectName = Exclude<LiveGraphicEffect, 'none'>;
 
 /**
  * Object form: name + tuning knobs for that effect. Allows composition
  * with different params per preset in the array form of `effect`.
  */
-export type BezierLogoEffectSpec =
+export type LiveGraphicEffectSpec =
   | ({ name: 'reveal' } & RevealParams)
   | ({ name: 'ripple' } & RippleParams)
   | ({ name: 'liquid-cursor' } & LiquidCursorParams)
   | ({ name: 'liquid-glass' } & LiquidGlassParams);
 
 /** Accepted shapes for the backdrop prop consumed in liquid-glass mode. */
-export type BezierLogoBackdrop = string | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
+export type LiveGraphicBackdrop = string | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
 
 /**
  * `effect` accepts: a single preset name, a single spec object, or an
@@ -47,12 +47,12 @@ export type BezierLogoBackdrop = string | HTMLImageElement | HTMLCanvasElement |
  * or omit the prop to disable effects entirely — `'none'` is not allowed
  * inside an array.
  */
-export type BezierLogoEffectProp =
-  | BezierLogoEffect
-  | BezierLogoEffectSpec
-  | Array<BezierLogoEffectName | BezierLogoEffectSpec>;
+export type LiveGraphicEffectProp =
+  | LiveGraphicEffect
+  | LiveGraphicEffectSpec
+  | Array<LiveGraphicEffectName | LiveGraphicEffectSpec>;
 
-export interface BezierLogoHandle {
+export interface LiveGraphicHandle {
   /**
    * Reset the effect to its start state. For `reveal` this re-plays the
    * intro animation; for the reactive effects it's a no-op unless the
@@ -61,7 +61,7 @@ export interface BezierLogoHandle {
   replay(): void;
 }
 
-export interface BezierLogoProps {
+export interface LiveGraphicProps {
   /** URL (or data URI) of the SVG to trace. */
   src: string;
   /**
@@ -76,7 +76,7 @@ export interface BezierLogoProps {
    * Which effect preset(s) to run. Pass a single name, or an array to
    * compose (e.g. `['liquid-cursor', 'ripple']`). Default `'none'`.
    */
-  effect?: BezierLogoEffectProp;
+  effect?: LiveGraphicEffectProp;
   /**
    * For `effect='reveal'`: start the animation immediately on mount. When
    * `false` (default), the animation waits for the component to scroll
@@ -113,7 +113,7 @@ export interface BezierLogoProps {
    * style={{objectFit: 'cover'}}>` at canvas size, or a `background-size:
    * cover; background-position: center` on a canvas-sized element).
    */
-  backdrop?: BezierLogoBackdrop;
+  backdrop?: LiveGraphicBackdrop;
   /**
    * Gaussian blur (in CSS pixels of the display canvas) applied to the
    * backdrop after it's resized to match the canvas's backing-store
@@ -160,7 +160,7 @@ const DEFAULT_SMIN_K = 0.005;
  * not a frame-modulating runtime, and follows an entirely separate
  * mount path below.
  */
-const DEFINITIONS: Record<Exclude<BezierLogoEffectName, 'liquid-glass'>, EffectDefinition> = {
+const DEFINITIONS: Record<Exclude<LiveGraphicEffectName, 'liquid-glass'>, EffectDefinition> = {
   'reveal': reveal,
   'ripple': ripple,
   'liquid-cursor': liquidCursor,
@@ -176,20 +176,20 @@ interface ResolvedSpec {
 }
 
 function specToEntry(
-  item: BezierLogoEffectName | BezierLogoEffectSpec,
-): { name: BezierLogoEffectName; params?: Record<string, number> } {
+  item: LiveGraphicEffectName | LiveGraphicEffectSpec,
+): { name: LiveGraphicEffectName; params?: Record<string, number> } {
   if (typeof item === 'string') return { name: item };
   const { name, ...rest } = item;
   const params = rest as Record<string, number>;
   return { name, params: Object.keys(params).length ? params : undefined };
 }
 
-function resolveSpecs(prop: BezierLogoEffectProp): ResolvedSpec[] {
+function resolveSpecs(prop: LiveGraphicEffectProp): ResolvedSpec[] {
   if (prop === 'none') return [];
-  const items: Array<BezierLogoEffectName | BezierLogoEffectSpec> = Array.isArray(prop)
+  const items: Array<LiveGraphicEffectName | LiveGraphicEffectSpec> = Array.isArray(prop)
     ? prop
     : typeof prop === 'string'
-      ? [prop as BezierLogoEffectName]
+      ? [prop as LiveGraphicEffectName]
       : [prop];
   // De-duplicate by name — repeating a preset would double its contribution.
   // liquid-glass is handled separately (different pipeline entirely), so
@@ -212,12 +212,12 @@ function resolveSpecs(prop: BezierLogoEffectProp): ResolvedSpec[] {
  * spec and the caller decides (we warn and render glass-only — see
  * `extractGlassSpec` call site).
  */
-function extractGlassSpec(prop: BezierLogoEffectProp): LiquidGlassParams | null {
+function extractGlassSpec(prop: LiveGraphicEffectProp): LiquidGlassParams | null {
   if (prop === 'none') return null;
-  const items: Array<BezierLogoEffectName | BezierLogoEffectSpec> = Array.isArray(prop)
+  const items: Array<LiveGraphicEffectName | LiveGraphicEffectSpec> = Array.isArray(prop)
     ? prop
     : typeof prop === 'string'
-      ? [prop as BezierLogoEffectName]
+      ? [prop as LiveGraphicEffectName]
       : [prop];
   for (const item of items) {
     if (item === 'liquid-glass') return {};
@@ -230,14 +230,14 @@ function extractGlassSpec(prop: BezierLogoEffectProp): LiquidGlassParams | null 
 }
 
 /** Stable identity key for the useEffect dep — names only, sorted. */
-function effectNamesKey(prop: BezierLogoEffectProp): string {
+function effectNamesKey(prop: LiveGraphicEffectProp): string {
   const glass = extractGlassSpec(prop) ? ['liquid-glass'] : [];
   const frame = resolveSpecs(prop).map((s) => s.def.name);
   return [...glass, ...frame].sort().join(',');
 }
 
 /** Extract per-effect params map for live updates. */
-function effectParamsMap(prop: BezierLogoEffectProp): Record<string, Record<string, number>> {
+function effectParamsMap(prop: LiveGraphicEffectProp): Record<string, Record<string, number>> {
   const out: Record<string, Record<string, number>> = {};
   for (const { def, params } of resolveSpecs(prop)) {
     if (params) out[def.name] = params;
@@ -311,7 +311,7 @@ function buildPerPath(mark: Mark): PerPathUniforms {
 /* ============================== liquid-glass ============================== */
 
 /**
- * Resolve a raw `<BezierLogo backdrop>` value into a TexImageSource ready
+ * Resolve a raw `<LiveGraphic backdrop>` value into a TexImageSource ready
  * to hand to the renderer. URL strings become `HTMLImageElement` fetched
  * with `crossOrigin='anonymous'`; passed-in elements/bitmaps are awaited
  * for decode if they're not ready yet.
@@ -323,7 +323,7 @@ function buildPerPath(mark: Mark): PerPathUniforms {
  * server doesn't respond with `Access-Control-Allow-Origin`, the load
  * fails fast with a readable error instead of later at upload time.
  */
-async function loadBackdrop(src: BezierLogoBackdrop): Promise<TexImageSource> {
+async function loadBackdrop(src: LiveGraphicBackdrop): Promise<TexImageSource> {
   if (typeof src === 'string') {
     return new Promise<HTMLImageElement>((resolve, reject) => {
       const img = new Image();
@@ -471,7 +471,7 @@ function resolveGlassUniforms(spec: LiquidGlassParams): GlassUniformShape {
  *
  * Client-only. For Next.js, wrap with `dynamic(..., { ssr: false })`.
  */
-export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function BezierLogo(
+export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(function LiveGraphic(
   {
     src,
     color,
@@ -782,7 +782,7 @@ export const BezierLogo = forwardRef<BezierLogoHandle, BezierLogoProps>(function
           const loaded = await loadBackdrop(backdrop);
           if (cancelled) return;
           // loadBackdrop's return type is TexImageSource, but in practice
-          // it only yields the three shapes `BezierLogoBackdrop` exposes
+          // it only yields the three shapes `LiveGraphicBackdrop` exposes
           // — which is also the set `prepareBackdrop` accepts.
           rawBackdrop = loaded as HTMLImageElement | HTMLCanvasElement | ImageBitmap;
         } catch (err) {
