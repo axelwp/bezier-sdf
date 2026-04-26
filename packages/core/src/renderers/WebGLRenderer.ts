@@ -8,6 +8,7 @@ import {
   WEBGL_BAKE_VERT,
   WEBGL_DIRECT_FRAG,
   WEBGL_GLASS_FRAG,
+  WEBGL_MORPH_FRAG,
   WEBGL_SAMPLE_FRAG,
   WEBGL_VERT,
 } from '../shaders/webgl';
@@ -48,6 +49,10 @@ export class WebGLRenderer implements Renderer {
   private sampleProgram: WebGLProgram | null = null;
   private directProgram: WebGLProgram | null = null;
   private glassProgram: WebGLProgram | null = null;
+  private morphProgram: WebGLProgram | null = null;
+  private morphTexA: WebGLTexture | null = null;
+  private morphTexB: WebGLTexture | null = null;
+  private morphUniforms: Record<string, WebGLUniformLocation | null> = {};
   private textures: WebGLTexture[] = [];
   private backdropTexture: WebGLTexture | null = null;
   private sampleUniforms: Record<string, WebGLUniformLocation | null> = {};
@@ -68,8 +73,9 @@ export class WebGLRenderer implements Renderer {
   get mode(): 'baked' | 'direct' { return this._mode; }
   get pathCount(): number { return this._pathCount; }
 
-  async init({ canvas, mark, backdrop }: RendererInitOptions): Promise<void> {
+  async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGS);
+    if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGS);
 
     const gl = canvas.getContext('webgl', {
       antialias: true,
@@ -107,6 +113,18 @@ export class WebGLRenderer implements Renderer {
     );
     this.buffer = buf;
 
+    if (morphTo) {
+      // Morph mode is exclusive: skip the per-path sample/direct pipelines
+      // and only bake the two combined SDFs needed by the morph shader.
+      this._pathCount = 1;
+      if (!this.initMorph(gl, mark, morphTo)) {
+        throw new Error(
+          'morph effect requires half-float texture extensions (unavailable in this context)',
+        );
+      }
+      return;
+    }
+
     this._pathCount = mark.paths.length;
     const bakeOk = this.tryInitBaked(gl, mark.paths);
     if (!bakeOk) {
@@ -128,6 +146,69 @@ export class WebGLRenderer implements Renderer {
     if (backdrop) {
       this.initGlass(gl, backdrop);
     }
+  }
+
+  private initMorph(gl: WebGLRenderingContext, markA: Mark, markB: Mark): boolean {
+    const segsA = flattenSegments(markA, 'morph: shape A');
+    const segsB = flattenSegments(markB, 'morph: shape B');
+
+    const halfFloat = gl.getExtension('OES_texture_half_float');
+    const colorBuf = gl.getExtension('EXT_color_buffer_half_float');
+    const halfFloatLinear = gl.getExtension('OES_texture_half_float_linear');
+    if (!halfFloat || !colorBuf || !halfFloatLinear) return false;
+    const HALF_FLOAT_OES = halfFloat.HALF_FLOAT_OES;
+    this.halfFloatType = HALF_FLOAT_OES;
+
+    const bakeProgram = link(gl, WEBGL_BAKE_VERT, WEBGL_BAKE_FRAG);
+    if (!bakeProgram) return false;
+    this.bakeProgram = bakeProgram;
+
+    const texA = this.bakeOne(gl, bakeProgram, segsA, HALF_FLOAT_OES);
+    const texB = this.bakeOne(gl, bakeProgram, segsB, HALF_FLOAT_OES);
+    if (!texA || !texB) {
+      if (texA) gl.deleteTexture(texA);
+      if (texB) gl.deleteTexture(texB);
+      gl.deleteProgram(bakeProgram);
+      this.bakeProgram = null;
+      return false;
+    }
+    this.morphTexA = texA;
+    this.morphTexB = texB;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    const program = link(gl, WEBGL_VERT, WEBGL_MORPH_FRAG);
+    if (!program) {
+      gl.deleteTexture(texA);
+      gl.deleteTexture(texB);
+      this.morphTexA = null;
+      this.morphTexB = null;
+      gl.deleteProgram(bakeProgram);
+      this.bakeProgram = null;
+      return false;
+    }
+    this.morphProgram = program;
+    gl.useProgram(program);
+    const posLoc = gl.getAttribLocation(program, 'a_pos');
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+    const loc = (n: string) => gl.getUniformLocation(program, n);
+    this.morphUniforms = {
+      res:     loc('u_res'),
+      zoom:    loc('u_zoom'),
+      offset:  loc('u_offset'),
+      opacity: loc('u_opacity'),
+      bound:   loc('u_bound'),
+      morphT:  loc('u_morphT'),
+      colorA:  loc('u_colorA'),
+      colorB:  loc('u_colorB'),
+    };
+    // SDF textures live on units 0 and 1 — set once, render() only rebinds
+    // the textures themselves.
+    gl.uniform1i(loc('u_sdfA'), 0);
+    gl.uniform1i(loc('u_sdfB'), 1);
+    gl.uniform1f(this.morphUniforms.bound!, WEBGL_BAKE_BOUND);
+    return true;
   }
 
   private initGlass(gl: WebGLRenderingContext, backdrop: TexImageSource): void {
@@ -458,6 +539,28 @@ export class WebGLRenderer implements Renderer {
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
+    if (u.morph && this.morphProgram && this.morphTexA && this.morphTexB) {
+      gl.useProgram(this.morphProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.morphTexA);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.morphTexB);
+
+      const mU = this.morphUniforms;
+      gl.uniform2f(mU.res!, u.width, u.height);
+      gl.uniform1f(mU.zoom!, u.zoom);
+      gl.uniform2f(mU.offset!, u.offsetX, u.offsetY);
+      gl.uniform1f(mU.opacity!, u.opacity);
+      gl.uniform1f(mU.morphT!, u.morph.t);
+      const ca = u.morph.colorA;
+      const cb = u.morph.colorB;
+      gl.uniform3f(mU.colorA!, ca[0], ca[1], ca[2]);
+      gl.uniform3f(mU.colorB!, cb[0], cb[1], cb[2]);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      return;
+    }
+
     if (u.glass && this.glassProgram && this.backdropTexture) {
       gl.useProgram(this.glassProgram);
       // Bind per-path SDFs on units 0..MAX_PATHS-1, backdrop on BACKDROP_UNIT.
@@ -590,8 +693,11 @@ export class WebGLRenderer implements Renderer {
       if (this.sampleProgram) gl.deleteProgram(this.sampleProgram);
       if (this.directProgram) gl.deleteProgram(this.directProgram);
       if (this.glassProgram) gl.deleteProgram(this.glassProgram);
+      if (this.morphProgram) gl.deleteProgram(this.morphProgram);
       this.textures.forEach((t) => gl.deleteTexture(t));
       if (this.backdropTexture) gl.deleteTexture(this.backdropTexture);
+      if (this.morphTexA) gl.deleteTexture(this.morphTexA);
+      if (this.morphTexB) gl.deleteTexture(this.morphTexB);
       if (this.buffer) gl.deleteBuffer(this.buffer);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
@@ -600,10 +706,27 @@ export class WebGLRenderer implements Renderer {
     this.sampleProgram = null;
     this.directProgram = null;
     this.glassProgram = null;
+    this.morphProgram = null;
     this.textures = [];
     this.backdropTexture = null;
+    this.morphTexA = null;
+    this.morphTexB = null;
     this.buffer = null;
   }
+}
+
+function flattenSegments(mark: Mark, label: string): readonly CubicSegment[] {
+  const segs: CubicSegment[] = [];
+  for (const p of mark.paths) {
+    for (const s of p.segments) segs.push(s);
+  }
+  if (segs.length > MAX_SEGS) {
+    throw new Error(
+      `${label} has ${segs.length} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+        'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
+    );
+  }
+  return segs;
 }
 
 function packSegments(segments: readonly CubicSegment[]): [Float32Array, Float32Array] {

@@ -1,12 +1,16 @@
-import type { Mark, Path, RgbColor } from '../geometry/types';
+import type { CubicSegment, Mark, Path, RgbColor } from '../geometry/types';
 import {
   MAX_PATHS,
   WEBGPU_BACKDROP_BINDING,
   WEBGPU_BAKE_SHADER,
+  WEBGPU_BAKE_BOUND,
   WEBGPU_BAKE_SIZE,
   WEBGPU_GLASS_OFFSETS,
   WEBGPU_GLASS_SHADER,
   WEBGPU_GLASS_UNIFORM_SIZE,
+  WEBGPU_MORPH_OFFSETS,
+  WEBGPU_MORPH_SHADER,
+  WEBGPU_MORPH_UNIFORM_SIZE,
   WEBGPU_SAMPLE_OFFSETS,
   WEBGPU_SAMPLE_SHADER,
   WEBGPU_SAMPLE_UNIFORM_SIZE,
@@ -65,15 +69,22 @@ export class WebGPURenderer implements Renderer {
   private sampler: GPUSampler | null = null;
   private backdropTexture: GPUTexture | null = null;
   private glassUniformData = new ArrayBuffer(WEBGPU_GLASS_UNIFORM_SIZE);
+  private morphPipeline: GPURenderPipeline | null = null;
+  private morphUniformBuffer: GPUBuffer | null = null;
+  private morphBindGroup: GPUBindGroup | null = null;
+  private morphTexA: GPUTexture | null = null;
+  private morphTexB: GPUTexture | null = null;
+  private morphUniformData = new ArrayBuffer(WEBGPU_MORPH_UNIFORM_SIZE);
   private _pathCount = 0;
   private disposed = false;
 
   readonly mode = 'baked' as const;
   get pathCount(): number { return this._pathCount; }
 
-  async init({ canvas, mark, backdrop }: RendererInitOptions): Promise<void> {
+  async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGS);
-    this._pathCount = mark.paths.length;
+    if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGS);
+    this._pathCount = morphTo ? 1 : mark.paths.length;
 
     if (!('gpu' in navigator) || !navigator.gpu) {
       throw new Error('WebGPU not available');
@@ -124,6 +135,14 @@ export class WebGPURenderer implements Renderer {
     });
     this.bakePipeline = bakePipeline;
     this.bakeBindGroupLayout = bakeBindGroupLayout;
+
+    if (morphTo) {
+      // Morph mode is exclusive: bake the two combined SDFs and compile
+      // only the morph pipeline. Per-path sample / glass pipelines are
+      // not created.
+      this.initMorph(device, mark, morphTo);
+      return;
+    }
 
     this.textures = mark.paths.map((p) => this.allocBakeTexture(device));
     for (let i = 0; i < mark.paths.length; i++) {
@@ -211,6 +230,63 @@ export class WebGPURenderer implements Renderer {
     if (backdrop) {
       this.initGlass(device, sampler, backdrop, viewFor);
     }
+  }
+
+  private initMorph(device: GPUDevice, markA: Mark, markB: Mark): void {
+    const segsA = flattenSegments(markA, 'morph: shape A');
+    const segsB = flattenSegments(markB, 'morph: shape B');
+
+    this.morphTexA = this.allocBakeTexture(device);
+    this.morphTexB = this.allocBakeTexture(device);
+    this.runBakeSegments(device, this.morphTexA, segsA);
+    this.runBakeSegments(device, this.morphTexB, segsB);
+
+    this.morphUniformBuffer = device.createBuffer({
+      size: WEBGPU_MORPH_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const sampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    });
+    this.sampler = sampler;
+
+    const morphShader = device.createShaderModule({ code: WEBGPU_MORPH_SHADER });
+    const morphLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+      ],
+    });
+    this.morphPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [morphLayout] }),
+      vertex: { module: morphShader, entryPoint: 'vs_main' },
+      fragment: {
+        module: morphShader,
+        entryPoint: 'fs_main',
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.morphBindGroup = device.createBindGroup({
+      layout: morphLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.morphUniformBuffer } },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: this.morphTexA.createView() },
+        { binding: 3, resource: this.morphTexB.createView() },
+      ],
+    });
   }
 
   private initGlass(
@@ -322,11 +398,18 @@ export class WebGPURenderer implements Renderer {
     texture: GPUTexture,
     path: Path,
   ): void {
+    this.runBakeSegments(device, texture, path.segments);
+  }
+
+  private runBakeSegments(
+    device: GPUDevice,
+    texture: GPUTexture,
+    segs: readonly CubicSegment[],
+  ): void {
     const pipeline = this.bakePipeline;
     const layout = this.bakeBindGroupLayout;
     if (!pipeline || !layout) return;
 
-    const segs = path.segments;
     const segFloats = new Float32Array(segs.length * 8);
     for (let i = 0; i < segs.length; i++) {
       segFloats.set(segs[i] as unknown as ArrayLike<number>, i * 8);
@@ -412,8 +495,16 @@ export class WebGPURenderer implements Renderer {
   }
 
   render(u: Uniforms): void {
-    const { device, context, samplePipeline, uniformBuffer, sampleBindGroup } = this;
-    if (!device || !context || !samplePipeline || !uniformBuffer || !sampleBindGroup || this.disposed) return;
+    const { device, context } = this;
+    if (!device || !context || this.disposed) return;
+
+    if (u.morph && this.morphPipeline && this.morphBindGroup && this.morphUniformBuffer) {
+      this.renderMorph(device, context, u);
+      return;
+    }
+
+    const { samplePipeline, uniformBuffer, sampleBindGroup } = this;
+    if (!samplePipeline || !uniformBuffer || !sampleBindGroup) return;
 
     if (u.glass && this.glassPipeline && this.glassBindGroup && this.glassUniformBuffer) {
       this.renderGlass(device, context, u);
@@ -476,6 +567,49 @@ export class WebGPURenderer implements Renderer {
     });
     pass.setPipeline(samplePipeline);
     pass.setBindGroup(0, sampleBindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  private renderMorph(device: GPUDevice, context: GPUCanvasContext, u: Uniforms): void {
+    const pipeline = this.morphPipeline!;
+    const bindGroup = this.morphBindGroup!;
+    const buffer = this.morphUniformBuffer!;
+    const m = u.morph!;
+
+    const view = new DataView(this.morphUniformData);
+    new Uint8Array(this.morphUniformData).fill(0);
+    const off = WEBGPU_MORPH_OFFSETS;
+
+    view.setFloat32(off.resolution,     u.width,   true);
+    view.setFloat32(off.resolution + 4, u.height,  true);
+    view.setFloat32(off.zoom,           u.zoom,    true);
+    view.setFloat32(off.morphT,         m.t,       true);
+    view.setFloat32(off.offset,         u.offsetX, true);
+    view.setFloat32(off.offset + 4,     u.offsetY, true);
+    view.setFloat32(off.opacity,        u.opacity, true);
+    view.setFloat32(off.bound,          WEBGPU_BAKE_BOUND, true);
+    view.setFloat32(off.colorA,         m.colorA[0], true);
+    view.setFloat32(off.colorA + 4,     m.colorA[1], true);
+    view.setFloat32(off.colorA + 8,     m.colorA[2], true);
+    view.setFloat32(off.colorB,         m.colorB[0], true);
+    view.setFloat32(off.colorB + 4,     m.colorB[1], true);
+    view.setFloat32(off.colorB + 8,     m.colorB[2], true);
+
+    device.queue.writeBuffer(buffer, 0, this.morphUniformData);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
     pass.draw(3);
     pass.end();
     device.queue.submit([encoder.finish()]);
@@ -550,16 +684,22 @@ export class WebGPURenderer implements Renderer {
     this.disposed = true;
     this.uniformBuffer?.destroy();
     this.glassUniformBuffer?.destroy();
+    this.morphUniformBuffer?.destroy();
     this.textures.forEach((t) => t.destroy());
     this.dummyTexture?.destroy();
     this.backdropTexture?.destroy();
+    this.morphTexA?.destroy();
+    this.morphTexB?.destroy();
     this.context?.unconfigure();
     this.device?.destroy();
     this.uniformBuffer = null;
     this.glassUniformBuffer = null;
+    this.morphUniformBuffer = null;
     this.textures = [];
     this.dummyTexture = null;
     this.backdropTexture = null;
+    this.morphTexA = null;
+    this.morphTexB = null;
     this.context = null;
     this.device = null;
     this.samplePipeline = null;
@@ -569,8 +709,24 @@ export class WebGPURenderer implements Renderer {
     this.glassPipeline = null;
     this.glassBindGroup = null;
     this.glassBindGroupLayout = null;
+    this.morphPipeline = null;
+    this.morphBindGroup = null;
     this.sampler = null;
   }
+}
+
+function flattenSegments(mark: Mark, label: string): readonly CubicSegment[] {
+  const segs: CubicSegment[] = [];
+  for (const p of mark.paths) {
+    for (const s of p.segments) segs.push(s);
+  }
+  if (segs.length > MAX_SEGS) {
+    throw new Error(
+      `${label} has ${segs.length} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+        'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
+    );
+  }
+  return segs;
 }
 
 /* --- Uniform-write helpers ----------------------------------------------- */

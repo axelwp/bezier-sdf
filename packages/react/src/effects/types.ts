@@ -23,6 +23,12 @@ export interface EffectFrame {
   cursorRadius?: number;
   /** Active ripple rings. See core `Uniforms.ripples`. */
   ripples?: ReadonlyArray<readonly [number, number, number, number]>;
+  /**
+   * Morph interpolation parameter in `[0, 1]`. 0 = shape A, 1 = shape B.
+   * Only meaningful when the renderer was init'd with a morph target;
+   * the component routes this into `Uniforms.morph.t`.
+   */
+  morphT?: number;
 }
 
 export interface EffectRuntime {

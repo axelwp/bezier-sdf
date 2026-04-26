@@ -12,5 +12,6 @@ export type { RevealParams } from './effects/reveal';
 export type { RippleParams } from './effects/ripple';
 export type { LiquidCursorParams } from './effects/liquid-cursor';
 export type { LiquidGlassParams } from './effects/liquid-glass';
+export type { MorphParams } from './effects/morph';
 export { StaticFallback, type StaticFallbackProps } from './StaticFallback';
 export { clearSvgCache } from './svg-cache';

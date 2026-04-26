@@ -82,6 +82,24 @@ export interface Uniforms {
   frostStrength?: number;
   rimColor?: readonly [number, number, number];
   tintColor?: readonly [number, number, number];
+
+  /**
+   * Switch the render to the morph (two-shape SDF interpolation) sample
+   * pipeline. Requires the renderer to have been init'd with a
+   * {@link RendererInitOptions.morphTo}; otherwise the morph pipeline
+   * isn't available and this field is ignored.
+   *
+   * `t` ∈ [0, 1] interpolates each pixel's distance: `mix(dA, dB, t)`. The
+   * zero-contour of the resulting field is a continuous geometric in-
+   * between of shape A and shape B at every t. Color is lerped between
+   * `colorA` (at t=0) and `colorB` (at t=1) with no per-path machinery —
+   * morph renders as a single uniform color.
+   */
+  morph?: {
+    t: number;
+    colorA: readonly [number, number, number];
+    colorB: readonly [number, number, number];
+  };
 }
 
 export interface RendererInitOptions {
@@ -99,6 +117,20 @@ export interface RendererInitOptions {
    * backdrops (video, updating canvas) need a re-init.
    */
   backdrop?: TexImageSource;
+  /**
+   * Enable the morph (two-shape SDF interpolation) sample pipeline. When
+   * provided, the renderer bakes `mark` and `morphTo` into two combined
+   * SDF textures (each shape's paths flattened into one segment list per
+   * texture) and compiles a dedicated morph fragment shader.
+   *
+   * Morph mode is exclusive: when `morphTo` is set, the per-path sample
+   * and direct pipelines are *not* compiled — the renderer can only draw
+   * via the morph pipeline. Each shape's combined segment count must
+   * fit under MAX_SEGS; both shapes must lie within the normalized bake
+   * region (`|x|, |y| ≲ 1`) for the field outside their boundaries to
+   * remain a meaningful Euclidean distance.
+   */
+  morphTo?: Mark;
 }
 
 export interface Renderer {

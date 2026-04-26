@@ -108,6 +108,35 @@ export const WEBGPU_GLASS_UNIFORM_SIZE =
   GLASS_OFF.pathOffsets + (MAX_PATHS / 2) * 16;
 
 /**
+ * Uniform buffer layout for the morph pipeline. Two vec3<f32> colors
+ * each take 12 B but a vec3 must align to 16 B in WGSL — pad behind
+ * each to keep the next field 16-aligned.
+ *
+ *   resolution : vec2<f32>   //  0
+ *   zoom       : f32         //  8
+ *   morphT     : f32         // 12
+ *   offset     : vec2<f32>   // 16
+ *   opacity    : f32         // 24
+ *   bound      : f32         // 28
+ *   colorA     : vec3<f32>   // 32  (align 16)
+ *   _pad0      : f32         // 44
+ *   colorB     : vec3<f32>   // 48  (align 16)
+ *   _pad1      : f32         // 60
+ */
+const MORPH_OFF = {
+  resolution: 0,
+  zoom: 8,
+  morphT: 12,
+  offset: 16,
+  opacity: 24,
+  bound: 28,
+  colorA: 32,
+  colorB: 48,
+} as const;
+export const WEBGPU_MORPH_OFFSETS = MORPH_OFF;
+export const WEBGPU_MORPH_UNIFORM_SIZE = 64;
+
+/**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
  * per bake pass; the fragment shader walks them for each pixel of a
  * 1024x1024 r16float render target.
@@ -736,5 +765,72 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
   return vec4<f32>(color, insideMask * U.opacity);
   //return vec4<f32>(normal * 0.5 + 0.5, 0.0, insideMask);
+}
+`;
+
+/**
+ * Morph sample shader. Two combined-shape SDFs (`sdfA`, `sdfB`) are
+ * sampled at the same uv and lerped per-pixel by `morphT`; the zero-
+ * contour of the resulting field is a coherent geometric in-between
+ * shape at every t. Color is lerped from `colorA` (t=0) to `colorB`
+ * (t=1). No per-path machinery — morph renders as a single uniform
+ * color silhouette.
+ *
+ * Bindings:
+ *   0: uniforms (MorphUniforms)
+ *   1: sampler (linear, clamp — shared by both SDFs)
+ *   2: sdfA
+ *   3: sdfB
+ */
+export const WEBGPU_MORPH_SHADER = /* wgsl */ `
+struct MorphUniforms {
+  resolution: vec2<f32>,
+  zoom: f32,
+  morphT: f32,
+  offset: vec2<f32>,
+  opacity: f32,
+  bound: f32,
+  colorA: vec3<f32>,
+  colorB: vec3<f32>,
+};
+
+@group(0) @binding(0) var<uniform> U: MorphUniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var sdfA: texture_2d<f32>;
+@group(0) @binding(3) var sdfB: texture_2d<f32>;
+
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0),
+  );
+  var out: VsOut;
+  out.pos = vec4<f32>(pos[vi], 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = U.resolution;
+  var uv = (fragCoord.xy - 0.5 * res) / min(res.x, res.y);
+  uv.y = -uv.y;
+  uv = uv * (2.0 / U.zoom);
+  uv = uv - U.offset;
+
+  let t = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+  let dA = textureSample(sdfA, samp, t).r;
+  let dB = textureSample(sdfB, samp, t).r;
+  let d = mix(dA, dB, U.morphT);
+
+  let aa = fwidth(d) * 1.2;
+  let mask = 1.0 - smoothstep(-aa, aa, d);
+  let color = mix(U.colorA, U.colorB, U.morphT);
+  return vec4<f32>(color, mask * U.opacity);
 }
 `;

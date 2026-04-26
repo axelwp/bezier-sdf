@@ -19,7 +19,7 @@ import './styles.css';
 // The playground's tunable effects are the frame-based ones. `liquid-glass`
 // is a material (separate GPU pipeline) with its own card and static
 // defaults, so it's excluded from the playground's record shapes.
-type FrameEffectName = Exclude<LiveGraphicEffectName, 'liquid-glass'>;
+type FrameEffectName = Exclude<LiveGraphicEffectName, 'liquid-glass' | 'morph'>;
 
 const GLASS_DEFAULTS = {
   refractionStrength: 0.05,
@@ -102,6 +102,12 @@ interface CardSpec {
   backdrop?: boolean;
   /** Show a backdrop upload button in the replay slot. */
   backdropUpload?: boolean;
+  /** Target SVG for the `morph` effect. */
+  to?: string;
+  /** End color (`t = 1`) for the `morph` effect. Falls back to `color`. */
+  toFillColor?: string;
+  /** Show a "target SVG" upload button (parallels `backdropUpload`). */
+  toUpload?: boolean;
 }
 
 const CARDS: CardSpec[] = [
@@ -159,6 +165,18 @@ const CARDS: CardSpec[] = [
     hint: 'refracts the backdrop',
     backdrop: true,
     backdropUpload: true,
+  },
+  {
+    id: 'morph',
+    number: '07',
+    title: 'Morph',
+    color: '#ff3a7a',
+    toFillColor: '#10c8ff',
+    to: '/morph-circle.svg',
+    effect: 'morph',
+    code: `<LiveGraphic effect="morph" to={target} />`,
+    hint: 'hover to morph; upload a target SVG',
+    toUpload: true,
   },
 ];
 
@@ -668,11 +686,16 @@ function ShowcaseCard({
 }) {
   const ref = useRef<LiveGraphicHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const toFileInputRef = useRef<HTMLInputElement>(null);
   const [uploadedUrl, setUploadedUrl] = useState<string | null>(null);
+  const [toUploadedUrl, setToUploadedUrl] = useState<string | null>(null);
 
   useEffect(() => () => {
     if (uploadedUrl) URL.revokeObjectURL(uploadedUrl);
   }, [uploadedUrl]);
+  useEffect(() => () => {
+    if (toUploadedUrl) URL.revokeObjectURL(toUploadedUrl);
+  }, [toUploadedUrl]);
 
   // Generated backdrop is only built when there's no upload. Swapping to
   // the uploaded URL drops the generated canvas for GC.
@@ -704,6 +727,22 @@ function ShowcaseCard({
     });
   };
 
+  const onToUploadFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const looksLikeSvg =
+      file.type === 'image/svg+xml' || file.name.toLowerCase().endsWith('.svg');
+    if (!looksLikeSvg) return;
+    const url = URL.createObjectURL(file);
+    setToUploadedUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return url;
+    });
+  };
+
+  const toSrc = toUploadedUrl ?? spec.to;
+
   return (
     <article className="card">
       <header className="card-head">
@@ -718,8 +757,12 @@ function ShowcaseCard({
           src={src}
           // Thematic color applies only to the built-in demo logo —
           // uploaded SVGs render with their own per-path paint so users
-          // can preview their artwork as authored.
-          color={src === DEFAULT_SRC ? spec.color : undefined}
+          // can preview their artwork as authored. Morph always applies
+          // its colors though: the shader has no per-path paint to fall
+          // back on, so an unset color would render as transparent.
+          color={spec.id === 'morph' || src === DEFAULT_SRC ? spec.color : undefined}
+          to={toSrc}
+          toFillColor={spec.toFillColor}
           effect={spec.effect}
           backdrop={backdrop}
           autoPlay={spec.autoPlay}
@@ -754,6 +797,25 @@ function ShowcaseCard({
             title="replace the backdrop with a custom image"
           >
             ↑ backdrop
+          </button>
+        </>
+      ) : null}
+      {spec.toUpload ? (
+        <>
+          <input
+            ref={toFileInputRef}
+            type="file"
+            accept=".svg,image/svg+xml"
+            onChange={onToUploadFile}
+            style={{ display: 'none' }}
+          />
+          <button
+            type="button"
+            className="card-replay"
+            onClick={() => toFileInputRef.current?.click()}
+            title="replace the morph target with a custom SVG"
+          >
+            ↑ target
           </button>
         </>
       ) : null}

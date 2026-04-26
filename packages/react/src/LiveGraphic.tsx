@@ -21,9 +21,10 @@ import { reveal, type RevealParams } from './effects/reveal';
 import { ripple, type RippleParams } from './effects/ripple';
 import { liquidCursor, type LiquidCursorParams } from './effects/liquid-cursor';
 import { DEFAULT_GLASS_PARAMS, type LiquidGlassParams } from './effects/liquid-glass';
+import { morph, type MorphParams } from './effects/morph';
 import type { EffectDefinition, EffectFrame, EffectRuntime } from './effects/types';
 
-export type LiveGraphicEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor' | 'liquid-glass';
+export type LiveGraphicEffect = 'none' | 'reveal' | 'ripple' | 'liquid-cursor' | 'liquid-glass' | 'morph';
 
 export type LiveGraphicEffectName = Exclude<LiveGraphicEffect, 'none'>;
 
@@ -35,7 +36,8 @@ export type LiveGraphicEffectSpec =
   | ({ name: 'reveal' } & RevealParams)
   | ({ name: 'ripple' } & RippleParams)
   | ({ name: 'liquid-cursor' } & LiquidCursorParams)
-  | ({ name: 'liquid-glass' } & LiquidGlassParams);
+  | ({ name: 'liquid-glass' } & LiquidGlassParams)
+  | ({ name: 'morph' } & MorphParams);
 
 /** Accepted shapes for the backdrop prop consumed in liquid-glass mode. */
 export type LiveGraphicBackdrop = string | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
@@ -65,9 +67,29 @@ export interface LiveGraphicProps {
   /** URL (or data URI) of the SVG to trace. */
   src: string;
   /**
+   * Target SVG for the `morph` effect. Loaded and parsed via the same
+   * pipeline as `src`, then baked into a second combined SDF that the
+   * morph shader interpolates with the first. Required for
+   * `effect="morph"`; ignored for other effects.
+   *
+   * Both shapes' geometry must fit within normalized space (`|x|, |y| ≲ 1`)
+   * and their combined segment counts must each fit under MAX_SEGS.
+   */
+  to?: string;
+  /**
+   * Fill color used at `t = 1` (the morph target shape). At `t = 0` the
+   * shape is painted with `fillColor` (or `color`); the shader linearly
+   * interpolates between them. Defaults to the start color, so omitting
+   * this gives a single-color morph with no color animation.
+   */
+  toFillColor?: string;
+  /**
    * Optional global color override. When set, every path is painted with
    * this color (smooth-union mode, matches the reveal example). Omit to
    * honor the SVG's own per-path fill/stroke colors.
+   *
+   * For `effect="morph"`, this is the start color (`t = 0`); see
+   * `toFillColor` for the end color.
    */
   color?: string;
   /** 0..1 opacity multiplier applied on top of any effect opacity. */
@@ -164,6 +186,7 @@ const DEFINITIONS: Record<Exclude<LiveGraphicEffectName, 'liquid-glass'>, Effect
   'reveal': reveal,
   'ripple': ripple,
   'liquid-cursor': liquidCursor,
+  'morph': morph,
 };
 
 function zeroOffsets(n: number): Array<[number, number]> {
@@ -263,6 +286,7 @@ function mergeFrames(frames: EffectFrame[]): EffectFrame {
     if (f.cursorPull !== undefined) out.cursorPull = f.cursorPull;
     if (f.cursorRadius !== undefined) out.cursorRadius = f.cursorRadius;
     if (f.ripples !== undefined) out.ripples = f.ripples;
+    if (f.morphT !== undefined) out.morphT = f.morphT;
   }
   return out;
 }
@@ -474,6 +498,8 @@ function resolveGlassUniforms(spec: LiquidGlassParams): GlassUniformShape {
 export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(function LiveGraphic(
   {
     src,
+    to,
+    toFillColor,
     color,
     opacity = 1,
     effect = 'none',
@@ -495,6 +521,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [mark, setMark] = useState<Mark | null>(null);
+  const [markB, setMarkB] = useState<Mark | null>(null);
   const [fallback, setFallback] = useState(false);
 
   // Per-path uniforms derived from the mark. Stable across re-renders so
@@ -505,6 +532,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
   // loop sees fresh color/opacity without forcing a re-init.
   const stateRef = useRef({
     color,
+    toFillColor,
     opacity,
     perPath,
     pauseWhenOffscreen,
@@ -515,6 +543,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
     pushParams: (_: Record<string, Record<string, number>>) => {},
   });
   stateRef.current.color = color;
+  stateRef.current.toFillColor = toFillColor;
   stateRef.current.opacity = opacity;
   stateRef.current.perPath = perPath;
   stateRef.current.pauseWhenOffscreen = pauseWhenOffscreen;
@@ -548,6 +577,25 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
     );
     return () => { cancelled = true; };
   }, [src, onError]);
+
+  /* ---------------------- 1b. Load morph target SVG ----------------------- */
+
+  useEffect(() => {
+    if (!to) {
+      setMarkB(null);
+      return;
+    }
+    let cancelled = false;
+    setMarkB(null);
+    loadMark(to).then(
+      (m) => { if (!cancelled) setMarkB(m); },
+      (err) => {
+        if (cancelled) return;
+        onError?.(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+    return () => { cancelled = true; };
+  }, [to, onError]);
 
   /* ---------------------- 2. Init renderer + run loop ---------------------- */
 
@@ -595,6 +643,18 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
     const needsPointer = defs.some((d) => d.needsPointer);
     const needsScroll = defs.some((d) => d.scrollTrigger);
     const hasReveal = defs.some((d) => d.name === 'reveal');
+    const morphMode = defs.some((d) => d.name === 'morph');
+
+    // Morph requires the second mark to be loaded before init — the
+    // renderer compiles a different pipeline based on its presence. Wait
+    // for the second loadMark to settle; the markB dep below re-runs us.
+    if (morphMode && !markB) return;
+    if (morphMode && !to) {
+      // Programmer error — surface and fall through to non-morph render
+      // of shape A. Component still works; just no morph.
+      // eslint-disable-next-line no-console
+      console.warn('[bezier-sdf] effect="morph" requires the `to` prop; rendering shape A only');
+    }
 
     let cancelled = false;
     let renderer: Renderer | null = null;
@@ -614,6 +674,33 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
         runtimes.length > 0 ? mergeFrames(runtimes.map((rt) => rt.frame(now))) : null;
       const offsets = frame?.pathOffsets ?? zeroOffsets(r.pathCount);
       const base = state.perPath;
+
+      if (morphMode && markB) {
+        // Morph render path. Renderer was init'd with both marks; the
+        // shader interpolates the two baked SDFs by `t`. No per-path
+        // machinery — shape paints in `colorA → colorB` lerped by `t`.
+        const startColor = state.color ? parseColor(state.color) : ([1, 1, 1] as RgbColor);
+        const endColor = state.toFillColor
+          ? parseColor(state.toFillColor)
+          : startColor;
+        r.render({
+          width: canvas.width,
+          height: canvas.height,
+          zoom: 1,
+          sminK: DEFAULT_SMIN_K,
+          offsetX: 0,
+          offsetY: 0,
+          pathOffsets: zeroOffsets(r.pathCount),
+          color: [0, 0, 0],
+          opacity: (frame?.opacity ?? 1) * state.opacity,
+          morph: {
+            t: frame?.morphT ?? 0,
+            colorA: startColor,
+            colorB: endColor,
+          },
+        });
+        return runtimes.some((rt) => rt.active(now));
+      }
 
       if (glassMode) {
         // Glass pipeline — shape is a material, not a painter. Per-path
@@ -804,6 +891,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
           canvas,
           mark,
           backdrop: backdropSrc,
+          morphTo: morphMode && markB ? markB : undefined,
         });
         if (cancelled) {
           result.renderer.dispose();
@@ -939,13 +1027,13 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       renderer = null;
       runtimes = [];
     };
-  }, [mark, rendererKind, effectKey, autoPlay, onReady, onError, backdrop, backdropBlur, material]);
+  }, [mark, markB, to, rendererKind, effectKey, autoPlay, onReady, onError, backdrop, backdropBlur, material]);
 
   /* --------------- 3. React to color/opacity changes mid-life -------------- */
 
   useEffect(() => {
     stateRef.current.requestRender();
-  }, [color, opacity]);
+  }, [color, opacity, toFillColor]);
 
   /* --------------- 4. Live-push effect param changes ----------------------- */
 

@@ -704,6 +704,52 @@ void main() {
 `;
 
 /**
+ * Morph fragment — interpolates two baked SDFs by `u_morphT` per pixel.
+ *
+ * Each input shape is baked into one combined SDF texture covering the
+ * same `[-BOUND, BOUND]²` region; the shader samples both at the same
+ * uv and lerps the distances. Because each baked field reports the
+ * approximate Euclidean signed distance to its shape's boundary across
+ * the whole bake region, `mix(dA, dB, t)` is itself a coherent distance
+ * field whose zero-contour is a continuous geometric in-between of A
+ * and B at every t (Quilez 2D distance functions, blending demos).
+ *
+ * Color is lerped from `u_colorA` (t=0) to `u_colorB` (t=1). No per-path
+ * machinery applies — morph renders as a single uniform color.
+ */
+export const WEBGL_MORPH_FRAG = /* glsl */ `
+#extension GL_OES_standard_derivatives : enable
+precision highp float;
+
+uniform vec2  u_res;
+uniform float u_zoom;
+uniform vec2  u_offset;
+uniform float u_opacity;
+uniform float u_bound;
+uniform float u_morphT;
+uniform vec3  u_colorA;
+uniform vec3  u_colorB;
+uniform sampler2D u_sdfA;
+uniform sampler2D u_sdfB;
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
+  uv *= 2.0 / u_zoom;
+  uv -= u_offset;
+
+  vec2 t = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
+  float dA = texture2D(u_sdfA, t).r;
+  float dB = texture2D(u_sdfB, t).r;
+  float d = mix(dA, dB, u_morphT);
+
+  float aa = fwidth(d) * 1.2;
+  float mask = 1.0 - smoothstep(-aa, aa, d);
+  vec3 color = mix(u_colorA, u_colorB, u_morphT);
+  gl_FragColor = vec4(color, mask * u_opacity);
+}
+`;
+
+/**
  * Direct fragment — evaluates one combined SDF per pixel. Used when
  * half-float texture extensions are unavailable, or when the caller
  * explicitly opts out of baking (`mode: 'direct'`).
