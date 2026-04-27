@@ -39,9 +39,14 @@ function textureSourceSize(src: TexImageSource): [number, number] {
   return [anySrc.width, anySrc.height];
 }
 
-// MAX_SEGS isn't enforced by WebGPU's dynamic storage buffer — it's just
-// the documented upper bound matching the WebGL shader.
-const MAX_SEGS = 128;
+/**
+ * Per-shape segment-count cap, matched to the WebGL shader's compile-
+ * time loop bound (see {@link MAX_LOOP_BOUND} in shaders/webgl.ts) so a
+ * mark accepted by one renderer is accepted by the other. WebGPU's
+ * storage buffer + WGSL `arrayLength` already supports any size; this
+ * cap exists purely for cross-backend parity.
+ */
+const MAX_SEGMENTS_PER_SHAPE = 1024;
 
 /** First texture binding index for SDFs in both sample and glass layouts.
  *  Binding 0 = uniform, 1 = sampler, then MAX_PATHS SDFs, then backdrop
@@ -82,10 +87,10 @@ export class WebGPURenderer implements Renderer {
   get pathCount(): number { return this._pathCount; }
 
   async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
-    validateMark(mark, MAX_PATHS, MAX_SEGS);
-    if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGS);
+    validateMark(mark, MAX_PATHS, MAX_SEGMENTS_PER_SHAPE);
+    if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGMENTS_PER_SHAPE);
     // Morph bakes both shapes' paths into a single combined segment list
-    // bounded by MAX_SEGS. Run this check BEFORE acquiring the WebGPU
+    // bounded by MAX_SEGMENTS_PER_SHAPE. Run this check BEFORE acquiring the WebGPU
     // context: getContext('webgpu') irreversibly binds the canvas to
     // WebGPU, so any subsequent throw poisons the WebGL fallback path
     // (its getContext('webgl') would return null on the same canvas,
@@ -401,8 +406,8 @@ export class WebGPURenderer implements Renderer {
   /**
    * Upload `path.segments` into a transient storage buffer, run the bake
    * fragment program into `texture`. The texture is reused across rebakes.
-   * The segment buffer is recreated each call — at MAX_SEGS×32 bytes it's
-   * a sub-KB allocation, cheaper to recreate than to track mapping.
+   * The segment buffer is recreated each call — at 32 bytes per segment
+   * it's a sub-KB allocation, cheaper to recreate than to track mapping.
    */
   private runBakeIntoTexture(
     device: GPUDevice,
@@ -462,7 +467,7 @@ export class WebGPURenderer implements Renderer {
         `rebake: mark has ${mark.paths.length} paths but renderer was init'd with ${this.textures.length}`,
       );
     }
-    validateMark(mark, MAX_PATHS, MAX_SEGS);
+    validateMark(mark, MAX_PATHS, MAX_SEGMENTS_PER_SHAPE);
     for (let i = 0; i < mark.paths.length; i++) {
       this.runBakeIntoTexture(device, this.textures[i]!, mark.paths[i]!);
     }
@@ -743,9 +748,9 @@ export class WebGPURenderer implements Renderer {
 function validateMorphSegments(mark: Mark, label: string): void {
   let total = 0;
   for (const p of mark.paths) total += p.segments.length;
-  if (total > MAX_SEGS) {
+  if (total > MAX_SEGMENTS_PER_SHAPE) {
     throw new Error(
-      `${label} has ${total} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+      `${label} has ${total} combined segments but the per-shape cap is ${MAX_SEGMENTS_PER_SHAPE}. ` +
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }
@@ -756,9 +761,9 @@ function flattenSegments(mark: Mark, label: string): readonly CubicSegment[] {
   for (const p of mark.paths) {
     for (const s of p.segments) segs.push(s);
   }
-  if (segs.length > MAX_SEGS) {
+  if (segs.length > MAX_SEGMENTS_PER_SHAPE) {
     throw new Error(
-      `${label} has ${segs.length} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+      `${label} has ${segs.length} combined segments but the per-shape cap is ${MAX_SEGMENTS_PER_SHAPE}. ` +
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }

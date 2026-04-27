@@ -1,7 +1,7 @@
 import type { Mark, Path, CubicSegment, RgbColor } from '../geometry/types';
 import {
+  MAX_LOOP_BOUND,
   MAX_PATHS,
-  MAX_SEGS,
   WEBGL_BAKE_BOUND,
   WEBGL_BAKE_FRAG,
   WEBGL_BAKE_SIZE,
@@ -28,6 +28,19 @@ const GLASS_DEFAULTS = {
  *  MAX_PATHS SDF bindings so raising MAX_PATHS only shifts it. */
 const BACKDROP_UNIT = MAX_PATHS;
 
+/** Texture unit used to bind the segment-data texture during bake (and
+ *  during the direct render). The bake program reads only this texture;
+ *  the direct program reads only this texture. Picking unit 0 keeps it
+ *  out of the way of the sample/glass programs' SDF bindings. */
+const SEGMENT_TEXTURE_UNIT = 0;
+
+interface SegmentTextureFormat {
+  /** GL type passed to texImage2D. */
+  type: number;
+  /** Either 'float' (Float32Array data) or 'half' (Uint16Array data). */
+  precision: 'float' | 'half';
+}
+
 /**
  * WebGL 1 renderer.
  *
@@ -46,14 +59,23 @@ export class WebGLRenderer implements Renderer {
   private gl: WebGLRenderingContext | null = null;
   private buffer: WebGLBuffer | null = null;
   private bakeProgram: WebGLProgram | null = null;
+  private bakeUniforms: Record<string, WebGLUniformLocation | null> = {};
   private sampleProgram: WebGLProgram | null = null;
   private directProgram: WebGLProgram | null = null;
   private glassProgram: WebGLProgram | null = null;
   private morphProgram: WebGLProgram | null = null;
   private morphTexA: WebGLTexture | null = null;
   private morphTexB: WebGLTexture | null = null;
+  private morphSegTexA: WebGLTexture | null = null;
+  private morphSegTexB: WebGLTexture | null = null;
   private morphUniforms: Record<string, WebGLUniformLocation | null> = {};
   private textures: WebGLTexture[] = [];
+  /** Per-path segment-data textures, parallel to {@link textures}. Each
+   *  packs the path's cubic control points into 2 RGBA texels per
+   *  segment; sampled by the bake program at bake/rebake time. */
+  private segmentTextures: WebGLTexture[] = [];
+  /** Combined-segment texture for the direct render path. */
+  private directSegmentTexture: WebGLTexture | null = null;
   private backdropTexture: WebGLTexture | null = null;
   private sampleUniforms: Record<string, WebGLUniformLocation | null> = {};
   private directUniforms: Record<string, WebGLUniformLocation | null> = {};
@@ -69,13 +91,17 @@ export class WebGLRenderer implements Renderer {
   private pathScalarBuf = new Float32Array(MAX_PATHS);
   private pathVec3Buf = new Float32Array(MAX_PATHS * 3);
   private halfFloatType = 0;
+  /** Format used for the segment-data texture. RGBA32F if
+   *  OES_texture_float is supported, else RGBA16F (which is also what
+   *  the SDF render targets use). Null until init picks one. */
+  private segmentFormat: SegmentTextureFormat | null = null;
 
   get mode(): 'baked' | 'direct' { return this._mode; }
   get pathCount(): number { return this._pathCount; }
 
   async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
-    validateMark(mark, MAX_PATHS, MAX_SEGS);
-    if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGS);
+    validateMark(mark, MAX_PATHS, MAX_LOOP_BOUND);
+    if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_LOOP_BOUND);
     // Combined-segment bound applies to both shapes in morph mode. Check
     // it BEFORE getContext binds the canvas — see WebGPURenderer for the
     // rationale (the symmetric concern there is poisoning the canvas for
@@ -120,6 +146,19 @@ export class WebGLRenderer implements Renderer {
       gl.STATIC_DRAW,
     );
     this.buffer = buf;
+
+    // Segment-data texture format. Either OES_texture_float (RGBA32F) or
+    // OES_texture_half_float (RGBA16F) must be present — we sample with
+    // NEAREST so no *_linear extension is needed. With neither available
+    // there's no way to upload segment data and we have to throw; the
+    // React static fallback already handles that case.
+    const segFormat = pickSegmentFormat(gl);
+    if (!segFormat) {
+      throw new Error(
+        'OES_texture_float or OES_texture_half_float required (neither available)',
+      );
+    }
+    this.segmentFormat = segFormat;
 
     if (morphTo) {
       // Morph mode is exclusive: skip the per-path sample/direct pipelines
@@ -167,15 +206,21 @@ export class WebGLRenderer implements Renderer {
     const HALF_FLOAT_OES = halfFloat.HALF_FLOAT_OES;
     this.halfFloatType = HALF_FLOAT_OES;
 
-    const bakeProgram = link(gl, WEBGL_BAKE_VERT, WEBGL_BAKE_FRAG);
-    if (!bakeProgram) return false;
-    this.bakeProgram = bakeProgram;
+    if (!this.initBakeProgram(gl)) return false;
+    const bakeProgram = this.bakeProgram!;
 
-    const texA = this.bakeOne(gl, bakeProgram, segsA, HALF_FLOAT_OES);
-    const texB = this.bakeOne(gl, bakeProgram, segsB, HALF_FLOAT_OES);
+    this.morphSegTexA = this.uploadSegmentTexture(gl, segsA);
+    this.morphSegTexB = this.uploadSegmentTexture(gl, segsB);
+
+    const texA = this.bakeOne(gl, bakeProgram, this.morphSegTexA, segsA.length, HALF_FLOAT_OES);
+    const texB = this.bakeOne(gl, bakeProgram, this.morphSegTexB, segsB.length, HALF_FLOAT_OES);
     if (!texA || !texB) {
       if (texA) gl.deleteTexture(texA);
       if (texB) gl.deleteTexture(texB);
+      gl.deleteTexture(this.morphSegTexA);
+      gl.deleteTexture(this.morphSegTexB);
+      this.morphSegTexA = null;
+      this.morphSegTexB = null;
       gl.deleteProgram(bakeProgram);
       this.bakeProgram = null;
       return false;
@@ -301,15 +346,18 @@ export class WebGLRenderer implements Renderer {
     const HALF_FLOAT_OES = halfFloat.HALF_FLOAT_OES;
     this.halfFloatType = HALF_FLOAT_OES;
 
-    const bakeProgram = link(gl, WEBGL_BAKE_VERT, WEBGL_BAKE_FRAG);
-    if (!bakeProgram) return false;
-    this.bakeProgram = bakeProgram;
+    if (!this.initBakeProgram(gl)) return false;
+    const bakeProgram = this.bakeProgram!;
 
     const textures: WebGLTexture[] = [];
+    const segmentTextures: WebGLTexture[] = [];
     for (const path of paths) {
-      const tex = this.bakeOne(gl, bakeProgram, path.segments, HALF_FLOAT_OES);
+      const segTex = this.uploadSegmentTexture(gl, path.segments);
+      segmentTextures.push(segTex);
+      const tex = this.bakeOne(gl, bakeProgram, segTex, path.segments.length, HALF_FLOAT_OES);
       if (!tex) {
         textures.forEach((t) => gl.deleteTexture(t));
+        segmentTextures.forEach((t) => gl.deleteTexture(t));
         gl.deleteProgram(bakeProgram);
         this.bakeProgram = null;
         return false;
@@ -317,6 +365,7 @@ export class WebGLRenderer implements Renderer {
       textures.push(tex);
     }
     this.textures = textures;
+    this.segmentTextures = segmentTextures;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
     const sampleProgram = link(gl, WEBGL_VERT, WEBGL_SAMPLE_FRAG);
@@ -373,7 +422,8 @@ export class WebGLRenderer implements Renderer {
   private bakeOne(
     gl: WebGLRenderingContext,
     bakeProgram: WebGLProgram,
-    segments: readonly CubicSegment[],
+    segmentTex: WebGLTexture,
+    segCount: number,
     halfFloatType: number,
   ): WebGLTexture | null {
     const tex = gl.createTexture();
@@ -387,7 +437,7 @@ export class WebGLRenderer implements Renderer {
       gl.RGBA, halfFloatType, null,
     );
 
-    if (!this.runBakeIntoTexture(gl, bakeProgram, tex, segments)) {
+    if (!this.runBakeIntoTexture(gl, bakeProgram, tex, segmentTex, segCount)) {
       gl.deleteTexture(tex);
       return null;
     }
@@ -395,20 +445,20 @@ export class WebGLRenderer implements Renderer {
   }
 
   /**
-   * Run the bake fragment program into `tex` with the given segments.
-   * Allocates and disposes one FBO; the texture is shared and reused
-   * across rebakes. Returns false only if framebuffer completeness check
-   * fails, which only happens at first-bake time (extension support);
-   * once a texture has succeeded once it'll succeed again.
+   * Run the bake fragment program into `tex` from segments stored in
+   * `segmentTex`. Allocates and disposes one FBO; both target and
+   * segment textures are reused across rebakes. Returns false only if
+   * framebuffer completeness check fails, which only happens at first-
+   * bake time (extension support); once a texture has succeeded once
+   * it'll succeed again.
    */
   private runBakeIntoTexture(
     gl: WebGLRenderingContext,
     bakeProgram: WebGLProgram,
     tex: WebGLTexture,
-    segments: readonly CubicSegment[],
+    segmentTex: WebGLTexture,
+    segCount: number,
   ): boolean {
-    const [segA, segB] = packSegments(segments);
-
     const fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -423,10 +473,12 @@ export class WebGLRenderer implements Renderer {
     const posLoc = gl.getAttribLocation(bakeProgram, 'a_pos');
     gl.enableVertexAttribArray(posLoc);
     gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-    gl.uniform1f(gl.getUniformLocation(bakeProgram, 'u_bound'), WEBGL_BAKE_BOUND);
-    gl.uniform1i(gl.getUniformLocation(bakeProgram, 'u_segCount'), segments.length);
-    gl.uniform4fv(gl.getUniformLocation(bakeProgram, 'u_segA'), segA);
-    gl.uniform4fv(gl.getUniformLocation(bakeProgram, 'u_segB'), segB);
+    gl.activeTexture(gl.TEXTURE0 + SEGMENT_TEXTURE_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D, segmentTex);
+    const bU = this.bakeUniforms;
+    gl.uniform1f(bU.bound!, WEBGL_BAKE_BOUND);
+    gl.uniform1i(bU.segCount!, segCount);
+    gl.uniform1f(bU.segmentTexWidth!, segCount * 2);
     gl.viewport(0, 0, WEBGL_BAKE_SIZE, WEBGL_BAKE_SIZE);
     gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0);
@@ -439,6 +491,87 @@ export class WebGLRenderer implements Renderer {
     return true;
   }
 
+  /** Compile + cache the bake program and uniform locations. Idempotent. */
+  private initBakeProgram(gl: WebGLRenderingContext): boolean {
+    if (this.bakeProgram) return true;
+    const program = link(gl, WEBGL_BAKE_VERT, WEBGL_BAKE_FRAG);
+    if (!program) return false;
+    this.bakeProgram = program;
+    gl.useProgram(program);
+    this.bakeUniforms = {
+      bound:           gl.getUniformLocation(program, 'u_bound'),
+      segCount:        gl.getUniformLocation(program, 'u_segCount'),
+      segmentTexWidth: gl.getUniformLocation(program, 'u_segmentTexWidth'),
+    };
+    // u_segments lives on a fixed unit; set it once so render-time only
+    // has to bind the texture itself.
+    gl.uniform1i(gl.getUniformLocation(program, 'u_segments'), SEGMENT_TEXTURE_UNIT);
+    return true;
+  }
+
+  /**
+   * Allocate a new RGBA float (or half-float) texture sized to fit the
+   * given segments and upload them. Each cubic occupies two consecutive
+   * RGBA texels: texel 2i = (P0, P1), texel 2i+1 = (P2, P3). Sampled
+   * with NEAREST so each fetch returns the exact stored values.
+   */
+  private uploadSegmentTexture(
+    gl: WebGLRenderingContext,
+    segments: readonly CubicSegment[],
+  ): WebGLTexture {
+    const fmt = this.segmentFormat;
+    if (!fmt) throw new Error('segmentFormat not initialized');
+    const segCount = segments.length;
+    const texWidth = Math.max(segCount * 2, 1);
+    const floats = new Float32Array(texWidth * 4);
+    for (let i = 0; i < segCount; i++) {
+      const c = segments[i]!;
+      floats[i * 8 + 0] = c[0]!; floats[i * 8 + 1] = c[1]!;
+      floats[i * 8 + 2] = c[2]!; floats[i * 8 + 3] = c[3]!;
+      floats[i * 8 + 4] = c[4]!; floats[i * 8 + 5] = c[5]!;
+      floats[i * 8 + 6] = c[6]!; floats[i * 8 + 7] = c[7]!;
+    }
+    const data = fmt.precision === 'float' ? floats : floatArrayToHalfFloat(floats);
+    const tex = gl.createTexture();
+    if (!tex) throw new Error('createTexture returned null');
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, texWidth, 1, 0,
+      gl.RGBA, fmt.type, data,
+    );
+    return tex;
+  }
+
+  /** In-place reupload of segment data into an existing texture. */
+  private reuploadSegmentTexture(
+    gl: WebGLRenderingContext,
+    tex: WebGLTexture,
+    segments: readonly CubicSegment[],
+  ): void {
+    const fmt = this.segmentFormat;
+    if (!fmt) throw new Error('segmentFormat not initialized');
+    const segCount = segments.length;
+    const texWidth = Math.max(segCount * 2, 1);
+    const floats = new Float32Array(texWidth * 4);
+    for (let i = 0; i < segCount; i++) {
+      const c = segments[i]!;
+      floats[i * 8 + 0] = c[0]!; floats[i * 8 + 1] = c[1]!;
+      floats[i * 8 + 2] = c[2]!; floats[i * 8 + 3] = c[3]!;
+      floats[i * 8 + 4] = c[4]!; floats[i * 8 + 5] = c[5]!;
+      floats[i * 8 + 6] = c[6]!; floats[i * 8 + 7] = c[7]!;
+    }
+    const data = fmt.precision === 'float' ? floats : floatArrayToHalfFloat(floats);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, texWidth, 1, 0,
+      gl.RGBA, fmt.type, data,
+    );
+  }
+
   rebake(mark: Mark): void {
     const gl = this.gl;
     if (!gl || this.disposed) return;
@@ -448,9 +581,12 @@ export class WebGLRenderer implements Renderer {
         `rebake: mark has ${mark.paths.length} paths but renderer was init'd with ${this.textures.length}`,
       );
     }
-    validateMark(mark, MAX_PATHS, MAX_SEGS);
+    validateMark(mark, MAX_PATHS, MAX_LOOP_BOUND);
     for (let i = 0; i < mark.paths.length; i++) {
-      this.runBakeIntoTexture(gl, this.bakeProgram, this.textures[i]!, mark.paths[i]!.segments);
+      const segs = mark.paths[i]!.segments;
+      const segTex = this.segmentTextures[i]!;
+      this.reuploadSegmentTexture(gl, segTex, segs);
+      this.runBakeIntoTexture(gl, this.bakeProgram, this.textures[i]!, segTex, segs.length);
     }
     // Restore the sample program's vertex attrib state — runBakeIntoTexture
     // bound the bake program's a_pos. Calling render() next switches
@@ -477,6 +613,12 @@ export class WebGLRenderer implements Renderer {
   }
 
   private initDirect(gl: WebGLRenderingContext, combined: readonly CubicSegment[]) {
+    if (combined.length > MAX_LOOP_BOUND) {
+      throw new Error(
+        `direct mode has ${combined.length} combined segments but the bake shader's loop bound is ${MAX_LOOP_BOUND}. ` +
+          'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
+      );
+    }
     const program = link(gl, WEBGL_VERT, WEBGL_DIRECT_FRAG);
     if (!program) throw new Error('direct shader failed to link');
     this.directProgram = program;
@@ -485,19 +627,20 @@ export class WebGLRenderer implements Renderer {
     gl.enableVertexAttribArray(posLoc);
     gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
     this.directUniforms = {
-      res:      gl.getUniformLocation(program, 'u_res'),
-      zoom:     gl.getUniformLocation(program, 'u_zoom'),
-      offset:   gl.getUniformLocation(program, 'u_offset'),
-      color:    gl.getUniformLocation(program, 'u_color'),
-      opacity:  gl.getUniformLocation(program, 'u_opacity'),
-      segCount: gl.getUniformLocation(program, 'u_segCount'),
-      segA:     gl.getUniformLocation(program, 'u_segA'),
-      segB:     gl.getUniformLocation(program, 'u_segB'),
+      res:             gl.getUniformLocation(program, 'u_res'),
+      zoom:            gl.getUniformLocation(program, 'u_zoom'),
+      offset:          gl.getUniformLocation(program, 'u_offset'),
+      color:           gl.getUniformLocation(program, 'u_color'),
+      opacity:         gl.getUniformLocation(program, 'u_opacity'),
+      segCount:        gl.getUniformLocation(program, 'u_segCount'),
+      segmentTexWidth: gl.getUniformLocation(program, 'u_segmentTexWidth'),
     };
-    const [segA, segB] = packSegments(combined);
-    gl.uniform4fv(this.directUniforms.segA!, segA);
-    gl.uniform4fv(this.directUniforms.segB!, segB);
+    // u_segments lives on a fixed unit; bind once and rebind the texture
+    // itself per-frame in render().
+    gl.uniform1i(gl.getUniformLocation(program, 'u_segments'), SEGMENT_TEXTURE_UNIT);
+    this.directSegmentTexture = this.uploadSegmentTexture(gl, combined);
     gl.uniform1i(this.directUniforms.segCount!, combined.length);
+    gl.uniform1f(this.directUniforms.segmentTexWidth!, combined.length * 2);
   }
 
   /** Pack `MAX_PATHS` vec2 offsets into {@link pathOffsetBuf}. */
@@ -690,6 +833,10 @@ export class WebGLRenderer implements Renderer {
 
     if (this.directProgram) {
       gl.useProgram(this.directProgram);
+      if (this.directSegmentTexture) {
+        gl.activeTexture(gl.TEXTURE0 + SEGMENT_TEXTURE_UNIT);
+        gl.bindTexture(gl.TEXTURE_2D, this.directSegmentTexture);
+      }
       const dU = this.directUniforms;
       gl.uniform2f(dU.res!, u.width, u.height);
       gl.uniform1f(dU.zoom!, u.zoom);
@@ -711,9 +858,13 @@ export class WebGLRenderer implements Renderer {
       if (this.glassProgram) gl.deleteProgram(this.glassProgram);
       if (this.morphProgram) gl.deleteProgram(this.morphProgram);
       this.textures.forEach((t) => gl.deleteTexture(t));
+      this.segmentTextures.forEach((t) => gl.deleteTexture(t));
+      if (this.directSegmentTexture) gl.deleteTexture(this.directSegmentTexture);
       if (this.backdropTexture) gl.deleteTexture(this.backdropTexture);
       if (this.morphTexA) gl.deleteTexture(this.morphTexA);
       if (this.morphTexB) gl.deleteTexture(this.morphTexB);
+      if (this.morphSegTexA) gl.deleteTexture(this.morphSegTexA);
+      if (this.morphSegTexB) gl.deleteTexture(this.morphSegTexB);
       if (this.buffer) gl.deleteBuffer(this.buffer);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
@@ -724,9 +875,13 @@ export class WebGLRenderer implements Renderer {
     this.glassProgram = null;
     this.morphProgram = null;
     this.textures = [];
+    this.segmentTextures = [];
+    this.directSegmentTexture = null;
     this.backdropTexture = null;
     this.morphTexA = null;
     this.morphTexB = null;
+    this.morphSegTexA = null;
+    this.morphSegTexB = null;
     this.buffer = null;
   }
 }
@@ -740,9 +895,9 @@ export class WebGLRenderer implements Renderer {
 function validateMorphSegments(mark: Mark, label: string): void {
   let total = 0;
   for (const p of mark.paths) total += p.segments.length;
-  if (total > MAX_SEGS) {
+  if (total > MAX_LOOP_BOUND) {
     throw new Error(
-      `${label} has ${total} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+      `${label} has ${total} combined segments but the bake shader's loop bound is ${MAX_LOOP_BOUND}. ` +
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }
@@ -753,26 +908,119 @@ function flattenSegments(mark: Mark, label: string): readonly CubicSegment[] {
   for (const p of mark.paths) {
     for (const s of p.segments) segs.push(s);
   }
-  if (segs.length > MAX_SEGS) {
+  if (segs.length > MAX_LOOP_BOUND) {
     throw new Error(
-      `${label} has ${segs.length} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+      `${label} has ${segs.length} combined segments but the bake shader's loop bound is ${MAX_LOOP_BOUND}. ` +
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }
   return segs;
 }
 
-function packSegments(segments: readonly CubicSegment[]): [Float32Array, Float32Array] {
-  const segA = new Float32Array(MAX_SEGS * 4);
-  const segB = new Float32Array(MAX_SEGS * 4);
-  for (let i = 0; i < segments.length; i++) {
-    const c = segments[i]!;
-    segA[i * 4 + 0] = c[0]!; segA[i * 4 + 1] = c[1]!;
-    segA[i * 4 + 2] = c[2]!; segA[i * 4 + 3] = c[3]!;
-    segB[i * 4 + 0] = c[4]!; segB[i * 4 + 1] = c[5]!;
-    segB[i * 4 + 2] = c[6]!; segB[i * 4 + 3] = c[7]!;
+/**
+ * Pick the highest-precision segment-data texture format the GL context
+ * can support. RGBA32F is preferred (exact storage of cubic control
+ * points); RGBA16F is the fallback. Both formats sample with NEAREST
+ * filtering, so neither *_linear extension is required. The returned
+ * `type` is the GLenum for `texImage2D`'s `type` argument; `precision`
+ * tells callers whether to upload a Float32Array directly or convert to
+ * Uint16 half-float bits first.
+ */
+function pickSegmentFormat(gl: WebGLRenderingContext): SegmentTextureFormat | null {
+  // Probe by attempting to allocate a 1x1 texture in each format. Just
+  // having the extension is necessary but not always sufficient — older
+  // mobile drivers advertise OES_texture_float yet error on actual
+  // upload. The probe is cheap and weeds those out at init.
+  if (gl.getExtension('OES_texture_float')) {
+    if (probeFormat(gl, gl.FLOAT, new Float32Array(4))) {
+      return { type: gl.FLOAT, precision: 'float' };
+    }
   }
-  return [segA, segB];
+  const halfFloat = gl.getExtension('OES_texture_half_float');
+  if (halfFloat) {
+    const HALF_FLOAT_OES = halfFloat.HALF_FLOAT_OES;
+    if (probeFormat(gl, HALF_FLOAT_OES, new Uint16Array(4))) {
+      return { type: HALF_FLOAT_OES, precision: 'half' };
+    }
+  }
+  return null;
+}
+
+function probeFormat(
+  gl: WebGLRenderingContext,
+  type: number,
+  data: ArrayBufferView,
+): boolean {
+  const tex = gl.createTexture();
+  if (!tex) return false;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, type, data);
+  const ok = gl.getError() === gl.NO_ERROR;
+  gl.deleteTexture(tex);
+  return ok;
+}
+
+/**
+ * IEEE-754 binary16 conversion — converts a Float32Array of arbitrary
+ * length to the matching Uint16Array of half-float bits, suitable for
+ * upload via `texImage2D` with `HALF_FLOAT_OES`.
+ *
+ * Cubic control points in this library are normalized to roughly
+ * [-1.2, 1.2], well inside half-float's representable range
+ * (~6.1e-5..65504) and far above its precision floor (~1e-3 in our
+ * range), so no fidelity is lost in practice.
+ */
+const f32Buf = new Float32Array(1);
+const i32Buf = new Uint32Array(f32Buf.buffer);
+function floatArrayToHalfFloat(src: Float32Array): Uint16Array {
+  const out = new Uint16Array(src.length);
+  for (let i = 0; i < src.length; i++) {
+    f32Buf[0] = src[i]!;
+    const x = i32Buf[0]!;
+    const sign = (x >>> 16) & 0x8000;
+    let exp = (x >>> 23) & 0xff;
+    let frac = x & 0x7fffff;
+    if (exp === 0xff) {
+      // NaN or Infinity.
+      out[i] = sign | 0x7c00 | (frac ? 0x200 : 0);
+      continue;
+    }
+    let e = exp - 127 + 15;
+    if (e >= 31) {
+      // Overflow → ±Inf.
+      out[i] = sign | 0x7c00;
+      continue;
+    }
+    if (e <= 0) {
+      if (e < -10) {
+        // Below subnormal range → ±0.
+        out[i] = sign;
+        continue;
+      }
+      // Subnormal — shift in implicit leading 1, round to nearest.
+      frac |= 0x800000;
+      const shift = 1 - e;
+      let halfFrac = frac >>> (shift + 13);
+      if ((frac >>> (shift + 12)) & 1) halfFrac += 1;
+      out[i] = sign | halfFrac;
+      continue;
+    }
+    // Normal — round-to-nearest on the truncated mantissa.
+    let halfFrac = frac >>> 13;
+    if (frac & 0x1000) {
+      halfFrac += 1;
+      if (halfFrac & 0x400) {
+        halfFrac = 0;
+        e += 1;
+        if (e >= 31) {
+          out[i] = sign | 0x7c00;
+          continue;
+        }
+      }
+    }
+    out[i] = sign | (e << 10) | halfFrac;
+  }
+  return out;
 }
 
 function link(gl: WebGLRenderingContext, vs: string, fs: string): WebGLProgram | null {

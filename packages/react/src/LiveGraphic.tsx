@@ -73,7 +73,8 @@ export interface LiveGraphicProps {
    * `effect="morph"`; ignored for other effects.
    *
    * Both shapes' geometry must fit within normalized space (`|x|, |y| ≲ 1`)
-   * and their combined segment counts must each fit under MAX_SEGS.
+   * and their combined segment counts must each fit under the renderer's
+   * per-shape cap.
    */
   to?: string;
   /**

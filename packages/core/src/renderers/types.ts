@@ -146,9 +146,9 @@ export interface RendererInitOptions {
    * Morph mode is exclusive: when `morphTo` is set, the per-path sample
    * and direct pipelines are *not* compiled — the renderer can only draw
    * via the morph pipeline. Each shape's combined segment count must
-   * fit under MAX_SEGS; both shapes must lie within the normalized bake
-   * region (`|x|, |y| ≲ 1`) for the field outside their boundaries to
-   * remain a meaningful Euclidean distance.
+   * fit under the bake shader's loop bound; both shapes must lie within
+   * the normalized bake region (`|x|, |y| ≲ 1`) for the field outside
+   * their boundaries to remain a meaningful Euclidean distance.
    */
   morphTo?: Mark;
 }
@@ -169,8 +169,8 @@ export interface Renderer {
    * The mark's structural shape — number of paths, paint metadata — must
    * match what was passed to {@link init}; only segment positions should
    * differ. Segment counts may differ as long as they stay under the
-   * backend's MAX_SEGS. No GPU resources are allocated; only segment data
-   * is uploaded and the bake pipeline is re-run.
+   * backend's per-shape segment cap. Segment data is re-uploaded into
+   * the existing GPU resources and the bake pipeline is re-run.
    *
    * Optional: backends without a baking step (the WebGL `direct` mode)
    * may treat this as a no-op. Callers should not rely on rebake outside
@@ -206,8 +206,8 @@ export function validateMark(mark: Mark, maxPaths: number, maxSegsPerPath: numbe
     const p: Path = mark.paths[i]!;
     if (p.segments.length > maxSegsPerPath) {
       throw new Error(
-        `path[${i}] has ${p.segments.length} segments but the shader's MAX_SEGS is ${maxSegsPerPath}. ` +
-          'Simplify the trace in Inkscape (Path → Simplify) or raise MAX_SEGS in shaders/webgl.ts.',
+        `path[${i}] has ${p.segments.length} segments but the per-path cap is ${maxSegsPerPath}. ` +
+          'Simplify the trace in Inkscape (Path → Simplify) or merge paths.',
       );
     }
   }

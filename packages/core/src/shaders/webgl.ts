@@ -24,16 +24,6 @@
  */
 
 /**
- * Upper bound on cubic segments per path. Bumped from 32 so one `<path>`
- * element with multiple subpaths merged (the normal SVG pattern for
- * rings/holes/compound shapes — see parseSvgDocument) fits in a single
- * bake. 128 covers the complex SVGs we've tested (gene icons at ~78,
- * connector-line icons at ~51) with headroom. Cost is two 128-slot
- * `vec4` uniform arrays in the bake shader; well under the 256 vector
- * floor that modern WebGL drivers expose.
- */
-export const MAX_SEGS = 128;
-/**
  * Upper bound on paths per mark (== baked SDF textures bound to the
  * sample/glass programs). Raised from 4 so multi-subpath SVGs — shapes
  * with holes, rings, compound icons that use multiple M commands in one
@@ -46,12 +36,41 @@ export const MAX_SEGS = 128;
  */
 export const MAX_PATHS = 16;
 
-/** Shared SDF evaluator, consumes u_segA/u_segB/u_segCount. */
+/**
+ * Per-fragment loop bound for the cubic segment walk. GLSL ES 1.00
+ * requires the loop's upper bound to be a compile-time constant, so we
+ * pick a value generous enough to cover any realistic SVG (Lucide /
+ * Heroicons rarely exceed a few hundred cubics per path; 1024 leaves
+ * room for the morph-combined case and unusual artwork) and let
+ * `u_segCount` drive the runtime exit. Drivers that unroll just compile
+ * the dead tail away.
+ *
+ * Also serves as the validation cap on segments per bake — anything
+ * higher would silently truncate at the runtime break, so we throw at
+ * mark-validation time instead.
+ */
+export const MAX_LOOP_BOUND = 1024;
+
+/**
+ * Shared SDF evaluator. Cubic segments live in a 1-row RGBA float
+ * texture (`u_segments`): for segment `i`, texel `2i` packs `(P0, P1)`
+ * and texel `2i+1` packs `(P2, P3)`. The texture is sampled with
+ * NEAREST filtering, so each fetch returns the exact stored values.
+ *
+ * The runtime `u_segCount` upper-bounds the loop; `MAX_LOOP_BOUND` is a
+ * compile-time ceiling required by the GLSL ES 1.00 spec. The texture
+ * itself has no fixed size — bake-time code allocates exactly
+ * `2 * segCount` texels per shape.
+ */
 const SDF_BODY = /* glsl */ `
-#define MAX_SEGS 128
-uniform int  u_segCount;
-uniform vec4 u_segA[MAX_SEGS];
-uniform vec4 u_segB[MAX_SEGS];
+uniform int       u_segCount;
+uniform sampler2D u_segments;
+uniform float     u_segmentTexWidth;
+
+vec4 fetchSeg(int i) {
+  float u = (float(i) + 0.5) / u_segmentTexWidth;
+  return texture2D(u_segments, vec2(u, 0.5));
+}
 
 vec2 bezier(vec2 p0, vec2 p1, vec2 p2, vec2 p3, float t) {
   float u = 1.0 - t;
@@ -104,10 +123,10 @@ float distToCubic(vec2 p, vec2 p0, vec2 p1, vec2 p2, vec2 p3, inout int crossing
 float sceneSDF(vec2 p) {
   float minD = 1e20;
   int crossings = 0;
-  for (int i = 0; i < MAX_SEGS; i++) {
+  for (int i = 0; i < ${MAX_LOOP_BOUND}; i++) {
     if (i >= u_segCount) break;
-    vec4 a = u_segA[i];
-    vec4 b = u_segB[i];
+    vec4 a = fetchSeg(i * 2);
+    vec4 b = fetchSeg(i * 2 + 1);
     float d = distToCubic(p, a.xy, a.zw, b.xy, b.zw, crossings);
     if (d < minD) minD = d;
   }

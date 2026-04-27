@@ -41,8 +41,8 @@ export function chordLength(seg: CubicSegment): number {
  * If subdivision would push past `maxSegments`, returns the partially-
  * subdivided result and the caller can decide whether to warn. The
  * remaining over-threshold segments stay in place — better to render an
- * imperfectly-bendy long segment than to crash the shader by exceeding
- * MAX_SEGS.
+ * imperfectly-bendy long segment than to exceed the renderer's per-path
+ * cap.
  */
 export function subdividePath(
   path: Path,
@@ -80,10 +80,10 @@ export function subdividePath(
 
 /**
  * Subdivide every path in a mark, capping per-path segment count at
- * `maxSegmentsPerPath` (matches the renderer's MAX_SEGS). Logs a single
- * console warning if any path was truncated mid-subdivision; returns
- * the new mark plus a `truncated` flag so callers can suppress the
- * warning when not desired.
+ * `maxSegmentsPerPath` (matches the renderer's per-path cap). Logs a
+ * single console warning if any path was truncated mid-subdivision;
+ * returns the new mark plus a `truncated` flag so callers can suppress
+ * the warning when not desired.
  */
 export function subdivideMark(
   mark: Mark,
