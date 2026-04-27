@@ -11,93 +11,54 @@ WebGPU primary, WebGL fallback, static SVG when neither is available.
 
 ### [**→ Live demo**](https://axelwp.github.io/)
 
-[![npm version](https://img.shields.io/npm/v/@bezier-sdf/core.svg)](https://www.npmjs.com/package/@bezier-sdf/core)
-
-`npm install @bezier-sdf/core`
+[![@bezier-sdf/react](https://img.shields.io/npm/v/@bezier-sdf/react.svg?label=%40bezier-sdf%2Freact)](https://www.npmjs.com/package/@bezier-sdf/react)
+[![@bezier-sdf/core](https://img.shields.io/npm/v/@bezier-sdf/core.svg?label=%40bezier-sdf%2Fcore)](https://www.npmjs.com/package/@bezier-sdf/core)
+[![license](https://img.shields.io/npm/l/@bezier-sdf/core.svg)](./LICENSE)
 
 </div>
 
 ---
 
-## Why
+## Two ways in
 
-Every vector rendering library in the browser: SVG, Canvas, Pixi, Lottie, you name it, does roughly the same thing under the hood: take Bezier curves, triangulate them on the CPU, upload the triangles to the GPU, rasterize. It works, but it scales badly for animation. Every frame where the shape *changes* needs a fresh tessellation, a fresh upload, and a fresh rasterization. That's why a logo reveal animation in Lottie hits a budget that a static SVG doesn't.
+This repo ships two npm packages. Pick the one that fits your project:
 
-This library takes the other path. The Bezier curves *are* the input to the GPU shader. The shader computes "distance from this pixel to the nearest point on any curve" directly. No triangles, no CPU tessellation, no intermediate mesh. The shape is a [signed distance field](https://iquilezles.org/articles/distfunctions2d/) defined by the curves themselves.
+- **[`@bezier-sdf/react`](./packages/react)** is the headline package: a drop-in `<LiveGraphic>` component. Point it at an SVG URL, get a GPU-rendered silhouette with built-in intro animations, hover effects, ripples, glass material, and shape-to-shape morph. Handles fetch, parse, normalize, DPR, resize, `prefers-reduced-motion`, viewport pause, and static-SVG fallback for you. This is what most people want.
 
-Two consequences:
-
-- **Perfect anti-aliasing at any zoom.** An SDF tells you sub-pixel distance to the edge, so `fwidth`-based AA gives you an edge that's one pixel wide whether the logo is 32px or filling a 4K display.
-- **Animation is free.** Re-rendering with a different transform is just "sample the texture at translated UVs and smooth-union." Your GPU can do 10,000 of those per frame without breathing hard.
-
-The flip side: computing distance to a cubic Bezier is [non-trivial](https://iquilezles.org/articles/distfunctions2d/) (Newton-iterating on a quintic), so the naive shader is expensive. This library bakes each path's SDF into a texture *once* at init — the expensive step happens on the first frame, and every frame after that is a couple of texture samples. You get the animation flexibility without paying the per-pixel cost.
-
-## Features
-
-- **WebGPU renderer** for browsers that support it (Chrome/Edge 113+, Safari 26+, Firefox 141+ on desktop — about 70% of traffic as of 2026).
-- **WebGL 1 renderer** as a universal fallback. Uses half-float render targets when available, falls back to a per-pixel shader if not.
-- **SVG path parser** — feed it the `d` attribute of any `<path>`, get back a normalized array of cubic segments ready for the GPU. Supports `M/L/H/V/C/S/Q/T/Z` (everything Inkscape and Figma emit).
-- **Canvas 2D helpers** for effects that want per-pixel control alongside the SDF: mask-based particle systems, animated stroke outlines, text clipped to the silhouette.
-- **Polyline sampling** for shape-to-shape morphs — sample source and target at the same N points, interpolate, crossfade to exact Beziers for the final frames.
-- **Monorepo** structured for extension: `@bezier-sdf/core` is framework-agnostic; a `@bezier-sdf/react` wrapper and `@bezier-sdf/cli` tool are obvious next additions.
-
-## Repo layout
-
-```
-bezier-sdf/
-├── packages/
-│   └── core/              ← the library (@bezier-sdf/core)
-│       ├── src/
-│       │   ├── geometry/  ← types, SVG parser, sampling, demo mark
-│       │   ├── renderers/ ← WebGPU + WebGL renderer classes
-│       │   ├── shaders/   ← WGSL + GLSL source as string constants
-│       │   └── canvas/    ← Canvas 2D helpers (masks, perturbation)
-│       └── README.md      ← per-package docs / npm-facing
-├── examples/              ← standalone Vite apps demonstrating features
-│   ├── reveal/            ← the split-morph intro animation
-│   ├── fan/               ← breathing outline swarm
-│   ├── cipher/            ← hex-glyph rain clipped to silhouette
-│   ├── root-system/       ← tendrils wrapping the shape
-│   └── morph/             ← shape-to-shape morph (source ≠ target)
-├── docs/                  ← technique writeup, performance notes
-└── skill/                 ← SKILL.md + templates for Claude integration
-```
-
-## Install and run
-
-Requires [pnpm](https://pnpm.io/) and Node 18+.
+- **[`@bezier-sdf/core`](./packages/core)** is the framework-agnostic engine the React component is built on. Use it directly when you need lower-level control (custom render loops, non-React frameworks, your own pointer/scroll bindings, custom shaders). Requires more code and more familiarity with GPU rendering.
 
 ```bash
-pnpm install          # install everything
-pnpm build            # build all packages
-pnpm dev:examples     # run every example in parallel
+npm install @bezier-sdf/react @bezier-sdf/core   # React projects
+npm install @bezier-sdf/core                     # everything else
 ```
 
-Or run a single example:
+## Quick start (React)
 
-```bash
-pnpm --filter @bezier-sdf/example-reveal dev
+```tsx
+import { LiveGraphic } from '@bezier-sdf/react';
+
+export default function Logo() {
+  return <LiveGraphic src="/logo.svg" effect="reveal" color="#ff3a7a" />;
+}
 ```
 
-## Using the library
+That's it. The component fetches `/logo.svg`, parses it, normalizes to the bake region, picks the best available GPU backend, plays a reveal animation when it scrolls into view, and falls back to a static `<svg>` if both backends fail. See the [React package README](./packages/react/README.md) for every effect, prop, and tuning knob.
 
-```bash
-npm install @bezier-sdf/core
-```
+## Quick start (core)
 
-Minimal example — draw the default demo mark on a canvas:
+When you want to drive the renderer yourself:
 
 ```ts
-import { createRenderer, DEMO_MARK } from '@bezier-sdf/core';
+import { createRenderer, parseSvgPath, normalizeMark } from '@bezier-sdf/core';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#logo')!;
 canvas.width = 800;
 canvas.height = 800;
 
-const { renderer } = await createRenderer('auto', {
-  canvas,
-  mark: DEMO_MARK,
-});
+const raw = parseSvgPath('M 297 790 C -35 -10, ... Z M 518 790 C -46 -9, ... Z');
+const { mark } = normalizeMark(raw);
+
+const { renderer } = await createRenderer('auto', { canvas, mark });
 
 renderer.render({
   width: canvas.width,
@@ -110,58 +71,86 @@ renderer.render({
 });
 ```
 
-Your own logo:
+Full API is in the [core package README](./packages/core/README.md).
 
-```ts
-import { createRenderer, parseSvgPath, normalizeMark } from '@bezier-sdf/core';
+## Why
 
-// The `d` attribute of your <path> element, from Inkscape's Plain SVG export.
-const raw = parseSvgPath('M 297 790 C -35 -10, ... Z M 518 790 C -46 -9, ... Z');
-const { mark } = normalizeMark(raw); // center + scale into [-1, 1]
+Most browser vector libraries (SVG, Canvas, Pixi, Lottie) work the same way under the hood: take Bezier curves, triangulate them on the CPU, upload the triangles to the GPU, rasterize. That works for static scenes, but it scales poorly for animation. Every frame where the shape *changes* needs a fresh tessellation, a fresh upload, and a fresh rasterization. A logo reveal in Lottie burns a budget that a static SVG never would.
 
-const { renderer } = await createRenderer('auto', { canvas, mark });
-// ... render as above, one [x, y] offset per mark.paths entry
+This library takes the other path. The Bezier curves *are* the input to the GPU shader, which computes "distance from this pixel to the nearest point on any curve" directly. No triangles, no CPU tessellation, no intermediate mesh. The shape is a [signed distance field](https://iquilezles.org/articles/distfunctions2d/) defined by the curves themselves.
+
+Two consequences:
+
+- **Perfect anti-aliasing at any zoom.** An SDF tells you sub-pixel distance to the edge, so `fwidth`-based AA gives you an edge that's one pixel wide whether the logo is 32px or filling a 4K display.
+- **Animation is cheap.** Re-rendering with a different transform is "sample the texture at translated UVs and smooth-union." Your GPU can do thousands of those per frame without breathing hard.
+
+The catch: computing distance to a cubic Bezier is [non-trivial](https://iquilezles.org/articles/distfunctions2d/) (Newton-iterating on a quintic), so the naive shader is expensive. This library bakes each path's SDF into a texture *once* at init. The expensive step happens on the first frame; every frame after that is a couple of texture samples. You get the animation flexibility without paying the per-pixel cost.
+
+## Packages
+
+| Package | What it is | When to reach for it |
+|---|---|---|
+| [`@bezier-sdf/react`](./packages/react) | Drop-in `<LiveGraphic>` React component with built-in effects (`reveal`, `ripple`, `liquid-cursor`, `liquid-glass`, `morph`), automatic fallback, and Next.js/SSR-friendly patterns. | React apps. The default choice. |
+| [`@bezier-sdf/core`](./packages/core) | Framework-agnostic engine: WebGPU + WebGL renderers, SVG path parser, geometry helpers, Canvas 2D primitives. | Non-React frameworks, custom render loops, building your own component, or extending the renderer. |
+
+## Repo layout
+
 ```
-
-See [`packages/core/README.md`](./packages/core/README.md) for the full API, and [`examples/`](./examples) for runnable integration demos.
+bezier-sdf/
+├── packages/
+│   ├── core/                ← engine: renderers, parser, geometry  (@bezier-sdf/core)
+│   └── react/               ← <LiveGraphic> component              (@bezier-sdf/react)
+├── examples/                ← standalone Vite apps, one per technique
+│   ├── reveal/              ← split-and-merge intro animation
+│   ├── morph/               ← shape-to-shape morph between two SVGs
+│   ├── liquid-cursor/       ← silhouette bulges toward the pointer
+│   ├── liquid-glass/        ← refractive lens material over a backdrop
+│   └── react/               ← <LiveGraphic> playground
+└── docs/
+    └── technique.md         ← the math + the rendering pipeline writeup
+```
 
 ## Examples
 
-Each folder under [`examples/`](./examples) is a standalone Vite app that depends on `@bezier-sdf/core` via the workspace link — edit a core file, the example hot-reloads.
+Each folder under [`examples/`](./examples) is a standalone Vite app that depends on the local packages via the workspace link. Edit a package source file; the example hot-reloads.
 
 <div align="center">
 
 https://github.com/user-attachments/assets/79373986-fb38-4aac-8bc8-e926ca45585c
 
-<sub><code>examples/reveal</code> — run with <code>pnpm --filter @bezier-sdf/example-reveal dev</code></sub>
+<sub><code>examples/reveal</code>. Run with <code>pnpm --filter @bezier-sdf/example-reveal dev</code></sub>
 
 </div>
 
-| Example         | Technique                                                              |
-|-----------------|------------------------------------------------------------------------|
-| `reveal`        | Split-morph intro: sub-paths start merged, slide to final positions on scroll-into-view |
-| `fan`           | A swarm of perturbed outlines, additively blended into a "many outcomes" shape |
-| `cipher`        | Grid of falling hex glyphs clipped to the silhouette, terminal-like  |
-| `root-system`   | Tendrils grow inward from canvas edges, deflecting along the outline |
-| `morph`         | Interpolate between two traced logos using polyline sampling + crossfade |
+| Example          | Technique                                                                 |
+|------------------|---------------------------------------------------------------------------|
+| `reveal`         | Split-and-merge intro: sub-paths start displaced, slide to final positions on scroll-into-view |
+| `morph`          | Hover-driven interpolation between two traced SVGs via combined-SDF lerp  |
+| `liquid-cursor`  | Pointer-tracking inverse-square pull bulges the silhouette toward the cursor |
+| `liquid-glass`   | Refractive glass material with chromatic aberration, frost blur, and Fresnel rim |
+| `react`          | `<LiveGraphic>` playground showing every preset and prop                  |
 
-## Performance
+## Local development
 
-Measured on a 2023 M1 MacBook at 1024×1024, 26 cubic segments total:
+Requires [pnpm](https://pnpm.io/) and Node 18+.
 
-| Mode                 | First frame (bake) | Subsequent frames |
-|----------------------|-------------------:|------------------:|
-| WebGPU baked         | ~8ms              | ~0.5ms            |
-| WebGL baked          | ~14ms             | ~1.1ms            |
-| WebGL direct (fallback) | n/a            | ~3.2ms            |
+```bash
+pnpm install          # install everything
+pnpm build            # build all packages
+pnpm dev:examples     # run every example in parallel
+```
 
-The bake step is a one-time cost at init. Every frame after that is dominated by texture sampling and smooth-min, well under one vblank even at 4K resolution.
+Run a single example:
 
-See [`docs/performance.md`](./docs/performance.md) for the full methodology and comparisons to SVG, Canvas, and Lottie equivalents.
+```bash
+pnpm --filter @bezier-sdf/example-reveal dev
+```
 
 ## Seen in the wild
 
-This library powers the logo reveal on [levx.trade](https://levx.trade) *(replace with your site)* — a chart-line-to-logo morph that demonstrates the polyline sampling pattern in production. Source is closed but the technique is documented in [`docs/technique.md`](./docs/technique.md#the-chart-to-logo-morph-pattern).
+This library powers the logo reveal on [levx.trade](https://levx.trade), a chart-line-to-logo morph that demonstrates the polyline sampling pattern in production. The technique is documented in [`docs/technique.md`](./docs/technique.md#the-chart-to-logo-morph-pattern).
+
+If you ship `@bezier-sdf/*` somewhere public, open a PR adding it here.
 
 ## Contributing
 
@@ -170,6 +159,7 @@ Pull requests welcome, particularly:
 - Additional SVG command support (`A` arc conversion via cubic approximation)
 - Vue / Svelte / Solid bindings as `@bezier-sdf/<framework>` packages
 - More renderer backends (canvas-based offscreen 2D for testing)
+- New built-in effects for `<LiveGraphic>`
 
 ## License
 
