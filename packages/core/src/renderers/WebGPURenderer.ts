@@ -84,6 +84,17 @@ export class WebGPURenderer implements Renderer {
   async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGS);
     if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGS);
+    // Morph bakes both shapes' paths into a single combined segment list
+    // bounded by MAX_SEGS. Run this check BEFORE acquiring the WebGPU
+    // context: getContext('webgpu') irreversibly binds the canvas to
+    // WebGPU, so any subsequent throw poisons the WebGL fallback path
+    // (its getContext('webgl') would return null on the same canvas,
+    // surfacing as a misleading "WebGL not supported"). Validating up
+    // front keeps fallback paths clean.
+    if (morphTo) {
+      validateMorphSegments(mark, 'morph: shape A');
+      validateMorphSegments(morphTo, 'morph: shape B');
+    }
     this._pathCount = morphTo ? 1 : mark.paths.length;
 
     if (!('gpu' in navigator) || !navigator.gpu) {
@@ -716,6 +727,27 @@ export class WebGPURenderer implements Renderer {
     this.morphPipeline = null;
     this.morphBindGroup = null;
     this.sampler = null;
+  }
+}
+
+/**
+ * Cheap pre-flight that mirrors {@link flattenSegments}'s overflow throw
+ * without allocating the segment array. Called from `init()` before any
+ * GPU resources (canvas context, adapter, device) are acquired so that a
+ * too-many-segments error in morph mode can fall back to the WebGL
+ * renderer cleanly — `getContext('webgpu')` permanently binds the
+ * canvas, so a throw after that point would surface as the misleading
+ * "WebGL not supported" when the fallback's `getContext('webgl')`
+ * returns null.
+ */
+function validateMorphSegments(mark: Mark, label: string): void {
+  let total = 0;
+  for (const p of mark.paths) total += p.segments.length;
+  if (total > MAX_SEGS) {
+    throw new Error(
+      `${label} has ${total} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+        'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
+    );
   }
 }
 

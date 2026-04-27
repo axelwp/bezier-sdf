@@ -76,6 +76,14 @@ export class WebGLRenderer implements Renderer {
   async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGS);
     if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGS);
+    // Combined-segment bound applies to both shapes in morph mode. Check
+    // it BEFORE getContext binds the canvas — see WebGPURenderer for the
+    // rationale (the symmetric concern there is poisoning the canvas for
+    // the cross-backend fallback; here it preserves a clean throw path).
+    if (morphTo) {
+      validateMorphSegments(mark, 'morph: shape A');
+      validateMorphSegments(morphTo, 'morph: shape B');
+    }
 
     const gl = canvas.getContext('webgl', {
       antialias: true,
@@ -720,6 +728,23 @@ export class WebGLRenderer implements Renderer {
     this.morphTexA = null;
     this.morphTexB = null;
     this.buffer = null;
+  }
+}
+
+/**
+ * Pre-flight check used by `init()` before `getContext('webgl')` runs —
+ * see the symmetric helper in {@link WebGPURenderer} for the rationale
+ * (avoid binding the canvas only to throw mid-init, which would mask
+ * the real cause behind a fallback's "WebGL not supported").
+ */
+function validateMorphSegments(mark: Mark, label: string): void {
+  let total = 0;
+  for (const p of mark.paths) total += p.segments.length;
+  if (total > MAX_SEGS) {
+    throw new Error(
+      `${label} has ${total} combined segments but the bake shader's MAX_SEGS is ${MAX_SEGS}. ` +
+        'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
+    );
   }
 }
 

@@ -917,6 +917,10 @@ function App() {
   const onLogoError = useCallback((err: Error) => {
     if (errorFiredRef.current) return;
     errorFiredRef.current = true;
+    // Surface the full error (stack + any .cause / .gpuCause) to the
+    // console so it's copyable; the toast only renders err.message.
+    // eslint-disable-next-line no-console
+    console.error('[bezier-sdf] live-graphic error:', err);
     showToast(err.message, 'error');
     if (blobUrlRef.current) reset();
   }, [showToast, reset]);
