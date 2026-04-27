@@ -2,6 +2,7 @@ import {
   createRenderer,
   DEMO_MARK,
   makePath,
+  prepareMorphPair,
   type CubicSegment,
   type Mark,
   type Uniforms,
@@ -46,10 +47,16 @@ async function main() {
   const SHAPE_A = DEMO_MARK;
   const SHAPE_B = squareMark(0.62);
 
+  // Flatten-then-bake morph pipeline: each side gets concatenated into
+  // a single combined SDF at init. prepareMorphPair just enforces the
+  // per-side path-count cap; demo shapes are well under the cap so it's
+  // a passthrough — kept for parity with the React component's call site.
+  const { markA, markB } = prepareMorphPair(SHAPE_A, SHAPE_B);
+
   const { renderer, actualKind, fallbackFrom } = await createRenderer('auto', {
     canvas,
-    mark: SHAPE_A,
-    morphTo: SHAPE_B,
+    mark: markA,
+    morphTo: markB,
   });
   if (fallbackFrom) {
     console.info('[morph] fell back to WebGL:', fallbackFrom.error.message);
@@ -75,7 +82,11 @@ async function main() {
     pathOffsets: [],
     color: [0, 0, 0],
     opacity: 1,
-    morph: { t: mt, colorA: COLOR_A, colorB: COLOR_B },
+    morph: {
+      t: mt,
+      colorA: COLOR_A,
+      colorB: COLOR_B,
+    },
   });
 
   const tick = (now: number) => {

@@ -28,6 +28,7 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 | `'reveal'` | Scroll-into-view, or `autoPlay` | Split-and-merge intro animation. Plays once per mount; use the [imperative handle](#imperative-handle) to replay. |
 | `'ripple'` | Pointer down on the canvas | Gaussian shockwave ring through the silhouette. Up to 4 concurrent rings. |
 | `'liquid-cursor'` | Pointer over the canvas | Silhouette bulges toward the pointer. Stroked paths thicken and warp under the cursor ("wet paint" model). |
+| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; pair with [`toFillColor`](#props-reference) for color animation. Works with mixed fill/stroke SVGs — stroked subpaths bake as sausage SDFs and union cleanly with filled paths. See [Morph](#morph-1). |
 | `'liquid-glass'` | none | Legacy alias for `material='glass'`. Prefer the [`material`](#material) prop for glass, and use the spec object form to tune. |
 
 ```tsx
@@ -89,6 +90,14 @@ Every parameter is optional; defaults are listed below. Live-updates: changing a
 | `pull` | `number` | `0.08` | Peak SDF deformation at the cursor. Higher = more aggressive bulge. |
 | `radius` | `number` | `0.15` | Gaussian sigma of the pull falloff. This is the spatial extent of the deformation. |
 | `lerp` | `number` | `0.5` | Per-frame smoothing factor (0..1) between raw pointer and rendered cursor position. Lower = laggier, smoother trails. |
+
+#### `morph`
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `rate` | `number` | `15` | Exponential approach rate (units `1/s`). Smoothed `t` follows the hover target via `t += (target - t) * (1 - exp(-rate*dt))`. Default reaches ~95% in ~200 ms — snappy but not jarring. Lower for more languid morphs. |
+
+See [Morph](#morph-1) for usage and the related `to` / `toFillColor` / `fillRule` props.
 
 #### `liquid-glass`
 
@@ -170,6 +179,44 @@ Why blur? Refraction sampling reads a different pixel per destination fragment. 
 
 Stroked paths render as illuminated glass filaments rather than refracting lenses. A 2–4px sausage doesn't have enough interior area for the full glass effect to read as lens-like. Both aesthetics are valid: filled SVGs give you lens refraction, stroked SVGs give you glass-tube lighting.
 
+## Morph
+
+Hover-driven interpolation between two SVGs. The component loads both `src` and `to`, bakes each into a single combined SDF (one texture per side), and the morph shader linearly interpolates the two distance fields per pixel. The result is one unified silhouette that flows from shape A to shape B as the pointer enters the canvas, and back out as it leaves.
+
+```tsx
+<LiveGraphic
+  src="/icons/circle.svg"
+  to="/icons/star.svg"
+  effect="morph"
+  color="#22d3ee"
+  toFillColor="#f472b6"
+/>
+```
+
+Behavioral details:
+
+- **Single silhouette.** Per-path colors and document order are intentionally collapsed; the morph paints the whole shape with `color` at `t=0` lerping to `toFillColor` at `t=1`. Pass only `color` (omit `toFillColor`) for a single-color morph with no color animation.
+- **Mixed fill + stroke is supported.** Stroked subpaths inside either shape bake as sausage SDFs (`|d| − strokeWidth/2`) and union with filled paths cleanly. Open subpaths in stroked SVGs (e.g. eyebrows or a mouth line in a smiley icon) no longer leak parity-garbage wisps into the silhouette.
+- **Reduced motion.** Stays at `t = 0` (shape A) and skips the rAF loop entirely.
+- **Fill rule.** The bake uses [`fillRule`](#props-reference) (default `'nonzero'`) to decide how each path's interior is determined. The default avoids cross-path fill artifacts in multi-path icons; switch to `'evenodd'` only when the source artwork relies on global subtractive parity (rare).
+
+### Morph parameters
+
+See the [`morph`](#morph) effect parameter table above for the `rate` knob. Pass it via the spec form:
+
+```tsx
+<LiveGraphic
+  src="/a.svg"
+  to="/b.svg"
+  effect={{ name: 'morph', rate: 8 }}
+/>
+```
+
+### Limits
+
+- Up to 16 paths per side. Beyond that, trailing paths are merged into the last allowed slot (warned via `console.warn`).
+- Per-side combined segment count must fit the renderer's bake-shader cap (1024 cubics on both backends). Throws at init time with a clear message if exceeded — flatten arcs / simplify paths in your source SVG.
+
 ## Imperative handle
 
 Forward a ref to `LiveGraphic` to replay animations on demand:
@@ -199,6 +246,9 @@ function ReplayableLogo() {
 | `color` | `string` | *none* | Optional global color override. When set, every path is painted with this color (legacy smin mode). Omit to honor the SVG's per-path fill/stroke. Ignored when `material='glass'`. |
 | `opacity` | `number` | `1` | 0..1 multiplier applied on top of any per-effect opacity. |
 | `effect` | `LiveGraphicEffectProp` | `'none'` | Single preset name, spec object, or array of either. See [Effects](#effects). |
+| `to` | `string` | *none* | Target SVG URL for `effect='morph'`. The morph bakes both shapes into a unified-silhouette SDF and lerps. |
+| `toFillColor` | `string` | *start color* | End color for the morph at `t=1`. Pair with `color` (start color at `t=0`). |
+| `fillRule` | `'nonzero' \| 'evenodd'` | `'nonzero'` | Morph bake fill rule. Default is SVG's default and avoids cross-path fill artifacts in multi-path icons. Switch to `'evenodd'` only when the source artwork relies on cross-path subtractive even-odd semantics (a "donut" SVG drawn as outer + inner contour subtracted via global parity). Other shapes lose their inner subtraction in `'evenodd'` so prefer the default. |
 | `autoPlay` | `boolean` | `false` | For `reveal`: skip the scroll-into-view wait and play on mount. Ignored by reactive effects. |
 | `material` | `'glass'` | *none* | Switch the silhouette pipeline to a material shader. Composes with frame-based effects. See [Material](#material). |
 | `backdrop` | `string \| HTMLImageElement \| HTMLCanvasElement \| ImageBitmap` | *none* | Image to refract when glass is active. Required whenever glass is active. |
@@ -273,6 +323,7 @@ import {
   type RippleParams,
   type LiquidCursorParams,
   type LiquidGlassParams,
+  type MorphParams,
   type StaticFallbackProps,
 } from '@bezier-sdf/react';
 ```

@@ -1,4 +1,5 @@
 import type { Mark, Path, CubicSegment, RgbColor } from '../geometry/types';
+import { MORPH_MAX_PATHS, prepareMorphPair } from '../geometry/morphPair';
 import {
   MAX_LOOP_BOUND,
   MAX_PATHS,
@@ -64,10 +65,13 @@ export class WebGLRenderer implements Renderer {
   private directProgram: WebGLProgram | null = null;
   private glassProgram: WebGLProgram | null = null;
   private morphProgram: WebGLProgram | null = null;
+  /** Single combined-SDF for morph shape A (flatten-then-bake). */
   private morphTexA: WebGLTexture | null = null;
+  /** Single combined-SDF for morph shape B. */
   private morphTexB: WebGLTexture | null = null;
-  private morphSegTexA: WebGLTexture | null = null;
-  private morphSegTexB: WebGLTexture | null = null;
+  /** Per-side segment-data textures (one for A, one for B). Tracked so
+   *  dispose can free GPU memory. */
+  private morphSegmentTextures: WebGLTexture[] = [];
   private morphUniforms: Record<string, WebGLUniformLocation | null> = {};
   private textures: WebGLTexture[] = [];
   /** Per-path segment-data textures, parallel to {@link textures}. Each
@@ -90,6 +94,13 @@ export class WebGLRenderer implements Renderer {
   private pathModeBuf = new Int32Array(MAX_PATHS);
   private pathScalarBuf = new Float32Array(MAX_PATHS);
   private pathVec3Buf = new Float32Array(MAX_PATHS * 3);
+  /** Scratch buffer for u_pathEnds[] uploads — sized to the shader's
+   *  fixed array length so we don't allocate at bake time. */
+  private bakePathEndsBuf = new Int32Array(MAX_PATHS);
+  /** Scratch buffers for the per-path stroke uniforms in the bake
+   *  shader. Same sizing rationale as bakePathEndsBuf. */
+  private bakePathModeBuf = new Int32Array(MAX_PATHS);
+  private bakePathHalfWBuf = new Float32Array(MAX_PATHS);
   private halfFloatType = 0;
   /** Format used for the segment-data texture. RGBA32F if
    *  OES_texture_float is supported, else RGBA16F (which is also what
@@ -99,16 +110,18 @@ export class WebGLRenderer implements Renderer {
   get mode(): 'baked' | 'direct' { return this._mode; }
   get pathCount(): number { return this._pathCount; }
 
-  async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
+  async init({ canvas, mark, backdrop, morphTo, morphFillRule }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_LOOP_BOUND);
     if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_LOOP_BOUND);
-    // Combined-segment bound applies to both shapes in morph mode. Check
-    // it BEFORE getContext binds the canvas — see WebGPURenderer for the
-    // rationale (the symmetric concern there is poisoning the canvas for
-    // the cross-backend fallback; here it preserves a clean throw path).
+    // Morph flatten-then-bake: the combined segments per side go through
+    // the bake shader's loop, so the *total* segment count per side must
+    // fit MAX_LOOP_BOUND. Run before getContext binds the canvas — see
+    // WebGPURenderer for the rationale (preserves a clean throw path for
+    // the cross-backend fallback).
     if (morphTo) {
-      validateMorphSegments(mark, 'morph: shape A');
-      validateMorphSegments(morphTo, 'morph: shape B');
+      const prep = prepareMorphPair(mark, morphTo);
+      validateCombined(prep.markA, 'A');
+      validateCombined(prep.markB, 'B');
     }
 
     const gl = canvas.getContext('webgl', {
@@ -164,7 +177,7 @@ export class WebGLRenderer implements Renderer {
       // Morph mode is exclusive: skip the per-path sample/direct pipelines
       // and only bake the two combined SDFs needed by the morph shader.
       this._pathCount = 1;
-      if (!this.initMorph(gl, mark, morphTo)) {
+      if (!this.initMorph(gl, mark, morphTo, morphFillRule ?? 'nonzero')) {
         throw new Error(
           'morph effect requires half-float texture extensions (unavailable in this context)',
         );
@@ -195,10 +208,12 @@ export class WebGLRenderer implements Renderer {
     }
   }
 
-  private initMorph(gl: WebGLRenderingContext, markA: Mark, markB: Mark): boolean {
-    const segsA = flattenSegments(markA, 'morph: shape A');
-    const segsB = flattenSegments(markB, 'morph: shape B');
-
+  private initMorph(
+    gl: WebGLRenderingContext,
+    markA: Mark,
+    markB: Mark,
+    fillRule: 'nonzero' | 'evenodd',
+  ): boolean {
     const halfFloat = gl.getExtension('OES_texture_half_float');
     const colorBuf = gl.getExtension('EXT_color_buffer_half_float');
     const halfFloatLinear = gl.getExtension('OES_texture_half_float_linear');
@@ -209,32 +224,50 @@ export class WebGLRenderer implements Renderer {
     if (!this.initBakeProgram(gl)) return false;
     const bakeProgram = this.bakeProgram!;
 
-    this.morphSegTexA = this.uploadSegmentTexture(gl, segsA);
-    this.morphSegTexB = this.uploadSegmentTexture(gl, segsB);
+    const prep = prepareMorphPair(markA, markB);
+    const fillRuleCode = fillRule === 'evenodd' ? 1 : 0;
 
-    const texA = this.bakeOne(gl, bakeProgram, this.morphSegTexA, segsA.length, HALF_FLOAT_OES);
-    const texB = this.bakeOne(gl, bakeProgram, this.morphSegTexB, segsB.length, HALF_FLOAT_OES);
-    if (!texA || !texB) {
-      if (texA) gl.deleteTexture(texA);
-      if (texB) gl.deleteTexture(texB);
-      gl.deleteTexture(this.morphSegTexA);
-      gl.deleteTexture(this.morphSegTexB);
-      this.morphSegTexA = null;
-      this.morphSegTexB = null;
-      gl.deleteProgram(bakeProgram);
-      this.bakeProgram = null;
-      return false;
-    }
+    // Flatten each side's paths into one combined segment list and bake
+    // into a single SDF using the per-path even-odd / global even-odd
+    // logic gated by `fillRuleCode`. pathEnds[i] is the cumulative
+    // segment count up through path i (exclusive end). pathModes /
+    // pathHalfW carry the per-path render mode so stroked paths bake as
+    // sausage SDFs rather than going through (meaningless) even-odd
+    // parity over their open subpaths.
+    const flatA = flattenForBake(prep.markA);
+    const flatB = flattenForBake(prep.markB);
+    const segTextures: WebGLTexture[] = [];
+    const cleanup = (texs: Array<WebGLTexture | null>) => {
+      texs.forEach((t) => t && gl.deleteTexture(t));
+      segTextures.forEach((t) => gl.deleteTexture(t));
+    };
+    const segA = this.uploadSegmentTexture(gl, flatA.segments);
+    segTextures.push(segA);
+    const texA = this.bakeOne(
+      gl, bakeProgram, segA, flatA.segments.length, HALF_FLOAT_OES,
+      flatA.pathEnds, fillRuleCode, flatA.pathModes, flatA.pathHalfW,
+    );
+    if (!texA) { cleanup([]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
+
+    const segB = this.uploadSegmentTexture(gl, flatB.segments);
+    segTextures.push(segB);
+    const texB = this.bakeOne(
+      gl, bakeProgram, segB, flatB.segments.length, HALF_FLOAT_OES,
+      flatB.pathEnds, fillRuleCode, flatB.pathModes, flatB.pathHalfW,
+    );
+    if (!texB) { cleanup([texA]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
     this.morphTexA = texA;
     this.morphTexB = texB;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.morphSegmentTextures = segTextures;
 
     const program = link(gl, WEBGL_VERT, WEBGL_MORPH_FRAG);
     if (!program) {
-      gl.deleteTexture(texA);
-      gl.deleteTexture(texB);
+      cleanup([texA, texB]);
       this.morphTexA = null;
       this.morphTexB = null;
+      this.morphSegmentTextures = [];
       gl.deleteProgram(bakeProgram);
       this.bakeProgram = null;
       return false;
@@ -247,21 +280,15 @@ export class WebGLRenderer implements Renderer {
 
     const loc = (n: string) => gl.getUniformLocation(program, n);
     this.morphUniforms = {
-      res:         loc('u_res'),
-      zoom:        loc('u_zoom'),
-      offset:      loc('u_offset'),
-      opacity:     loc('u_opacity'),
-      bound:       loc('u_bound'),
-      morphT:      loc('u_morphT'),
-      colorA:      loc('u_colorA'),
-      colorB:      loc('u_colorB'),
-      aIsStroked:  loc('u_aIsStroked'),
-      bIsStroked:  loc('u_bIsStroked'),
-      aHalfWidth:  loc('u_aHalfWidth'),
-      bHalfWidth:  loc('u_bHalfWidth'),
+      res:     loc('u_res'),
+      zoom:    loc('u_zoom'),
+      offset:  loc('u_offset'),
+      opacity: loc('u_opacity'),
+      bound:   loc('u_bound'),
+      morphT:  loc('u_morphT'),
+      colorA:  loc('u_colorA'),
+      colorB:  loc('u_colorB'),
     };
-    // SDF textures live on units 0 and 1 — set once, render() only rebinds
-    // the textures themselves.
     gl.uniform1i(loc('u_sdfA'), 0);
     gl.uniform1i(loc('u_sdfB'), 1);
     gl.uniform1f(this.morphUniforms.bound!, WEBGL_BAKE_BOUND);
@@ -425,6 +452,10 @@ export class WebGLRenderer implements Renderer {
     segmentTex: WebGLTexture,
     segCount: number,
     halfFloatType: number,
+    pathEnds: readonly number[] = [segCount],
+    fillRule: number = 0,
+    pathModes: readonly number[] = [0],
+    pathHalfW: readonly number[] = [0],
   ): WebGLTexture | null {
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -437,7 +468,10 @@ export class WebGLRenderer implements Renderer {
       gl.RGBA, halfFloatType, null,
     );
 
-    if (!this.runBakeIntoTexture(gl, bakeProgram, tex, segmentTex, segCount)) {
+    if (!this.runBakeIntoTexture(
+      gl, bakeProgram, tex, segmentTex, segCount, pathEnds, fillRule,
+      pathModes, pathHalfW,
+    )) {
       gl.deleteTexture(tex);
       return null;
     }
@@ -458,6 +492,10 @@ export class WebGLRenderer implements Renderer {
     tex: WebGLTexture,
     segmentTex: WebGLTexture,
     segCount: number,
+    pathEnds: readonly number[] = [segCount],
+    fillRule: number = 0,
+    pathModes: readonly number[] = [0],
+    pathHalfW: readonly number[] = [0],
   ): boolean {
     const fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -479,6 +517,20 @@ export class WebGLRenderer implements Renderer {
     gl.uniform1f(bU.bound!, WEBGL_BAKE_BOUND);
     gl.uniform1i(bU.segCount!, segCount);
     gl.uniform1f(bU.segmentTexWidth!, segCount * 2);
+    gl.uniform1i(bU.pathCount!, pathEnds.length);
+    gl.uniform1i(bU.fillRule!, fillRule);
+    // Pad arrays to MAX_PATHS so the uniforms are fully written; trailing
+    // entries are never read because the shader's outer loop bounds on
+    // u_pathCount, but GLSL requires the full array storage to be valid.
+    const ends = this.bakePathEndsBuf;
+    for (let i = 0; i < MAX_PATHS; i++) ends[i] = pathEnds[i] ?? 0;
+    gl.uniform1iv(bU.pathEnds!, ends);
+    const modes = this.bakePathModeBuf;
+    for (let i = 0; i < MAX_PATHS; i++) modes[i] = pathModes[i] ?? 0;
+    gl.uniform1iv(bU.pathMode!, modes);
+    const halfW = this.bakePathHalfWBuf;
+    for (let i = 0; i < MAX_PATHS; i++) halfW[i] = pathHalfW[i] ?? 0;
+    gl.uniform1fv(bU.pathHalfW!, halfW);
     gl.viewport(0, 0, WEBGL_BAKE_SIZE, WEBGL_BAKE_SIZE);
     gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0);
@@ -502,6 +554,11 @@ export class WebGLRenderer implements Renderer {
       bound:           gl.getUniformLocation(program, 'u_bound'),
       segCount:        gl.getUniformLocation(program, 'u_segCount'),
       segmentTexWidth: gl.getUniformLocation(program, 'u_segmentTexWidth'),
+      pathCount:       gl.getUniformLocation(program, 'u_pathCount'),
+      pathEnds:        gl.getUniformLocation(program, 'u_pathEnds[0]'),
+      pathMode:        gl.getUniformLocation(program, 'u_pathMode[0]'),
+      pathHalfW:       gl.getUniformLocation(program, 'u_pathHalfW[0]'),
+      fillRule:        gl.getUniformLocation(program, 'u_fillRule'),
     };
     // u_segments lives on a fixed unit; set it once so render-time only
     // has to bind the texture itself.
@@ -634,6 +691,9 @@ export class WebGLRenderer implements Renderer {
       opacity:         gl.getUniformLocation(program, 'u_opacity'),
       segCount:        gl.getUniformLocation(program, 'u_segCount'),
       segmentTexWidth: gl.getUniformLocation(program, 'u_segmentTexWidth'),
+      pathCount:       gl.getUniformLocation(program, 'u_pathCount'),
+      pathEnds:        gl.getUniformLocation(program, 'u_pathEnds[0]'),
+      fillRule:        gl.getUniformLocation(program, 'u_fillRule'),
     };
     // u_segments lives on a fixed unit; bind once and rebind the texture
     // itself per-frame in render().
@@ -641,6 +701,18 @@ export class WebGLRenderer implements Renderer {
     this.directSegmentTexture = this.uploadSegmentTexture(gl, combined);
     gl.uniform1i(this.directUniforms.segCount!, combined.length);
     gl.uniform1f(this.directUniforms.segmentTexWidth!, combined.length * 2);
+    // Direct mode keeps legacy global even-odd semantics: it's the
+    // half-float-unavailable fallback, single-color, no animation, and
+    // the smoothed fill rule swap could change static silhouettes for
+    // existing users in subtle ways. fillRule=1 (evenodd) preserves the
+    // original behavior; pathCount/pathEnds are unread in that branch
+    // but the uniforms must still be bound to keep GLSL happy.
+    gl.uniform1i(this.directUniforms.pathCount!, 1);
+    const ends = this.bakePathEndsBuf;
+    ends.fill(0);
+    ends[0] = combined.length;
+    gl.uniform1iv(this.directUniforms.pathEnds!, ends);
+    gl.uniform1i(this.directUniforms.fillRule!, 1);
   }
 
   /** Pack `MAX_PATHS` vec2 offsets into {@link pathOffsetBuf}. */
@@ -707,14 +779,10 @@ export class WebGLRenderer implements Renderer {
       gl.uniform2f(mU.offset!, u.offsetX, u.offsetY);
       gl.uniform1f(mU.opacity!, u.opacity);
       gl.uniform1f(mU.morphT!, u.morph.t);
-      const ca = u.morph.colorA;
-      const cb = u.morph.colorB;
-      gl.uniform3f(mU.colorA!, ca[0], ca[1], ca[2]);
-      gl.uniform3f(mU.colorB!, cb[0], cb[1], cb[2]);
-      gl.uniform1f(mU.aIsStroked!, u.morph.aIsStroked ? 1 : 0);
-      gl.uniform1f(mU.bIsStroked!, u.morph.bIsStroked ? 1 : 0);
-      gl.uniform1f(mU.aHalfWidth!, u.morph.aHalfWidth ?? 0);
-      gl.uniform1f(mU.bHalfWidth!, u.morph.bHalfWidth ?? 0);
+      const cA = u.morph.colorA;
+      const cB = u.morph.colorB;
+      gl.uniform3f(mU.colorA!, cA[0], cA[1], cA[2]);
+      gl.uniform3f(mU.colorB!, cB[0], cB[1], cB[2]);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
@@ -863,8 +931,7 @@ export class WebGLRenderer implements Renderer {
       if (this.backdropTexture) gl.deleteTexture(this.backdropTexture);
       if (this.morphTexA) gl.deleteTexture(this.morphTexA);
       if (this.morphTexB) gl.deleteTexture(this.morphTexB);
-      if (this.morphSegTexA) gl.deleteTexture(this.morphSegTexA);
-      if (this.morphSegTexB) gl.deleteTexture(this.morphSegTexB);
+      this.morphSegmentTextures.forEach((t) => gl.deleteTexture(t));
       if (this.buffer) gl.deleteBuffer(this.buffer);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
@@ -880,41 +947,52 @@ export class WebGLRenderer implements Renderer {
     this.backdropTexture = null;
     this.morphTexA = null;
     this.morphTexB = null;
-    this.morphSegTexA = null;
-    this.morphSegTexB = null;
+    this.morphSegmentTextures = [];
     this.buffer = null;
   }
 }
 
 /**
- * Pre-flight check used by `init()` before `getContext('webgl')` runs —
- * see the symmetric helper in {@link WebGPURenderer} for the rationale
- * (avoid binding the canvas only to throw mid-init, which would mask
- * the real cause behind a fallback's "WebGL not supported").
+ * Concatenate every path's segments into one array and produce the
+ * cumulative `pathEnds[i]` (exclusive end indices), per-path render
+ * modes, and per-path stroke half-widths the bake shader needs to walk
+ * the combined buffer with the correct per-path semantics. Stroked
+ * paths (mode === 'stroke') bake as sausage SDFs; fills and 'both' use
+ * even-odd parity.
  */
-function validateMorphSegments(mark: Mark, label: string): void {
+function flattenForBake(mark: Mark): {
+  segments: CubicSegment[];
+  pathEnds: number[];
+  pathModes: number[];
+  pathHalfW: number[];
+} {
+  const segments: CubicSegment[] = [];
+  const pathEnds: number[] = [];
+  const pathModes: number[] = [];
+  const pathHalfW: number[] = [];
+  for (const p of mark.paths) {
+    for (const s of p.segments) segments.push(s);
+    pathEnds.push(segments.length);
+    pathModes.push(p.mode === 'stroke' ? 1 : 0);
+    pathHalfW.push(p.mode === 'fill' ? 0 : p.strokeWidth * 0.5);
+  }
+  return { segments, pathEnds, pathModes, pathHalfW };
+}
+
+/**
+ * Validate that a flattened morph side fits the bake shader's combined
+ * loop bound. Throws with a clear message at init time so users hit it
+ * before getContext binds the canvas (clean fallback path).
+ */
+function validateCombined(mark: Mark, label: 'A' | 'B'): void {
   let total = 0;
   for (const p of mark.paths) total += p.segments.length;
   if (total > MAX_LOOP_BOUND) {
     throw new Error(
-      `${label} has ${total} combined segments but the bake shader's loop bound is ${MAX_LOOP_BOUND}. ` +
+      `morph shape ${label} has ${total} combined segments but the bake shader's loop bound is ${MAX_LOOP_BOUND}. ` +
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }
-}
-
-function flattenSegments(mark: Mark, label: string): readonly CubicSegment[] {
-  const segs: CubicSegment[] = [];
-  for (const p of mark.paths) {
-    for (const s of p.segments) segs.push(s);
-  }
-  if (segs.length > MAX_LOOP_BOUND) {
-    throw new Error(
-      `${label} has ${segs.length} combined segments but the bake shader's loop bound is ${MAX_LOOP_BOUND}. ` +
-        'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
-    );
-  }
-  return segs;
 }
 
 /**

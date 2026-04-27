@@ -1,14 +1,19 @@
 import type { CubicSegment, Mark, Path, RgbColor } from '../geometry/types';
+import { MORPH_MAX_PATHS, prepareMorphPair } from '../geometry/morphPair';
 import {
   MAX_PATHS,
   WEBGPU_BACKDROP_BINDING,
+  WEBGPU_BAKE_OFFSETS,
   WEBGPU_BAKE_SHADER,
   WEBGPU_BAKE_BOUND,
   WEBGPU_BAKE_SIZE,
+  WEBGPU_BAKE_UNIFORM_SIZE,
   WEBGPU_GLASS_OFFSETS,
   WEBGPU_GLASS_SHADER,
   WEBGPU_GLASS_UNIFORM_SIZE,
   WEBGPU_MORPH_OFFSETS,
+  WEBGPU_MORPH_SDF_A_BINDING,
+  WEBGPU_MORPH_SDF_B_BINDING,
   WEBGPU_MORPH_SHADER,
   WEBGPU_MORPH_UNIFORM_SIZE,
   WEBGPU_SAMPLE_OFFSETS,
@@ -77,6 +82,7 @@ export class WebGPURenderer implements Renderer {
   private morphPipeline: GPURenderPipeline | null = null;
   private morphUniformBuffer: GPUBuffer | null = null;
   private morphBindGroup: GPUBindGroup | null = null;
+  /** Single combined SDF for morph shape A (flatten-then-bake). */
   private morphTexA: GPUTexture | null = null;
   private morphTexB: GPUTexture | null = null;
   private morphUniformData = new ArrayBuffer(WEBGPU_MORPH_UNIFORM_SIZE);
@@ -86,19 +92,19 @@ export class WebGPURenderer implements Renderer {
   readonly mode = 'baked' as const;
   get pathCount(): number { return this._pathCount; }
 
-  async init({ canvas, mark, backdrop, morphTo }: RendererInitOptions): Promise<void> {
+  async init({ canvas, mark, backdrop, morphTo, morphFillRule }: RendererInitOptions): Promise<void> {
     validateMark(mark, MAX_PATHS, MAX_SEGMENTS_PER_SHAPE);
     if (morphTo) validateMark(morphTo, MAX_PATHS, MAX_SEGMENTS_PER_SHAPE);
-    // Morph bakes both shapes' paths into a single combined segment list
-    // bounded by MAX_SEGMENTS_PER_SHAPE. Run this check BEFORE acquiring the WebGPU
-    // context: getContext('webgpu') irreversibly binds the canvas to
-    // WebGPU, so any subsequent throw poisons the WebGL fallback path
-    // (its getContext('webgl') would return null on the same canvas,
-    // surfacing as a misleading "WebGL not supported"). Validating up
+    // Morph flattens each side into a single combined SDF, so the
+    // *total* segment count per side must fit MAX_SEGMENTS_PER_SHAPE.
+    // Run this check BEFORE acquiring the WebGPU context: getContext
+    // ('webgpu') irreversibly binds the canvas to WebGPU, so any
+    // subsequent throw poisons the WebGL fallback path. Validating up
     // front keeps fallback paths clean.
     if (morphTo) {
-      validateMorphSegments(mark, 'morph: shape A');
-      validateMorphSegments(morphTo, 'morph: shape B');
+      const prep = prepareMorphPair(mark, morphTo);
+      validateCombined(prep.markA, 'A');
+      validateCombined(prep.markB, 'B');
     }
     this._pathCount = morphTo ? 1 : mark.paths.length;
 
@@ -141,6 +147,7 @@ export class WebGPURenderer implements Renderer {
     const bakeBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       ],
     });
     const bakePipeline = device.createRenderPipeline({
@@ -156,13 +163,22 @@ export class WebGPURenderer implements Renderer {
       // Morph mode is exclusive: bake the two combined SDFs and compile
       // only the morph pipeline. Per-path sample / glass pipelines are
       // not created.
-      this.initMorph(device, mark, morphTo);
+      this.initMorph(device, mark, morphTo, morphFillRule ?? 'nonzero');
       return;
     }
 
     this.textures = mark.paths.map((p) => this.allocBakeTexture(device));
     for (let i = 0; i < mark.paths.length; i++) {
-      this.runBakeIntoTexture(device, this.textures[i]!, mark.paths[i]!);
+      const segs = mark.paths[i]!.segments;
+      // Per-path bake: pathEnds=[segCount], pathCount=1, so the inner
+      // loop walks just this path's segments and even-odd parity is
+      // computed within them. Visually identical to the prior
+      // global-segments bake for a single-path input. We force fill
+      // mode here regardless of `mark.paths[i].mode` — for non-morph,
+      // strokes are realised at sample time via abs(d) - halfW, which
+      // depends only on |d| and so is insensitive to the bake's parity
+      // sign.
+      this.runBakeSegments(device, this.textures[i]!, segs, [segs.length], 0, [0], [0]);
     }
 
     // Dummy 1x1 texture for unused path slots — WebGPU requires every
@@ -248,14 +264,34 @@ export class WebGPURenderer implements Renderer {
     }
   }
 
-  private initMorph(device: GPUDevice, markA: Mark, markB: Mark): void {
-    const segsA = flattenSegments(markA, 'morph: shape A');
-    const segsB = flattenSegments(markB, 'morph: shape B');
+  private initMorph(
+    device: GPUDevice,
+    markA: Mark,
+    markB: Mark,
+    fillRule: 'nonzero' | 'evenodd',
+  ): void {
+    const prep = prepareMorphPair(markA, markB);
+    const fillRuleCode = fillRule === 'evenodd' ? 1 : 0;
 
-    this.morphTexA = this.allocBakeTexture(device);
-    this.morphTexB = this.allocBakeTexture(device);
-    this.runBakeSegments(device, this.morphTexA, segsA);
-    this.runBakeSegments(device, this.morphTexB, segsB);
+    // Flatten each side into one combined segment list and bake into a
+    // single SDF using the chosen fill rule. The bake's sceneSDF walks
+    // pathEnds[] to compute per-path even-odd parity (nonzero) or one
+    // global crossing count (evenodd).
+    const flatA = flattenForBake(prep.markA);
+    const flatB = flattenForBake(prep.markB);
+
+    const texA = this.allocBakeTexture(device);
+    const texB = this.allocBakeTexture(device);
+    this.runBakeSegments(
+      device, texA, flatA.segments, flatA.pathEnds, fillRuleCode,
+      flatA.pathModes, flatA.pathHalfW,
+    );
+    this.runBakeSegments(
+      device, texB, flatB.segments, flatB.pathEnds, fillRuleCode,
+      flatB.pathModes, flatB.pathHalfW,
+    );
+    this.morphTexA = texA;
+    this.morphTexB = texB;
 
     this.morphUniformBuffer = device.createBuffer({
       size: WEBGPU_MORPH_UNIFORM_SIZE,
@@ -274,8 +310,16 @@ export class WebGPURenderer implements Renderer {
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        {
+          binding: WEBGPU_MORPH_SDF_A_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
+        {
+          binding: WEBGPU_MORPH_SDF_B_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
       ],
     });
     this.morphPipeline = device.createRenderPipeline({
@@ -294,13 +338,14 @@ export class WebGPURenderer implements Renderer {
       },
       primitive: { topology: 'triangle-list' },
     });
+
     this.morphBindGroup = device.createBindGroup({
       layout: morphLayout,
       entries: [
         { binding: 0, resource: { buffer: this.morphUniformBuffer } },
         { binding: 1, resource: sampler },
-        { binding: 2, resource: this.morphTexA.createView() },
-        { binding: 3, resource: this.morphTexB.createView() },
+        { binding: WEBGPU_MORPH_SDF_A_BINDING, resource: texA.createView() },
+        { binding: WEBGPU_MORPH_SDF_B_BINDING, resource: texB.createView() },
       ],
     });
   }
@@ -414,13 +459,19 @@ export class WebGPURenderer implements Renderer {
     texture: GPUTexture,
     path: Path,
   ): void {
-    this.runBakeSegments(device, texture, path.segments);
+    // See initMorph note: per-path baking uses fill mode regardless of
+    // path.mode because the sample shader handles strokes via abs(d).
+    this.runBakeSegments(device, texture, path.segments, [path.segments.length], 0, [0], [0]);
   }
 
   private runBakeSegments(
     device: GPUDevice,
     texture: GPUTexture,
     segs: readonly CubicSegment[],
+    pathEnds: readonly number[],
+    fillRule: number,
+    pathModes: readonly number[],
+    pathHalfW: readonly number[],
   ): void {
     const pipeline = this.bakePipeline;
     const layout = this.bakeBindGroupLayout;
@@ -438,9 +489,35 @@ export class WebGPURenderer implements Renderer {
     new Float32Array(segmentBuffer.getMappedRange()).set(segFloats);
     segmentBuffer.unmap();
 
+    // Bake uniforms: pathCount (u32), fillRule (u32), 2 pad u32, then
+    // pathEnds / pathMode / pathHalfW each packed four-wide into
+    // MAX_PATHS/4 vec4 slots. Layout mirrors WGSL's BakeParams struct.
+    // pathMode/pathHalfW carry the per-path render mode so stroked
+    // paths bake as sausage SDFs (pathMinD - halfW) instead of going
+    // through (meaningless) even-odd parity over their open subpaths.
+    const bakeUniformBuffer = device.createBuffer({
+      size: WEBGPU_BAKE_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    {
+      const view = new DataView(bakeUniformBuffer.getMappedRange());
+      view.setUint32(WEBGPU_BAKE_OFFSETS.pathCount, pathEnds.length, true);
+      view.setUint32(WEBGPU_BAKE_OFFSETS.fillRule,  fillRule,        true);
+      for (let i = 0; i < MAX_PATHS; i++) {
+        view.setUint32(WEBGPU_BAKE_OFFSETS.pathEnds  + i * 4, pathEnds[i]  ?? 0, true);
+        view.setUint32(WEBGPU_BAKE_OFFSETS.pathMode  + i * 4, pathModes[i] ?? 0, true);
+        view.setFloat32(WEBGPU_BAKE_OFFSETS.pathHalfW + i * 4, pathHalfW[i] ?? 0, true);
+      }
+    }
+    bakeUniformBuffer.unmap();
+
     const bindGroup = device.createBindGroup({
       layout,
-      entries: [{ binding: 0, resource: { buffer: segmentBuffer } }],
+      entries: [
+        { binding: 0, resource: { buffer: segmentBuffer } },
+        { binding: 1, resource: { buffer: bakeUniformBuffer } },
+      ],
     });
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
@@ -457,6 +534,7 @@ export class WebGPURenderer implements Renderer {
     pass.end();
     device.queue.submit([encoder.finish()]);
     segmentBuffer.destroy();
+    bakeUniformBuffer.destroy();
   }
 
   rebake(mark: Mark): void {
@@ -612,10 +690,6 @@ export class WebGPURenderer implements Renderer {
     view.setFloat32(off.colorB,         m.colorB[0], true);
     view.setFloat32(off.colorB + 4,     m.colorB[1], true);
     view.setFloat32(off.colorB + 8,     m.colorB[2], true);
-    view.setFloat32(off.strokeArgs,      m.aIsStroked ? 1 : 0,    true);
-    view.setFloat32(off.strokeArgs + 4,  m.bIsStroked ? 1 : 0,    true);
-    view.setFloat32(off.strokeArgs + 8,  m.aHalfWidth ?? 0,       true);
-    view.setFloat32(off.strokeArgs + 12, m.bHalfWidth ?? 0,       true);
 
     device.queue.writeBuffer(buffer, 0, this.morphUniformData);
 
@@ -736,38 +810,46 @@ export class WebGPURenderer implements Renderer {
 }
 
 /**
- * Cheap pre-flight that mirrors {@link flattenSegments}'s overflow throw
- * without allocating the segment array. Called from `init()` before any
- * GPU resources (canvas context, adapter, device) are acquired so that a
- * too-many-segments error in morph mode can fall back to the WebGL
- * renderer cleanly — `getContext('webgpu')` permanently binds the
- * canvas, so a throw after that point would surface as the misleading
- * "WebGL not supported" when the fallback's `getContext('webgl')`
- * returns null.
+ * Concatenate every path's segments into one array and produce the
+ * cumulative `pathEnds[i]` (exclusive end indices), per-path render
+ * modes, and per-path stroke half-widths the bake shader needs to walk
+ * the combined buffer with the correct per-path semantics. Stroked
+ * paths (mode === 'stroke') bake as sausage SDFs; fills and 'both' use
+ * even-odd parity. Mirrors the WebGL helper in WebGLRenderer.ts.
  */
-function validateMorphSegments(mark: Mark, label: string): void {
+function flattenForBake(mark: Mark): {
+  segments: CubicSegment[];
+  pathEnds: number[];
+  pathModes: number[];
+  pathHalfW: number[];
+} {
+  const segments: CubicSegment[] = [];
+  const pathEnds: number[] = [];
+  const pathModes: number[] = [];
+  const pathHalfW: number[] = [];
+  for (const p of mark.paths) {
+    for (const s of p.segments) segments.push(s);
+    pathEnds.push(segments.length);
+    pathModes.push(p.mode === 'stroke' ? 1 : 0);
+    pathHalfW.push(p.mode === 'fill' ? 0 : p.strokeWidth * 0.5);
+  }
+  return { segments, pathEnds, pathModes, pathHalfW };
+}
+
+/**
+ * Validate that a flattened morph side fits the bake shader's combined
+ * loop bound. Throws with a clear message at init time so users hit it
+ * before getContext binds the canvas (clean fallback path).
+ */
+function validateCombined(mark: Mark, label: 'A' | 'B'): void {
   let total = 0;
   for (const p of mark.paths) total += p.segments.length;
   if (total > MAX_SEGMENTS_PER_SHAPE) {
     throw new Error(
-      `${label} has ${total} combined segments but the per-shape cap is ${MAX_SEGMENTS_PER_SHAPE}. ` +
+      `morph shape ${label} has ${total} combined segments but the bake shader's per-shape cap is ${MAX_SEGMENTS_PER_SHAPE}. ` +
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }
-}
-
-function flattenSegments(mark: Mark, label: string): readonly CubicSegment[] {
-  const segs: CubicSegment[] = [];
-  for (const p of mark.paths) {
-    for (const s of p.segments) segs.push(s);
-  }
-  if (segs.length > MAX_SEGMENTS_PER_SHAPE) {
-    throw new Error(
-      `${label} has ${segs.length} combined segments but the per-shape cap is ${MAX_SEGMENTS_PER_SHAPE}. ` +
-        'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
-    );
-  }
-  return segs;
 }
 
 /* --- Uniform-write helpers ----------------------------------------------- */

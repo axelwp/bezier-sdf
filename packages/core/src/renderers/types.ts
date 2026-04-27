@@ -84,41 +84,22 @@ export interface Uniforms {
   tintColor?: readonly [number, number, number];
 
   /**
-   * Switch the render to the morph (two-shape SDF interpolation) sample
-   * pipeline. Requires the renderer to have been init'd with a
+   * Switch the render to the morph (flatten-then-bake SDF interpolation)
+   * sample pipeline. Requires the renderer to have been init'd with a
    * {@link RendererInitOptions.morphTo}; otherwise the morph pipeline
    * isn't available and this field is ignored.
    *
-   * `t` ∈ [0, 1] interpolates each pixel's distance: `mix(dA, dB, t)`. The
-   * zero-contour of the resulting field is a continuous geometric in-
-   * between of shape A and shape B at every t. Color is lerped between
-   * `colorA` (at t=0) and `colorB` (at t=1) with no per-path machinery —
-   * morph renders as a single uniform color.
+   * Both shapes are baked once per side into a single combined SDF using
+   * the chosen fill rule (see {@link RendererInitOptions.morphFillRule}).
+   * Per pixel the morph shader samples both, lerps `mix(dA, dB, t)`, and
+   * paints the silhouette with `mix(colorA, colorB, t)`. The unified-
+   * silhouette aesthetic is what the bake produces; per-path colors are
+   * intentionally not preserved in this mode.
    */
   morph?: {
     t: number;
     colorA: readonly [number, number, number];
     colorB: readonly [number, number, number];
-    /**
-     * Per-shape render-mode hints. The morph shader is a fill renderer:
-     * it lerps two SDFs and shades the zero-contour. Filled shapes' SDFs
-     * are already fill SDFs, but stroked shapes' SDFs are centerline
-     * distance fields — lerping those alongside a fill SDF produces
-     * nonsense in fill rendering (the stroked side appears as a solid
-     * disc with interior artifacts).
-     *
-     * When `aIsStroked` is true, the shader pre-converts shape A's SDF
-     * to its sausage fill SDF `abs(dA) - aHalfWidth` (the Minkowski sum
-     * of the centerline with a disc of radius `aHalfWidth`) before the
-     * lerp. Same for B. With both flags false the conversion is a no-op
-     * and behavior matches the previous filled-only morph.
-     *
-     * Defaults: `aIsStroked = bIsStroked = false`, half-widths `0`.
-     */
-    aIsStroked?: boolean;
-    bIsStroked?: boolean;
-    aHalfWidth?: number;
-    bHalfWidth?: number;
   };
 }
 
@@ -138,19 +119,37 @@ export interface RendererInitOptions {
    */
   backdrop?: TexImageSource;
   /**
-   * Enable the morph (two-shape SDF interpolation) sample pipeline. When
-   * provided, the renderer bakes `mark` and `morphTo` into two combined
-   * SDF textures (each shape's paths flattened into one segment list per
-   * texture) and compiles a dedicated morph fragment shader.
+   * Enable the morph (flatten-then-bake SDF interpolation) sample
+   * pipeline. When provided, the renderer concatenates the segments of
+   * every path in `mark` (and separately every path in `morphTo`) into
+   * one combined SDF texture per side, baked with the fill-rule chosen
+   * via {@link morphFillRule}, and compiles a dedicated morph fragment
+   * shader that lerps between the two SDFs.
+   *
+   * The two marks need not have the same path count or segment count.
+   * Both must fit under {@link MORPH_MAX_PATHS} paths and the bake
+   * shader's per-bake segment loop bound (combined across all paths in
+   * a side). Both should already be normalized via `prepareMorphPair`,
+   * which handles the over-cap merging.
    *
    * Morph mode is exclusive: when `morphTo` is set, the per-path sample
    * and direct pipelines are *not* compiled — the renderer can only draw
-   * via the morph pipeline. Each shape's combined segment count must
-   * fit under the bake shader's loop bound; both shapes must lie within
-   * the normalized bake region (`|x|, |y| ≲ 1`) for the field outside
-   * their boundaries to remain a meaningful Euclidean distance.
+   * via the morph pipeline. Geometry must lie within the normalized
+   * bake region (`|x|, |y| ≲ 1`) for the field outside the boundary to
+   * remain a meaningful Euclidean distance.
    */
   morphTo?: Mark;
+  /**
+   * Fill-rule for the morph bake. `'nonzero'` (default) computes
+   * even-odd parity within each path independently and unions paths via
+   * `min()` of their signed distances — preserves intentional holes in
+   * a single path (the inside of an "O") and prevents path-crossings
+   * from punching artifacts in another path's fill region. `'evenodd'`
+   * uses a single global crossing count across every segment, which is
+   * the SVG even-odd fill rule extended cross-path; opt in only when
+   * the source artwork relies on that for subtractive effects.
+   */
+  morphFillRule?: 'nonzero' | 'evenodd';
 }
 
 export interface Renderer {

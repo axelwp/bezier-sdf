@@ -52,20 +52,48 @@ export const MAX_PATHS = 16;
 export const MAX_LOOP_BOUND = 1024;
 
 /**
- * Shared SDF evaluator. Cubic segments live in a 1-row RGBA float
- * texture (`u_segments`): for segment `i`, texel `2i` packs `(P0, P1)`
- * and texel `2i+1` packs `(P2, P3)`. The texture is sampled with
- * NEAREST filtering, so each fetch returns the exact stored values.
+ * Shared SDF helpers and evaluator. Cubic segments live in a 1-row RGBA
+ * float texture (`u_segments`): for segment `i`, texel `2i` packs
+ * `(P0, P1)` and texel `2i+1` packs `(P2, P3)`. NEAREST sampling so each
+ * fetch returns the exact stored values.
  *
- * The runtime `u_segCount` upper-bounds the loop; `MAX_LOOP_BOUND` is a
- * compile-time ceiling required by the GLSL ES 1.00 spec. The texture
- * itself has no fixed size — bake-time code allocates exactly
- * `2 * segCount` texels per shape.
+ * `sceneSDF` branches on `u_fillRule`:
+ *   0 (nonzero, default) — for each path independently, even-odd parity
+ *     determines that path's interior; paths combine via `min()` of their
+ *     signed distances (a hard union). This is what most callers want:
+ *     intentional holes within a path (the hole inside an "O") are
+ *     preserved, and a path's segments that pass through another path's
+ *     interior can no longer flip the parity and punch a fill artifact.
+ *   1 (evenodd, opt-in) — original behavior: a single global crossing
+ *     count across every segment. Useful only when the source artwork
+ *     was authored to rely on cross-path subtractive even-odd semantics.
+ *
+ * Per-path semantics need to know where each path starts/ends in the
+ * combined segment array. `u_pathEnds[i]` is the cumulative segment
+ * count up through path i (exclusive end). `u_pathCount` bounds the
+ * outer loop; segments past `u_pathEnds[u_pathCount-1]` are never read.
+ *
+ * Per-path render mode is also supplied at bake time so stroked paths
+ * never go through even-odd parity — open subpaths in a stroked SVG
+ * (eyebrows, mouth lines, …) have meaningless even-odd parity within
+ * their own segments, and feeding that garbage into a union corrupts
+ * the silhouette. `u_pathMode[i] == 1` selects the sausage SDF
+ * `pathMinD - halfW` directly; `0` (or `2`/both) keeps the existing
+ * even-odd parity. `u_pathHalfW[i]` is the stroke half-width per path
+ * in segment-space units. Filled paths set halfW=0; the value is unread.
+ *
+ * The runtime `u_segCount` upper-bounds the inner loop; `MAX_LOOP_BOUND`
+ * is a compile-time ceiling required by the GLSL ES 1.00 spec.
  */
 const SDF_BODY = /* glsl */ `
 uniform int       u_segCount;
 uniform sampler2D u_segments;
 uniform float     u_segmentTexWidth;
+uniform int       u_pathCount;
+uniform int       u_pathEnds[${MAX_PATHS}];
+uniform int       u_pathMode[${MAX_PATHS}];
+uniform float     u_pathHalfW[${MAX_PATHS}];
+uniform int       u_fillRule;
 
 vec4 fetchSeg(int i) {
   float u = (float(i) + 0.5) / u_segmentTexWidth;
@@ -121,17 +149,60 @@ float distToCubic(vec2 p, vec2 p0, vec2 p1, vec2 p2, vec2 p3, inout int crossing
   return length(b - p);
 }
 float sceneSDF(vec2 p) {
-  float minD = 1e20;
-  int crossings = 0;
-  for (int i = 0; i < ${MAX_LOOP_BOUND}; i++) {
-    if (i >= u_segCount) break;
-    vec4 a = fetchSeg(i * 2);
-    vec4 b = fetchSeg(i * 2 + 1);
-    float d = distToCubic(p, a.xy, a.zw, b.xy, b.zw, crossings);
-    if (d < minD) minD = d;
+  if (u_fillRule == 1) {
+    // Even-odd across every segment in the bake — global parity. Lets
+    // designers use cross-path crossings as subtraction; also the only
+    // mode in which the legacy fill-rule artifact can appear.
+    float minD = 1e20;
+    int crossings = 0;
+    for (int i = 0; i < ${MAX_LOOP_BOUND}; i++) {
+      if (i >= u_segCount) break;
+      vec4 a = fetchSeg(i * 2);
+      vec4 b = fetchSeg(i * 2 + 1);
+      float d = distToCubic(p, a.xy, a.zw, b.xy, b.zw, crossings);
+      if (d < minD) minD = d;
+    }
+    bool inside = (crossings - (crossings / 2) * 2) == 1;
+    return inside ? -minD : minD;
   }
-  bool inside = (crossings - (crossings / 2) * 2) == 1;
-  return inside ? -minD : minD;
+
+  // Nonzero (default): per-path even-odd, hard-unioned via min(). Outer
+  // loop's bound (MAX_PATHS) and inner loop's bound (MAX_LOOP_BOUND) are
+  // compile-time constants; runtime u_pathCount and per-path span
+  // (segEnd - prevEnd) drive the early exits. Total inner iterations
+  // sum to the total segment count — same work as the global loop, just
+  // partitioned into per-path crossings.
+  //
+  // Stroked paths (u_pathMode[i] == 1) bypass even-odd entirely and use
+  // the sausage SDF (pathMinD - halfW). Open subpaths inside a stroked
+  // SVG would otherwise produce garbage parity that corrupts the union.
+  float result = 1e20;
+  int prevEnd = 0;
+  for (int p_i = 0; p_i < ${MAX_PATHS}; p_i++) {
+    if (p_i >= u_pathCount) break;
+    int segEnd = u_pathEnds[p_i];
+    int pathSegs = segEnd - prevEnd;
+    float pathMinD = 1e20;
+    int pathCrossings = 0;
+    for (int j = 0; j < ${MAX_LOOP_BOUND}; j++) {
+      if (j >= pathSegs) break;
+      int idx = j + prevEnd;
+      vec4 a = fetchSeg(idx * 2);
+      vec4 b = fetchSeg(idx * 2 + 1);
+      float d = distToCubic(p, a.xy, a.zw, b.xy, b.zw, pathCrossings);
+      if (d < pathMinD) pathMinD = d;
+    }
+    float pathSigned;
+    if (u_pathMode[p_i] == 1) {
+      pathSigned = pathMinD - u_pathHalfW[p_i];
+    } else {
+      bool insidePath = (pathCrossings - (pathCrossings / 2) * 2) == 1;
+      pathSigned = insidePath ? -pathMinD : pathMinD;
+    }
+    if (pathSigned < result) result = pathSigned;
+    prevEnd = segEnd;
+  }
+  return result;
 }
 `;
 
@@ -723,28 +794,20 @@ void main() {
 `;
 
 /**
- * Morph fragment — interpolates two baked SDFs by `u_morphT` per pixel.
+ * Morph fragment — flatten-then-bake architecture. Each side bakes once
+ * into a single SDF texture using a fill-rule-aware combine (see
+ * {@link SDF_BODY}'s sceneSDF), so the silhouette is unified — multiple
+ * sub-paths morph as one coherent shape rather than popping in/out via
+ * Porter-Duff "over". Per-path colors are not preserved; the morph
+ * paints with `u_colorA`→`u_colorB` lerped by `u_morphT`.
  *
- * Each input shape is baked into one combined SDF texture covering the
- * same `[-BOUND, BOUND]²` region; the shader samples both at the same
- * uv and lerps the distances. Because each baked field reports the
- * approximate Euclidean signed distance to its shape's boundary across
- * the whole bake region, `mix(dA, dB, t)` is itself a coherent distance
- * field whose zero-contour is a continuous geometric in-between of A
- * and B at every t (Quilez 2D distance functions, blending demos).
+ * Two textures, one t lerp, single fill mask:
+ *   d = mix(texture(u_sdfA, st).r, texture(u_sdfB, st).r, u_morphT)
+ *   mask = 1 - smoothstep(-aa, aa, d)
  *
- * Stroke conversion: a stroked SVG bakes its centerline distance, not
- * the distance to its filled tube boundary. Lerping a centerline field
- * against a fill field renders as a solid disc (the centerline's
- * negative interior is empty in fill semantics). We pre-convert each
- * stroked side to the sausage fill SDF `abs(d) - halfWidth` (the
- * Minkowski sum of the centerline with a disc of `halfWidth`) so both
- * sides of the lerp are coherent fill SDFs. Filled shapes pass through
- * unchanged (`u_aIsStroked = u_bIsStroked = 0` makes both branches a
- * no-op).
- *
- * Color is lerped from `u_colorA` (t=0) to `u_colorB` (t=1). No per-path
- * machinery applies — morph renders as a single uniform color.
+ * Output is straight-alpha (color * opacity) so the renderer's
+ * `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blend composites correctly without a
+ * trailing un-premultiply step.
  */
 export const WEBGL_MORPH_FRAG = /* glsl */ `
 #extension GL_OES_standard_derivatives : enable
@@ -756,28 +819,20 @@ uniform vec2  u_offset;
 uniform float u_opacity;
 uniform float u_bound;
 uniform float u_morphT;
-uniform vec3  u_colorA;
-uniform vec3  u_colorB;
-uniform float u_aIsStroked;
-uniform float u_bIsStroked;
-uniform float u_aHalfWidth;
-uniform float u_bHalfWidth;
 uniform sampler2D u_sdfA;
 uniform sampler2D u_sdfB;
+uniform vec3  u_colorA;
+uniform vec3  u_colorB;
 
 void main() {
   vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
   uv *= 2.0 / u_zoom;
   uv -= u_offset;
 
-  vec2 t = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
-  float dA_raw = texture2D(u_sdfA, t).r;
-  float dB_raw = texture2D(u_sdfB, t).r;
-
-  float dA = mix(dA_raw, abs(dA_raw) - u_aHalfWidth, u_aIsStroked);
-  float dB = mix(dB_raw, abs(dB_raw) - u_bHalfWidth, u_bIsStroked);
+  vec2 st = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
+  float dA = texture2D(u_sdfA, st).r;
+  float dB = texture2D(u_sdfB, st).r;
   float d = mix(dA, dB, u_morphT);
-
   float aa = fwidth(d) * 1.2;
   float mask = 1.0 - smoothstep(-aa, aa, d);
   vec3 color = mix(u_colorA, u_colorB, u_morphT);

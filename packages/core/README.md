@@ -61,6 +61,14 @@ Every major rendering library computes vector shapes on the CPU and uploads tria
 
 The result: smooth animation of complex vector shapes without re-tessellation, with perfect anti-aliasing at any zoom (the shape is a distance field, not a triangle mesh, so `fwidth`-based AA gives you sub-pixel edges for free).
 
+### Mark-to-mark morph
+
+For shape-to-shape interpolation, the renderer offers a separate **flatten-then-bake** pipeline. Both marks have all of their paths concatenated and baked into a single combined SDF per side; the morph fragment shader samples both textures and lerps `mix(dA, dB, t)` per pixel. The result is a single unified silhouette that flows from shape A to shape B as `t` advances from 0 to 1.
+
+The bake distinguishes fill paths from stroke paths internally: filled subpaths use per-path even-odd parity, stroked subpaths bake as sausage SDFs (`pathMinD − strokeWidth/2`). Both produce proper signed fill SDFs that union via `min()` into a coherent silhouette — so SVGs that mix fills and strokes (icons with a circle plus stroked accents, line-art with closed and open subpaths, etc.) morph correctly without parity garbage from the open subpaths leaking into the result.
+
+Activate by passing `morphTo` and (optionally) `morphFillRule` to `renderer.init`, then per-frame uniforms include `morph: { t, colorA, colorB }`.
+
 See [`docs/technique.md`](../../docs/technique.md) in the repo for the full writeup.
 
 ## API
@@ -92,13 +100,35 @@ Every renderer implements the same interface:
 ```ts
 interface Renderer {
   kind: 'webgpu' | 'webgl';
-  mode: 'baked' | 'direct';  // WebGL can fall back to direct if half-float missing
+  mode: 'baked' | 'direct';   // WebGL can fall back to direct if half-float missing
   pathCount: number;
-  init(opts: { canvas, mark }): Promise<void>;
+  init(opts: RendererInitOptions): Promise<void>;
   render(uniforms: Uniforms): void;
+  rebake(mark: Mark): void;          // re-run bake with new geometry; structural shape must match init
+  setBackdrop(source: TexImageSource): void;  // hot-swap glass backdrop on resize/dpi change
   dispose(): void;
 }
 ```
+
+#### `RendererInitOptions`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `canvas` | `HTMLCanvasElement` | *required* | Target canvas. The renderer takes ownership of its GPU context. |
+| `mark` | `Mark` | *required* | Geometry. For morph, this is shape A. |
+| `backdrop` | `TexImageSource` | *none* | Image to refract through the silhouette in liquid-glass mode. When omitted, the glass pipeline isn't compiled and `Uniforms.glass` is ignored. |
+| `morphTo` | `Mark` | *none* | When set, switches the renderer into morph mode. The renderer flattens both `mark` and `morphTo` into a single SDF per side and compiles only the morph pipeline (per-path sample / direct pipelines are skipped). |
+| `morphFillRule` | `'nonzero' \| 'evenodd'` | `'nonzero'` | Bake fill rule for both morph sides. `'nonzero'` (default) does per-path even-odd hard-unioned via `min()` — preserves intentional holes in a single path. `'evenodd'` does a single global crossing count across every segment; opt in only when the source artwork relies on cross-path subtractive parity. |
+
+#### `Uniforms` highlights
+
+Per-frame state. The full type is exported via `@bezier-sdf/core/renderers`. The renderer picks one of three composition modes from the fields you pass:
+
+- **Legacy smin** (used by `examples/reveal`): pass `color` alone. All paths smooth-union into one silhouette painted with `color`. `sminK` controls the soft-union radius.
+- **Per-path composite** (typical for arbitrary user SVGs): pass `pathModes`, `pathFillColors`, `pathStrokeColors`, `pathStrokeHalfW`. Paths render in document order with Porter-Duff "over" at rest, smin-fuse with color blending under cursor/ripple effects.
+- **Morph**: pass `morph: { t, colorA, colorB }`. Renderer must have been init'd with `morphTo`. `t ∈ [0, 1]` lerps the SDFs and the silhouette color.
+
+Optional shared deformations: `cursor` / `cursorPull` / `cursorRadius` (Gaussian pull toward a point) and `ripples` (up to 4 concurrent shockwave rings, each `[x, y, age, amplitude]`). Apply in legacy and per-path modes; ignored in morph and (subtly composed) in glass.
 
 ### Canvas helpers
 

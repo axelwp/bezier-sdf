@@ -108,11 +108,11 @@ export const WEBGPU_GLASS_UNIFORM_SIZE =
   GLASS_OFF.pathOffsets + (MAX_PATHS / 2) * 16;
 
 /**
- * Uniform buffer layout for the morph pipeline. Two vec3<f32> colors
- * each take 12 B but a vec3 must align to 16 B in WGSL — pad behind
- * each to keep the next field 16-aligned. Stroke conversion params
- * are packed into one vec4 at the end (aIsStroked, bIsStroked,
- * aHalfWidth, bHalfWidth) — see the morph fragment for usage.
+ * Uniform buffer layout for the morph pipeline. Two textures (one
+ * combined SDF per side) sampled and lerped by `morphT`; single
+ * colorA/colorB lerp paints the whole silhouette. No per-path data —
+ * the flatten-then-bake architecture deliberately drops it for the
+ * unified-silhouette aesthetic.
  *
  *   resolution : vec2<f32>   //  0
  *   zoom       : f32         //  8
@@ -120,12 +120,10 @@ export const WEBGPU_GLASS_UNIFORM_SIZE =
  *   offset     : vec2<f32>   // 16
  *   opacity    : f32         // 24
  *   bound      : f32         // 28
- *   colorA     : vec3<f32>   // 32  (align 16)
+ *   colorA     : vec3<f32>   // 32  (vec3 needs align 16)
  *   _pad0      : f32         // 44
- *   colorB     : vec3<f32>   // 48  (align 16)
+ *   colorB     : vec3<f32>   // 48
  *   _pad1      : f32         // 60
- *   strokeArgs : vec4<f32>   // 64  (aIsStroked, bIsStroked,
- *                                    aHalfWidth, bHalfWidth)
  */
 const MORPH_OFF = {
   resolution: 0,
@@ -136,27 +134,62 @@ const MORPH_OFF = {
   bound: 28,
   colorA: 32,
   colorB: 48,
-  strokeArgs: 64,
 } as const;
 export const WEBGPU_MORPH_OFFSETS = MORPH_OFF;
-export const WEBGPU_MORPH_UNIFORM_SIZE = 80;
+export const WEBGPU_MORPH_UNIFORM_SIZE = 64;
+
+/**
+ * Bake-shader uniform layout. Mirrors the GLSL bake's u_pathCount /
+ * u_pathEnds / u_pathMode / u_pathHalfW / u_fillRule. WGSL uniform-array
+ * stride is 16 bytes so MAX_PATHS values are packed four-wide into
+ * ${MAX_PATHS / 4} vec4<u32>/vec4<f32> slots; pathEnds(i) etc. return
+ * the i-th value via the indexed accessor.
+ */
+const BAKE_OFF = {
+  pathCount: 0,
+  fillRule: 4,
+  pathEnds:  16,
+  pathMode:  16 + (MAX_PATHS / 4) * 16,
+  pathHalfW: 16 + (MAX_PATHS / 4) * 16 * 2,
+} as const;
+export const WEBGPU_BAKE_OFFSETS = BAKE_OFF;
+export const WEBGPU_BAKE_UNIFORM_SIZE = BAKE_OFF.pathHalfW + (MAX_PATHS / 4) * 16;
 
 /**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
  * per bake pass; the fragment shader walks them for each pixel of a
  * 1024x1024 r16float render target.
+ *
+ * The combined SDF over multiple paths is built with one of two fill
+ * rules (see GLSL twin's SDF_BODY for the full rationale):
+ *   0 (nonzero) — per-path even-odd, hard-unioned via min(). Default;
+ *     preserves intentional holes inside a single path (the inside of
+ *     an "O") while a path's segments crossing through another path's
+ *     interior cannot subtract from that path's fill region.
+ *   1 (evenodd) — single global crossing count across every segment.
+ *     Required only when source artwork relies on cross-path even-odd
+ *     subtraction.
+ *
+ * For non-morph bakes (one path at a time) pathCount=1 and the two
+ * rules produce identical output; the renderer still binds these
+ * uniforms because the layout requires them.
  */
 export const WEBGPU_BAKE_SHADER = /* wgsl */ `
 struct Segment {
   a: vec4<f32>, // (P0, P1)
   b: vec4<f32>, // (P2, P3)
 };
-struct BakeUniforms {
-  bound: f32,
-  _pad: vec3<f32>,
+struct BakeParams {
+  pathCount: u32,
+  fillRule: u32,
+  _pad: vec2<u32>,
+  pathEnds:  array<vec4<u32>, ${MAX_PATHS / 4}>,
+  pathMode:  array<vec4<u32>, ${MAX_PATHS / 4}>,
+  pathHalfW: array<vec4<f32>, ${MAX_PATHS / 4}>,
 };
 
 @group(0) @binding(0) var<storage, read> segments: array<Segment>;
+@group(0) @binding(1) var<uniform> bake: BakeParams;
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -229,22 +262,69 @@ fn dist_to_cubic(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>, p3: 
   return vec2<f32>(length(bfinal - p), crossings);
 }
 
+fn pathEnd(i: u32) -> u32 {
+  return bake.pathEnds[i / 4u][i % 4u];
+}
+fn pathMode(i: u32) -> u32 {
+  return bake.pathMode[i / 4u][i % 4u];
+}
+fn pathHalfW(i: u32) -> f32 {
+  return bake.pathHalfW[i / 4u][i % 4u];
+}
+
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   // Flip Y — our geometry uses +y up, render targets use +y down.
   let p = vec2<f32>(uv.x, -uv.y);
-  var minD: f32 = 1e20;
-  var crossings: f32 = 0.0;
-  let count = arrayLength(&segments);
-  for (var i: u32 = 0u; i < count; i = i + 1u) {
-    let seg = segments[i];
-    let r = dist_to_cubic(p, seg.a.xy, seg.a.zw, seg.b.xy, seg.b.zw);
-    if (r.x < minD) { minD = r.x; }
-    crossings = crossings + r.y;
+
+  if (bake.fillRule == 1u) {
+    // Even-odd across every segment in the bake — global parity (legacy).
+    var minD: f32 = 1e20;
+    var crossings: f32 = 0.0;
+    let count = arrayLength(&segments);
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+      let seg = segments[i];
+      let r = dist_to_cubic(p, seg.a.xy, seg.a.zw, seg.b.xy, seg.b.zw);
+      if (r.x < minD) { minD = r.x; }
+      crossings = crossings + r.y;
+    }
+    let inside = (i32(crossings) % 2) == 1;
+    let signed_d = select(minD, -minD, inside);
+    return vec4<f32>(signed_d, 0.0, 0.0, 1.0);
   }
-  let inside = (i32(crossings) % 2) == 1;
-  let signed_d = select(minD, -minD, inside);
-  return vec4<f32>(signed_d, 0.0, 0.0, 1.0);
+
+  // Nonzero (default): per-path even-odd, hard-unioned via min(). Outer
+  // loop bound is MAX_PATHS; runtime pathCount and per-path span drive
+  // the early exits. Total inner iterations sum to the total segment
+  // count — same work as the global loop, partitioned per path.
+  //
+  // Stroked paths (pathMode == 1) bypass even-odd and use the sausage
+  // SDF (pathMinD - halfW) — open subpaths in stroked SVGs would
+  // otherwise produce garbage parity that corrupts the union.
+  var result: f32 = 1e20;
+  var prevEnd: u32 = 0u;
+  for (var p_i: u32 = 0u; p_i < ${MAX_PATHS}u; p_i = p_i + 1u) {
+    if (p_i >= bake.pathCount) { break; }
+    let segEnd = pathEnd(p_i);
+    var pathMinD: f32 = 1e20;
+    var pathCrossings: f32 = 0.0;
+    for (var idx: u32 = prevEnd; idx < segEnd; idx = idx + 1u) {
+      let seg = segments[idx];
+      let r = dist_to_cubic(p, seg.a.xy, seg.a.zw, seg.b.xy, seg.b.zw);
+      if (r.x < pathMinD) { pathMinD = r.x; }
+      pathCrossings = pathCrossings + r.y;
+    }
+    var pathSigned: f32;
+    if (pathMode(p_i) == 1u) {
+      pathSigned = pathMinD - pathHalfW(p_i);
+    } else {
+      let insidePath = (i32(pathCrossings) % 2) == 1;
+      pathSigned = select(pathMinD, -pathMinD, insidePath);
+    }
+    if (pathSigned < result) { result = pathSigned; }
+    prevEnd = segEnd;
+  }
+  return vec4<f32>(result, 0.0, 0.0, 1.0);
 }
 `;
 
@@ -774,19 +854,22 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 `;
 
 /**
- * Morph sample shader. Two combined-shape SDFs (`sdfA`, `sdfB`) are
- * sampled at the same uv and lerped per-pixel by `morphT`; the zero-
- * contour of the resulting field is a coherent geometric in-between
- * shape at every t. Color is lerped from `colorA` (t=0) to `colorB`
- * (t=1). No per-path machinery — morph renders as a single uniform
- * color silhouette.
+ * Morph sample shader — flatten-then-bake architecture. One combined
+ * SDF per side (texA, texB) lerped by `morphT`; single colorA/colorB
+ * lerp paints the entire silhouette. The unified silhouette is what
+ * the bake's fill-rule-aware combine produces (see WEBGPU_BAKE_SHADER's
+ * sceneSDF for the fill-rule semantics); per-path colors are
+ * deliberately not preserved in this mode.
  *
  * Bindings:
  *   0: uniforms (MorphUniforms)
- *   1: sampler (linear, clamp — shared by both SDFs)
- *   2: sdfA
- *   3: sdfB
+ *   1: sampler (linear, clamp)
+ *   2: texA
+ *   3: texB
  */
+export const WEBGPU_MORPH_SDF_A_BINDING = 2;
+export const WEBGPU_MORPH_SDF_B_BINDING = 3;
+
 export const WEBGPU_MORPH_SHADER = /* wgsl */ `
 struct MorphUniforms {
   resolution: vec2<f32>,
@@ -796,16 +879,15 @@ struct MorphUniforms {
   opacity: f32,
   bound: f32,
   colorA: vec3<f32>,
+  _pad0: f32,
   colorB: vec3<f32>,
-  // x: aIsStroked (0/1), y: bIsStroked (0/1),
-  // z: aHalfWidth, w: bHalfWidth
-  strokeArgs: vec4<f32>,
+  _pad1: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: MorphUniforms;
 @group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var sdfA: texture_2d<f32>;
-@group(0) @binding(3) var sdfB: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_MORPH_SDF_A_BINDING}) var sdfA: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_MORPH_SDF_B_BINDING}) var sdfB: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -831,16 +913,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv * (2.0 / U.zoom);
   uv = uv - U.offset;
 
-  let t = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-  let dA_raw = textureSample(sdfA, samp, t).r;
-  let dB_raw = textureSample(sdfB, samp, t).r;
-
-  // Convert centerline SDFs to fill SDFs for stroked sides before the
-  // lerp. See the GLSL counterpart for the geometry rationale.
-  let dA = mix(dA_raw, abs(dA_raw) - U.strokeArgs.z, U.strokeArgs.x);
-  let dB = mix(dB_raw, abs(dB_raw) - U.strokeArgs.w, U.strokeArgs.y);
+  let st = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+  let dA = textureSample(sdfA, samp, st).r;
+  let dB = textureSample(sdfB, samp, st).r;
   let d = mix(dA, dB, U.morphT);
-
   let aa = fwidth(d) * 1.2;
   let mask = 1.0 - smoothstep(-aa, aa, d);
   let color = mix(U.colorA, U.colorB, U.morphT);

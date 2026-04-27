@@ -9,6 +9,7 @@ import {
 } from 'react';
 import {
   createRenderer,
+  prepareMorphPair,
   type Mark,
   type PathMode,
   type Renderer,
@@ -84,6 +85,16 @@ export interface LiveGraphicProps {
    * this gives a single-color morph with no color animation.
    */
   toFillColor?: string;
+  /**
+   * Fill rule for the morph bake. `'nonzero'` (default) preserves the
+   * unified-silhouette aesthetic without cross-path fill artifacts —
+   * matches SVG's default and works for the vast majority of icons /
+   * logos. `'evenodd'` opts back into global even-odd parity across
+   * every segment in the bake, which is needed only when the source
+   * artwork was authored to rely on cross-path subtractive even-odd
+   * semantics. Ignored for non-morph effects.
+   */
+  fillRule?: 'nonzero' | 'evenodd';
   /**
    * Optional global color override. When set, every path is painted with
    * this color (smooth-union mode, matches the reveal example). Omit to
@@ -192,27 +203,6 @@ const DEFINITIONS: Record<Exclude<LiveGraphicEffectName, 'liquid-glass'>, Effect
 
 function zeroOffsets(n: number): Array<[number, number]> {
   return Array.from({ length: n }, () => [0, 0] as [number, number]);
-}
-
-/**
- * Pick the morph shader's per-shape render mode from a mark's paths.
- *
- * The morph shader is a fill renderer — it lerps two SDFs and shades
- * the zero-contour. Filled paths' SDFs are already fill SDFs, but
- * stroked paths are baked as centerline distance fields; passing one
- * straight to the lerp shows up as a solid disc with interior
- * artifacts. When every path is stroked we tell the shader to
- * pre-convert that side via `abs(d) - halfW` (the sausage / Minkowski-
- * tube fill SDF) before mixing. Mixed-mode marks fall back to "treat
- * as filled" — the historical behavior — until we have a use case that
- * needs per-path mixing inside morph.
- */
-function detectStrokeMode(mark: Mark): { isStroked: boolean; halfWidth: number } {
-  const paths = mark.paths;
-  if (paths.length === 0) return { isStroked: false, halfWidth: 0 };
-  const allStroke = paths.every((p) => p.mode === 'stroke');
-  if (!allStroke) return { isStroked: false, halfWidth: 0 };
-  return { isStroked: true, halfWidth: paths[0]!.strokeWidth * 0.5 };
 }
 
 interface ResolvedSpec {
@@ -522,6 +512,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
     src,
     to,
     toFillColor,
+    fillRule,
     color,
     opacity = 1,
     effect = 'none',
@@ -555,6 +546,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
   const stateRef = useRef({
     color,
     toFillColor,
+    morphFillRule: fillRule,
     opacity,
     perPath,
     pauseWhenOffscreen,
@@ -566,6 +558,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
   });
   stateRef.current.color = color;
   stateRef.current.toFillColor = toFillColor;
+  stateRef.current.morphFillRule = fillRule;
   stateRef.current.opacity = opacity;
   stateRef.current.perPath = perPath;
   stateRef.current.pauseWhenOffscreen = pauseWhenOffscreen;
@@ -678,11 +671,11 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       console.warn('[bezier-sdf] effect="morph" requires the `to` prop; rendering shape A only');
     }
 
-    // Per-shape stroke conversion params for the morph shader. Stable
-    // for the lifetime of this renderer (re-init runs whenever mark or
-    // markB change), so compute once outside the render loop.
-    const morphStrokeA = morphMode && markB ? detectStrokeMode(mark) : null;
-    const morphStrokeB = morphMode && markB ? detectStrokeMode(markB) : null;
+    // Normalize both marks for the flatten-then-bake morph pipeline:
+    // cap-merges any paths beyond MORPH_MAX_PATHS into the last allowed
+    // path. Stable for the lifetime of this renderer — re-init runs
+    // whenever mark or markB change.
+    const morphPrep = morphMode && markB ? prepareMorphPair(mark, markB) : null;
 
     let cancelled = false;
     let renderer: Renderer | null = null;
@@ -703,14 +696,17 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       const offsets = frame?.pathOffsets ?? zeroOffsets(r.pathCount);
       const base = state.perPath;
 
-      if (morphMode && markB) {
-        // Morph render path. Renderer was init'd with both marks; the
-        // shader interpolates the two baked SDFs by `t`. No per-path
-        // machinery — shape paints in `colorA → colorB` lerped by `t`.
-        const startColor = state.color ? parseColor(state.color) : ([1, 1, 1] as RgbColor);
-        const endColor = state.toFillColor
+      if (morphMode && morphPrep) {
+        // Morph render path. Both shapes were pre-baked into a single
+        // combined SDF per side at init using the chosen fill rule; the
+        // shader lerps `mix(dA, dB, t)` and paints with `mix(colorA,
+        // colorB, t)`. `color` / `toFillColor` provide the start/end
+        // colors; if unset, fall back to black for both endpoints (the
+        // user opted out of color morphing).
+        const colorA = state.color ? parseColor(state.color) : ([0, 0, 0] as const);
+        const colorB = state.toFillColor
           ? parseColor(state.toFillColor)
-          : startColor;
+          : colorA;
         r.render({
           width: canvas.width,
           height: canvas.height,
@@ -723,12 +719,8 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
           opacity: (frame?.opacity ?? 1) * state.opacity,
           morph: {
             t: frame?.morphT ?? 0,
-            colorA: startColor,
-            colorB: endColor,
-            aIsStroked: morphStrokeA?.isStroked ?? false,
-            bIsStroked: morphStrokeB?.isStroked ?? false,
-            aHalfWidth: morphStrokeA?.halfWidth ?? 0,
-            bHalfWidth: morphStrokeB?.halfWidth ?? 0,
+            colorA,
+            colorB,
           },
         });
         return runtimes.some((rt) => rt.active(now));
@@ -921,9 +913,10 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       try {
         const result = await createRenderer(rendererKind, {
           canvas,
-          mark,
+          mark: morphPrep ? morphPrep.markA : mark,
           backdrop: backdropSrc,
-          morphTo: morphMode && markB ? markB : undefined,
+          morphTo: morphPrep ? morphPrep.markB : undefined,
+          morphFillRule: state.morphFillRule,
         });
         if (cancelled) {
           result.renderer.dispose();
@@ -1059,7 +1052,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       renderer = null;
       runtimes = [];
     };
-  }, [mark, markB, to, rendererKind, effectKey, autoPlay, onReady, onError, backdrop, backdropBlur, material]);
+  }, [mark, markB, to, fillRule, rendererKind, effectKey, autoPlay, onReady, onError, backdrop, backdropBlur, material]);
 
   /* --------------- 3. React to color/opacity changes mid-life -------------- */
 

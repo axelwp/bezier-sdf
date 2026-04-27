@@ -20,3 +20,8 @@ export {
   subdividePath,
   subdivideMark,
 } from './subdivide';
+export {
+  MORPH_MAX_PATHS,
+  prepareMorphPair,
+  type PreparedMorphPair,
+} from './morphPair';
