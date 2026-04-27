@@ -7,7 +7,7 @@
 Smooth animation, crisp at any zoom, no re-tessellation per frame.
 WebGPU primary, WebGL fallback, static SVG when neither is available.
 
-<img src="./docs/assets/default-mark.png" alt="Two rounded chevrons facing each other" width="420" />
+<img src="./docs/assets/logo-liquid-glass.png" alt="Logo with Liquid Glass Material" width="420" />
 
 ### [**→ Live demo**](https://axelwp.github.io/)
 
@@ -116,9 +116,13 @@ Each folder under [`examples/`](./examples) is a standalone Vite app that depend
 
 <div align="center">
 
-https://github.com/user-attachments/assets/79373986-fb38-4aac-8bc8-e926ca45585c
+https://github.com/user-attachments/assets/a8ad0b5d-4c91-4ff2-b478-c8344d438cf3
 
-<sub><code>examples/reveal</code>. Run with <code>pnpm --filter @bezier-sdf/example-reveal dev</code></sub>
+https://github.com/user-attachments/assets/76adf553-1b86-4c1f-9bc9-42fa1874fe45
+
+https://github.com/user-attachments/assets/e2ac7b06-a441-417a-bcbe-818039b35a1c
+
+https://github.com/user-attachments/assets/b6aa3d43-aaa6-4a27-a00e-d485a725d081
 
 </div>
 
@@ -148,7 +152,7 @@ pnpm --filter @bezier-sdf/example-reveal dev
 
 ## Seen in the wild
 
-This library powers the logo reveal on [levx.trade](https://levx.trade), a chart-line-to-logo morph that demonstrates the polyline sampling pattern in production. The technique is documented in [`docs/technique.md`](./docs/technique.md#the-chart-to-logo-morph-pattern).
+This library powers the logo reveal on [levx.trade](https://levx.trade) The technique is documented in [`docs/technique.md`](./docs/technique.md#the-chart-to-logo-morph-pattern).
 
 If you ship `@bezier-sdf/*` somewhere public, open a PR adding it here.
 
