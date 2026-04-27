@@ -1,7 +1,10 @@
 # @bezier-sdf/react
 
+<div align="center">
+  <img src="https://raw.githubusercontent.com/axelwp/bezier-sdf/main/docs/assets/morph.gif" alt="Apple to Apple Pay morph demo" width="600" />
+</div>
+
 [![npm version](https://img.shields.io/npm/v/@bezier-sdf/react.svg)](https://www.npmjs.com/package/@bezier-sdf/react)
-[![bundle size](https://img.shields.io/bundlephobia/minzip/@bezier-sdf/react.svg)](https://bundlephobia.com/package/@bezier-sdf/react)
 [![license](https://img.shields.io/npm/l/@bezier-sdf/react.svg)](./LICENSE)
 
 A drop-in React component wrapping [`@bezier-sdf/core`](https://www.npmjs.com/package/@bezier-sdf/core). Point it at an SVG URL; the component fetches, parses, and normalizes the file, boots a GPU renderer (WebGPU with WebGL and static-SVG fallbacks), handles DPR and resize, respects `prefers-reduced-motion`, runs any interactive effects you configure, and cleans up on unmount.
@@ -38,7 +41,7 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 | `'reveal'` | Scroll-into-view, or `autoPlay` | Split-and-merge intro animation. Plays once per mount; use the [imperative handle](#imperative-handle) to replay. |
 | `'ripple'` | Pointer down on the canvas | Gaussian shockwave ring through the silhouette. Up to 4 concurrent rings. |
 | `'liquid-cursor'` | Pointer over the canvas | Silhouette bulges toward the pointer. Stroked paths thicken and warp under the cursor ("wet paint" model). |
-| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; each source path keeps its own SVG fill/stroke color through the transition by default, or pair with [`color`](#props-reference) / [`toFillColor`](#props-reference) to flatten a side to a single color. Works with mixed fill/stroke SVGs (stroked subpaths bake as sausage SDFs and union cleanly with filled paths). Composes with `material='glass'` for refraction through a morphing silhouette. See [Morph](#morph-1). |
+| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Per-path colors preserved by default; supports mixed fill + stroke SVGs. Composes with `material='glass'`. See [Morph](#morph-1) for full behavior and parameters. |
 | `'liquid-glass'` | none | Legacy alias for `material='glass'`. Prefer the [`material`](#material) prop for glass, and use the spec object form to tune. |
 
 ```tsx
@@ -113,6 +116,54 @@ See [Morph](#morph-1) for usage and the related `to` / `toFillColor` / `fillRule
 
 See [Material: glass](#material).
 
+## Morph
+
+Hover-driven interpolation between two SVGs. The component loads both `src` and `to`, bakes each into a single combined SDF (one texture per side), and the morph shader linearly interpolates the two distance fields per pixel. You get one unified silhouette that flows from shape A to shape B as the pointer enters the canvas, and back out as it leaves.
+
+```tsx
+<LiveGraphic
+  src="/icons/circle.svg"
+  to="/icons/star.svg"
+/>
+```
+
+That's enough to engage the morph runtime, and each path on either side keeps its own SVG fill/stroke color through the transition. Add `color` and/or `toFillColor` if you want to flatten a side to a single tint:
+
+```tsx
+<LiveGraphic
+  src="/icons/circle.svg"
+  to="/icons/star.svg"
+  color="#22d3ee"
+  toFillColor="#f472b6"
+/>
+```
+
+Setting the `to` prop alone is enough to engage the morph runtime; the explicit `effect="morph"` is only needed if you want to tune `rate` via the spec form. The runtime is also auto-included whenever `to` is paired with `material="glass"` (see [Liquid glass + morph](#liquid-glass--morph) for refraction through the morphing silhouette).
+
+Behavioral details:
+
+- **Per-path colors are preserved by default.** The bake records, alongside the SDF, which source path owns each pixel. The morph shader uses that lookup to paint each region with its intrinsic SVG fill or stroke color on side A, the corresponding color on side B, and lerps between them as `t` advances. `color` flattens side A to a single color (the start of the morph); `toFillColor` flattens side B (the end). Mixed mode works (override one side, leave the other per-path). Omitting both gives you the full per-path A→B color morph.
+- **Mixed fill + stroke is supported.** Stroked subpaths inside either shape bake as sausage SDFs (`|d| − strokeWidth/2`) and union with filled paths cleanly. Open subpaths in stroked SVGs (e.g. eyebrows or a mouth line in a smiley icon) no longer leak parity-garbage wisps into the silhouette.
+- **Reduced motion.** Stays at `t = 0` (shape A) and skips the rAF loop entirely.
+- **Fill rule.** The bake uses [`fillRule`](#props-reference) (default `'nonzero'`) to decide how each path's interior is determined. The default avoids cross-path fill artifacts in multi-path icons; switch to `'evenodd'` only when the source artwork relies on global subtractive parity (rare).
+
+### Morph parameters
+
+See the [`morph`](#morph) effect parameter table above for the `rate` knob. Pass it via the spec form:
+
+```tsx
+<LiveGraphic
+  src="/a.svg"
+  to="/b.svg"
+  effect={{ name: 'morph', rate: 8 }}
+/>
+```
+
+### Limits
+
+- Up to 16 paths per side. Beyond that, trailing paths are merged into the last allowed slot (warned via `console.warn`).
+- Per-side combined segment count must fit the renderer's bake-shader cap (1024 cubics on both backends). Throws at init time with a clear message if exceeded; flatten arcs or simplify paths in your source SVG.
+
 ## Material
 
 The `material` prop switches the silhouette's sample pipeline to a dedicated shader. Currently one material is supported: `'glass'`.
@@ -169,7 +220,7 @@ Glass-specific parameters travel alongside the composition via a `liquid-glass` 
 
 ### Liquid glass + morph
 
-Add a `to` prop alongside glass for refraction through a continuously morphing silhouette. Both shapes are baked as combined SDFs at init; the glass shader blends them per fragment by the morph's hover-driven `t`, so the surface normals follow the deforming geometry, the rim Fresnel band tracks the silhouette as it changes, and the chromatic fringe rides along the moving curvature.
+Add a `to` prop alongside glass for refraction through a continuously morphing silhouette (see [Morph](#morph-1) for how the morph runtime works). The glass shader blends both shapes' SDFs per fragment by the morph's hover-driven `t`, so surface normals follow the deforming geometry, the rim Fresnel band tracks the silhouette as it changes, and the chromatic fringe rides along the moving curvature.
 
 ```tsx
 <LiveGraphic
@@ -227,54 +278,6 @@ Why blur? Refraction sampling reads a different pixel per destination fragment. 
 
 Stroked paths render as illuminated glass filaments rather than refracting lenses. A 2 to 4px sausage doesn't have enough interior area for the full glass effect to read as lens-like. Both aesthetics are valid: filled SVGs give you lens refraction, stroked SVGs give you glass-tube lighting.
 
-## Morph
-
-Hover-driven interpolation between two SVGs. The component loads both `src` and `to`, bakes each into a single combined SDF (one texture per side), and the morph shader linearly interpolates the two distance fields per pixel. You get one unified silhouette that flows from shape A to shape B as the pointer enters the canvas, and back out as it leaves.
-
-```tsx
-<LiveGraphic
-  src="/icons/circle.svg"
-  to="/icons/star.svg"
-/>
-```
-
-That's enough to engage the morph runtime, and each path on either side keeps its own SVG fill/stroke color through the transition. Add `color` and/or `toFillColor` if you want to flatten a side to a single tint:
-
-```tsx
-<LiveGraphic
-  src="/icons/circle.svg"
-  to="/icons/star.svg"
-  color="#22d3ee"
-  toFillColor="#f472b6"
-/>
-```
-
-Setting the `to` prop alone is enough to engage the morph runtime; the explicit `effect="morph"` is only needed if you want to tune `rate` via the spec form. The runtime is also auto-included whenever `to` is paired with `material="glass"` (see [Liquid glass + morph](#liquid-glass--morph) for refraction through the morphing silhouette).
-
-Behavioral details:
-
-- **Per-path colors are preserved by default.** The bake records, alongside the SDF, which source path owns each pixel. The morph shader uses that lookup to paint each region with its intrinsic SVG fill or stroke color on side A, the corresponding color on side B, and lerps between them as `t` advances. `color` flattens side A to a single color (the start of the morph); `toFillColor` flattens side B (the end). Mixed mode works (override one side, leave the other per-path). Omitting both gives you the full per-path A→B color morph.
-- **Mixed fill + stroke is supported.** Stroked subpaths inside either shape bake as sausage SDFs (`|d| − strokeWidth/2`) and union with filled paths cleanly. Open subpaths in stroked SVGs (e.g. eyebrows or a mouth line in a smiley icon) no longer leak parity-garbage wisps into the silhouette.
-- **Reduced motion.** Stays at `t = 0` (shape A) and skips the rAF loop entirely.
-- **Fill rule.** The bake uses [`fillRule`](#props-reference) (default `'nonzero'`) to decide how each path's interior is determined. The default avoids cross-path fill artifacts in multi-path icons; switch to `'evenodd'` only when the source artwork relies on global subtractive parity (rare).
-
-### Morph parameters
-
-See the [`morph`](#morph) effect parameter table above for the `rate` knob. Pass it via the spec form:
-
-```tsx
-<LiveGraphic
-  src="/a.svg"
-  to="/b.svg"
-  effect={{ name: 'morph', rate: 8 }}
-/>
-```
-
-### Limits
-
-- Up to 16 paths per side. Beyond that, trailing paths are merged into the last allowed slot (warned via `console.warn`).
-- Per-side combined segment count must fit the renderer's bake-shader cap (1024 cubics on both backends). Throws at init time with a clear message if exceeded; flatten arcs or simplify paths in your source SVG.
-
 ## Imperative handle
 
 Forward a ref to `LiveGraphic` to replay animations on demand:
@@ -301,7 +304,7 @@ function ReplayableLogo() {
 | Prop | Type | Default | Description |
 |---|---|---|---|
 | `src` | `string` | *required* | SVG URL or data URI. Fetched once and cached per-src across component instances. |
-| `color` | `string` | *none* | Optional global color override. When set, every path is painted with this color (legacy smin mode); in morph mode it flattens side A (the start of the morph) to this single color. Omit to honor the SVG's per-path fill/stroke. Ignored when `material='glass'` (except in glass+morph, where it overrides side A's interior tint the same way). |
+| `color` | `string` | *none* | Optional global color override. Behavior depends on mode: <br>• **Default rendering:** every path painted with this color. <br>• **Morph mode:** flattens side A to this color (omit to keep per-path SVG colors). <br>• **Glass mode:** ignored. <br>• **Glass + morph:** overrides side A's interior tint. <br>Omit to honor the SVG's per-path fill/stroke colors throughout. |
 | `opacity` | `number` | `1` | 0..1 multiplier applied on top of any per-effect opacity. |
 | `effect` | `LiveGraphicEffectProp` | `'none'` | Single preset name, spec object, or array of either. See [Effects](#effects). |
 | `to` | `string` | *none* | Target SVG URL for the morph pipeline. Setting `to` engages a hover-driven morph between `src` and the target without requiring an explicit `effect="morph"`. Pairs with `material="glass"` so the backdrop refracts through the morphing silhouette. |
