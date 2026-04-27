@@ -1,10 +1,20 @@
 # @bezier-sdf/react
 
+[![npm version](https://img.shields.io/npm/v/@bezier-sdf/react.svg)](https://www.npmjs.com/package/@bezier-sdf/react)
+[![bundle size](https://img.shields.io/bundlephobia/minzip/@bezier-sdf/react.svg)](https://bundlephobia.com/package/@bezier-sdf/react)
+[![license](https://img.shields.io/npm/l/@bezier-sdf/react.svg)](./LICENSE)
+
 A drop-in React component wrapping [`@bezier-sdf/core`](https://www.npmjs.com/package/@bezier-sdf/core). Point it at an SVG URL; the component fetches, parses, and normalizes the file, boots a GPU renderer (WebGPU with WebGL and static-SVG fallbacks), handles DPR and resize, respects `prefers-reduced-motion`, runs any interactive effects you configure, and cleans up on unmount.
+
+> Pre-1.0. The public API may shift between minor versions until 1.0.
+
+## Install
 
 ```bash
 npm install @bezier-sdf/react @bezier-sdf/core
 ```
+
+Peer-deps on React 18+ and ReactDOM 18+. ESM only.
 
 ## Quick start
 
@@ -28,7 +38,7 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 | `'reveal'` | Scroll-into-view, or `autoPlay` | Split-and-merge intro animation. Plays once per mount; use the [imperative handle](#imperative-handle) to replay. |
 | `'ripple'` | Pointer down on the canvas | Gaussian shockwave ring through the silhouette. Up to 4 concurrent rings. |
 | `'liquid-cursor'` | Pointer over the canvas | Silhouette bulges toward the pointer. Stroked paths thicken and warp under the cursor ("wet paint" model). |
-| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; pair with [`toFillColor`](#props-reference) for color animation. Works with mixed fill/stroke SVGs — stroked subpaths bake as sausage SDFs and union cleanly with filled paths. See [Morph](#morph-1). |
+| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; pair with [`toFillColor`](#props-reference) for color animation. Works with mixed fill/stroke SVGs (stroked subpaths bake as sausage SDFs and union cleanly with filled paths). See [Morph](#morph-1). |
 | `'liquid-glass'` | none | Legacy alias for `material='glass'`. Prefer the [`material`](#material) prop for glass, and use the spec object form to tune. |
 
 ```tsx
@@ -95,7 +105,7 @@ Every parameter is optional; defaults are listed below. Live-updates: changing a
 
 | Param | Type | Default | Description |
 |---|---|---|---|
-| `rate` | `number` | `15` | Exponential approach rate (units `1/s`). Smoothed `t` follows the hover target via `t += (target - t) * (1 - exp(-rate*dt))`. Default reaches ~95% in ~200 ms — snappy but not jarring. Lower for more languid morphs. |
+| `rate` | `number` | `15` | Exponential approach rate (units `1/s`). Smoothed `t` follows the hover target via `t += (target - t) * (1 - exp(-rate*dt))`. Default reaches ~95% in ~200 ms (snappy but not jarring). Lower for more languid morphs. |
 
 See [Morph](#morph-1) for usage and the related `to` / `toFillColor` / `fillRule` props.
 
@@ -159,7 +169,7 @@ Pass any of these via a `{ name: 'liquid-glass', ...params }` spec in the `effec
 | `chromaticStrength` | `number` | `0.015` | Relative magnitude of the R/B offset vs G. Produces the rainbow fringe on curves. Scalar in roughly `[0, 0.1]`. |
 | `fresnelStrength` | `number` | `0.3` | Additive intensity of the rim band along the shape's edge. |
 | `tintStrength` | `number` | `0.1` | Mixing weight of `tintColor` across the interior, scaled by depth-in-shape. |
-| `frostStrength` | `number` | `2.5` | Radius (in physical pixels) of the cross-blur applied across the interior for a frosted quality. `0` = perfectly clear, `2–4` = Apple-style liquid glass. |
+| `frostStrength` | `number` | `2.5` | Radius (in physical pixels) of the cross-blur applied across the interior for a frosted quality. `0` = perfectly clear, `2` to `4` = Apple-style liquid glass. |
 | `rimColor` | `string` | `'#ffffff'` | Any CSS color. Applied to the fresnel rim. |
 | `tintColor` | `string` | `'#e8f0ff'` | Any CSS color. Tints the interior lens. |
 
@@ -171,17 +181,17 @@ Aspect: the image is center-cropped (CSS `cover`) to the canvas aspect before be
 
 ### The `backdropBlur` prop
 
-Gaussian blur (in CSS pixels of the display canvas) applied to the backdrop *after* it's been resized to match the canvas's backing store. Default `6`. Set to `0` for crisp refraction (best for gradients, grids, UI screenshots); raise to `10–16` for heavy frosting over photos. Re-applied on resize so the kernel radius stays correct in display space.
+Gaussian blur (in CSS pixels of the display canvas) applied to the backdrop *after* it's been resized to match the canvas's backing store. Default `6`. Set to `0` for crisp refraction (best for gradients, grids, UI screenshots); raise to `10` or `16` for heavy frosting over photos. Re-applied on resize so the kernel radius stays correct in display space.
 
 Why blur? Refraction sampling reads a different pixel per destination fragment. On a high-frequency backdrop (photos, textures) those neighboring lookups land on unrelated detail and refraction reads as noise. Pre-blurring attenuates that and produces smooth warping.
 
 ### Stroked SVGs under glass
 
-Stroked paths render as illuminated glass filaments rather than refracting lenses. A 2–4px sausage doesn't have enough interior area for the full glass effect to read as lens-like. Both aesthetics are valid: filled SVGs give you lens refraction, stroked SVGs give you glass-tube lighting.
+Stroked paths render as illuminated glass filaments rather than refracting lenses. A 2 to 4px sausage doesn't have enough interior area for the full glass effect to read as lens-like. Both aesthetics are valid: filled SVGs give you lens refraction, stroked SVGs give you glass-tube lighting.
 
 ## Morph
 
-Hover-driven interpolation between two SVGs. The component loads both `src` and `to`, bakes each into a single combined SDF (one texture per side), and the morph shader linearly interpolates the two distance fields per pixel. The result is one unified silhouette that flows from shape A to shape B as the pointer enters the canvas, and back out as it leaves.
+Hover-driven interpolation between two SVGs. The component loads both `src` and `to`, bakes each into a single combined SDF (one texture per side), and the morph shader linearly interpolates the two distance fields per pixel. You get one unified silhouette that flows from shape A to shape B as the pointer enters the canvas, and back out as it leaves.
 
 ```tsx
 <LiveGraphic
@@ -215,7 +225,7 @@ See the [`morph`](#morph) effect parameter table above for the `rate` knob. Pass
 ### Limits
 
 - Up to 16 paths per side. Beyond that, trailing paths are merged into the last allowed slot (warned via `console.warn`).
-- Per-side combined segment count must fit the renderer's bake-shader cap (1024 cubics on both backends). Throws at init time with a clear message if exceeded — flatten arcs / simplify paths in your source SVG.
+- Per-side combined segment count must fit the renderer's bake-shader cap (1024 cubics on both backends). Throws at init time with a clear message if exceeded; flatten arcs or simplify paths in your source SVG.
 
 ## Imperative handle
 
