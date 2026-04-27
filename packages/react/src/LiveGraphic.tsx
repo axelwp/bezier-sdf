@@ -686,6 +686,25 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
     // path. Stable for the lifetime of this renderer — re-init runs
     // whenever mark or markB change.
     const morphPrep = morphMode && markB ? prepareMorphPair(mark, markB) : null;
+    // Per-path color arrays keyed off the *post-prep* marks (so they
+    // align with what was actually baked, including any cap-merged
+    // tail paths). Stroked paths contribute their stroke color; fills
+    // and 'both' contribute the fill color — same convention used by
+    // the per-path silhouette / cursor / ripple effects, kept identical
+    // here so the same source SVG renders in the same colors across
+    // pipelines. When `color`/`toFillColor` props are set, the side
+    // collapses to that flat override and these arrays are omitted on
+    // the wire.
+    const morphPathColorsA = morphPrep
+      ? morphPrep.markA.paths.map((p) =>
+          p.mode === 'stroke' ? p.strokeColor : p.fillColor,
+        )
+      : null;
+    const morphPathColorsB = morphPrep
+      ? morphPrep.markB.paths.map((p) =>
+          p.mode === 'stroke' ? p.strokeColor : p.fillColor,
+        )
+      : null;
     // Glass+morph composition: when both glass material and a morph
     // target are active, the renderer routes the morph SDFs through
     // the glass pipeline's dynamic-SDF mode.
@@ -714,18 +733,21 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
         // Pure morph render path. Both shapes were pre-baked into a
         // single combined SDF per side at init using the chosen fill
         // rule; the shader lerps `mix(dA, dB, t)` and paints with
-        // `mix(colorA, colorB, t)`. `color` / `toFillColor` provide the
-        // start/end colors; if unset, fall back to black for both
-        // endpoints (the user opted out of color morphing).
+        // per-path colors looked up from the path-index map (preserves
+        // each region's intrinsic SVG color through the transition).
+        //
+        // The `color` / `toFillColor` props collapse a side to a flat
+        // override — populate `colorA/B` and skip the per-path array
+        // for that side. Mixed mode works (override A, per-path B).
         //
         // When glass is also active, fall through to the glass branch
         // below — the glass shader's dynamic-SDF mode samples the same
         // pair of morph-baked SDFs and refracts the backdrop through
         // the morphing silhouette.
-        const colorA = state.color ? parseColor(state.color) : ([0, 0, 0] as const);
-        const colorB = state.toFillColor
-          ? parseColor(state.toFillColor)
-          : colorA;
+        const overrideA = !!state.color;
+        const overrideB = !!state.toFillColor;
+        const colorA = overrideA ? parseColor(state.color!) : ([0, 0, 0] as const);
+        const colorB = overrideB ? parseColor(state.toFillColor!) : ([0, 0, 0] as const);
         r.render({
           width: canvas.width,
           height: canvas.height,
@@ -740,6 +762,8 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
             t: frame?.morphT ?? 0,
             colorA,
             colorB,
+            pathColorsA: overrideA ? undefined : morphPathColorsA ?? undefined,
+            pathColorsB: overrideB ? undefined : morphPathColorsB ?? undefined,
           },
         });
         return runtimes.some((rt) => rt.active(now));
@@ -768,14 +792,21 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
         const base = state.perPath;
         const morphData = glassMorphActive
           ? (() => {
-              const colorA = state.color ? parseColor(state.color) : ([0, 0, 0] as const);
-              const colorB = state.toFillColor
-                ? parseColor(state.toFillColor)
-                : colorA;
+              // Mirror of the standalone morph branch: `color` /
+              // `toFillColor` collapse a side to a flat tint override
+              // (the glass shader's per-pixel tint path is gated off);
+              // unset ⇒ per-path tint via the path-index lookup using
+              // the intrinsic SVG colors for that side.
+              const overrideA = !!state.color;
+              const overrideB = !!state.toFillColor;
+              const colorA = overrideA ? parseColor(state.color!) : ([0, 0, 0] as const);
+              const colorB = overrideB ? parseColor(state.toFillColor!) : ([0, 0, 0] as const);
               return {
                 t: frame?.morphT ?? 0,
                 colorA,
                 colorB,
+                pathColorsA: overrideA ? undefined : morphPathColorsA ?? undefined,
+                pathColorsB: overrideB ? undefined : morphPathColorsB ?? undefined,
               };
             })()
           : undefined;

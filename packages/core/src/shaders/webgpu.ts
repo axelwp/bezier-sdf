@@ -83,7 +83,15 @@ export const WEBGPU_SAMPLE_UNIFORM_SIZE =
  * when set, the lens SDF at each pixel is `mix(sample(sdf0), sample(sdfB),
  * blendT)` instead of the per-path smin union — used for glass-on-morph
  * composition (and any future effect that wants a blended-SDF source).
+ *
+ * In dynamic-SDF (glass+morph) mode, the tint that's normally a single
+ * `tintColor` becomes per-pixel: each side's path-index texture is
+ * sampled, the matching `pathColorsA/B` entry looked up, and the two
+ * tints lerped by `blendT`. `useOverrideA/B` bypasses the lookup with
+ * `morphColorA/B` (or falls back to plain glass tint when both are
+ * unset). Plain glass mode (`dynamicSdf == 0`) is unchanged.
  */
+const _GLASS_OFF_END = 160 + PATH_V4 * 16 * 2 + (MAX_PATHS / 2) * 16;
 const GLASS_OFF = {
   resolution: 0,
   zoom: 8,
@@ -106,33 +114,45 @@ const GLASS_OFF = {
   pathMode: 160,                                  // 160..160+PATH_V4*16
   pathStrokeHalfW: 160 + PATH_V4 * 16,            // next
   pathOffsets: 160 + PATH_V4 * 16 * 2,            // two vec2 per vec4
-  dynamicSdf: 160 + PATH_V4 * 16 * 2 + (MAX_PATHS / 2) * 16,
-  blendT: 160 + PATH_V4 * 16 * 2 + (MAX_PATHS / 2) * 16 + 4,
+  dynamicSdf: _GLASS_OFF_END,
+  blendT: _GLASS_OFF_END + 4,
+  useOverrideA: _GLASS_OFF_END + 8,
+  useOverrideB: _GLASS_OFF_END + 12,
+  // morphColorA/B are vec3<f32>, aligned to 16; placed at the next vec4
+  // slot so WGSL struct alignment is satisfied.
+  morphColorA: _GLASS_OFF_END + 16,    // .. + 28
+  morphColorB: _GLASS_OFF_END + 32,    // .. + 44
+  pathColorsA: _GLASS_OFF_END + 48,
+  pathColorsB: _GLASS_OFF_END + 48 + MAX_PATHS * 16,
 } as const;
 
 export const WEBGPU_GLASS_OFFSETS = GLASS_OFF;
 // Pad to vec4 alignment so the buffer size is a multiple of 16; WGSL
 // requires array elements / total struct sizes to round up to that.
 export const WEBGPU_GLASS_UNIFORM_SIZE =
-  GLASS_OFF.blendT + 12;
+  GLASS_OFF.pathColorsB + MAX_PATHS * 16;
 
 /**
  * Uniform buffer layout for the morph pipeline. Two textures (one
- * combined SDF per side) sampled and lerped by `morphT`; single
- * colorA/colorB lerp paints the whole silhouette. No per-path data —
- * the flatten-then-bake architecture deliberately drops it for the
- * unified-silhouette aesthetic.
+ * combined SDF per side) sampled and lerped by `morphT`; per-path
+ * colors looked up from the path-index textures preserve each region's
+ * intrinsic SVG color through the morph. `useOverrideA/B` falls back
+ * to flat `colorA/colorB` when the caller supplies a single-color
+ * override (the React `color`/`toColor` props, or the legacy 2-color
+ * morph API).
  *
- *   resolution : vec2<f32>   //  0
- *   zoom       : f32         //  8
- *   morphT     : f32         // 12
- *   offset     : vec2<f32>   // 16
- *   opacity    : f32         // 24
- *   bound      : f32         // 28
- *   colorA     : vec3<f32>   // 32  (vec3 needs align 16)
- *   _pad0      : f32         // 44
- *   colorB     : vec3<f32>   // 48
- *   _pad1      : f32         // 60
+ *   resolution     : vec2<f32>            //   0
+ *   zoom           : f32                  //   8
+ *   morphT         : f32                  //  12
+ *   offset         : vec2<f32>            //  16
+ *   opacity        : f32                  //  24
+ *   bound          : f32                  //  28
+ *   colorA         : vec3<f32>            //  32  (vec3 needs align 16)
+ *   useOverrideA   : u32                  //  44
+ *   colorB         : vec3<f32>            //  48
+ *   useOverrideB   : u32                  //  60
+ *   pathColorsA    : array<vec4<f32>, MAX_PATHS>   // 64
+ *   pathColorsB    : array<vec4<f32>, MAX_PATHS>   // 64 + MAX_PATHS*16
  */
 const MORPH_OFF = {
   resolution: 0,
@@ -142,10 +162,14 @@ const MORPH_OFF = {
   opacity: 24,
   bound: 28,
   colorA: 32,
+  useOverrideA: 44,
   colorB: 48,
+  useOverrideB: 60,
+  pathColorsA: 64,
+  pathColorsB: 64 + MAX_PATHS * 16,
 } as const;
 export const WEBGPU_MORPH_OFFSETS = MORPH_OFF;
-export const WEBGPU_MORPH_UNIFORM_SIZE = 64;
+export const WEBGPU_MORPH_UNIFORM_SIZE = 64 + MAX_PATHS * 16 * 2;
 
 /**
  * Bake-shader uniform layout. Mirrors the GLSL bake's u_pathCount /
@@ -153,10 +177,19 @@ export const WEBGPU_MORPH_UNIFORM_SIZE = 64;
  * stride is 16 bytes so MAX_PATHS values are packed four-wide into
  * ${MAX_PATHS / 4} vec4<u32>/vec4<f32> slots; pathEnds(i) etc. return
  * the i-th value via the indexed accessor.
+ *
+ * `outputMode` selects what the bake fragment shader writes:
+ *   0 — signed distance (default).
+ *   1 — winning path index, normalized to [0, 1] for r16float storage.
+ * Two-pass per side (distance + path-index) lets render shaders sample
+ * a per-pixel ownership map alongside the SDF and look up per-path
+ * colors from a uniform array — preserves source SVG region colors
+ * through the morph's unified-silhouette bake.
  */
 const BAKE_OFF = {
   pathCount: 0,
   fillRule: 4,
+  outputMode: 8,
   pathEnds:  16,
   pathMode:  16 + (MAX_PATHS / 4) * 16,
   pathHalfW: 16 + (MAX_PATHS / 4) * 16 * 2,
@@ -191,7 +224,8 @@ struct Segment {
 struct BakeParams {
   pathCount: u32,
   fillRule: u32,
-  _pad: vec2<u32>,
+  outputMode: u32,
+  _pad: u32,
   pathEnds:  array<vec4<u32>, ${MAX_PATHS / 4}>,
   pathMode:  array<vec4<u32>, ${MAX_PATHS / 4}>,
   pathHalfW: array<vec4<f32>, ${MAX_PATHS / 4}>,
@@ -288,6 +322,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
   if (bake.fillRule == 1u) {
     // Even-odd across every segment in the bake — global parity (legacy).
+    // No per-path notion in this mode, so winning path index is always 0.
     var minD: f32 = 1e20;
     var crossings: f32 = 0.0;
     let count = arrayLength(&segments);
@@ -299,6 +334,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     }
     let inside = (i32(crossings) % 2) == 1;
     let signed_d = select(minD, -minD, inside);
+    if (bake.outputMode == 1u) {
+      return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     return vec4<f32>(signed_d, 0.0, 0.0, 1.0);
   }
 
@@ -310,7 +348,13 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   // Stroked paths (pathMode == 1) bypass even-odd and use the sausage
   // SDF (pathMinD - halfW) — open subpaths in stroked SVGs would
   // otherwise produce garbage parity that corrupts the union.
+  //
+  // winningPathIdx tracks which path produced the smallest signed
+  // distance at this fragment — used by outputMode == 1u (path-index
+  // pass) to emit a per-pixel ownership map for downstream per-path
+  // color lookup.
   var result: f32 = 1e20;
+  var winningPathIdx: u32 = 0u;
   var prevEnd: u32 = 0u;
   for (var p_i: u32 = 0u; p_i < ${MAX_PATHS}u; p_i = p_i + 1u) {
     if (p_i >= bake.pathCount) { break; }
@@ -330,8 +374,14 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       let insidePath = (i32(pathCrossings) % 2) == 1;
       pathSigned = select(pathMinD, -pathMinD, insidePath);
     }
-    if (pathSigned < result) { result = pathSigned; }
+    if (pathSigned < result) {
+      result = pathSigned;
+      winningPathIdx = p_i;
+    }
     prevEnd = segEnd;
+  }
+  if (bake.outputMode == 1u) {
+    return vec4<f32>(f32(winningPathIdx) / 15.0, 0.0, 0.0, 1.0);
   }
   return vec4<f32>(result, 0.0, 0.0, 1.0);
 }
@@ -635,6 +685,18 @@ const GLASS_SDF_DISPATCH = Array.from({ length: MAX_PATHS }, (_, i) =>
 export const WEBGPU_DYNAMIC_SDF_B_BINDING = WEBGPU_BACKDROP_BINDING + 1;
 
 /**
+ * Path-index texture bindings for glass+morph. Same idea as the morph
+ * shader's pathIdxA/B — each side's per-pixel "winning path" map. In
+ * plain glass mode these slots hold the 1×1 dummy and the shader never
+ * samples them (`dynamicSdf == 0`).
+ */
+export const WEBGPU_PATH_IDX_A_BINDING = WEBGPU_DYNAMIC_SDF_B_BINDING + 1;
+export const WEBGPU_PATH_IDX_B_BINDING = WEBGPU_DYNAMIC_SDF_B_BINDING + 2;
+/** Nearest-filter sampler binding for the glass shader's path-index
+ *  lookups. Same rationale as the morph shader's sampNearest. */
+export const WEBGPU_GLASS_NEAREST_SAMPLER_BINDING = WEBGPU_DYNAMIC_SDF_B_BINDING + 3;
+
+/**
  * Liquid-glass sample pipeline. Same shape-compositing as the legacy
  * smin branch — all paths smooth-unioned into one silhouette — but uses
  * the combined SDF's screen-space gradient as a surface normal to
@@ -683,10 +745,23 @@ struct GlassUniforms {
   // each pixel is mix(sample(tex0), sample(sdfB), blendT) — used for
   // glass-on-morph composition (and any future effect that wants a
   // blended-SDF source). See WEBGL_GLASS_FRAG for the full rationale.
+  //
+  // In dynamic-SDF mode, the tint that's normally driven by the single
+  // 'tintColor' uniform becomes per-pixel: sample each side's path-
+  // index map, look up 'pathColorsA/B' for that path index, and lerp
+  // by blendT. 'useOverrideA/B' falls back to 'morphColorA/B' (a flat
+  // single-color override per side, used when the React 'color' /
+  // 'toColor' props are set).
   dynamicSdf: u32,
   blendT: f32,
-  _pad0: u32,
-  _pad1: u32,
+  useOverrideA: u32,
+  useOverrideB: u32,
+  morphColorA: vec3<f32>,
+  _padA: f32,
+  morphColorB: vec3<f32>,
+  _padB: f32,
+  pathColorsA: array<vec4<f32>, ${MAX_PATHS}>,
+  pathColorsB: array<vec4<f32>, ${MAX_PATHS}>,
 };
 
 @group(0) @binding(0) var<uniform> U: GlassUniforms;
@@ -694,6 +769,14 @@ struct GlassUniforms {
 ${SDF_TEXTURE_BINDINGS}
 @group(0) @binding(${WEBGPU_BACKDROP_BINDING}) var backdrop: texture_2d<f32>;
 @group(0) @binding(${WEBGPU_BACKDROP_BINDING + 1}) var sdfB: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_PATH_IDX_A_BINDING}) var pathIdxA: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_PATH_IDX_B_BINDING}) var pathIdxB: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_GLASS_NEAREST_SAMPLER_BINDING}) var sampNearest: sampler;
+
+fn decodePathIdx(v: f32) -> u32 {
+  let raw = u32(round(clamp(v, 0.0, 1.0) * 15.0));
+  return min(raw, ${MAX_PATHS - 1}u);
+}
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -887,7 +970,33 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let rim = smoothstep(-0.03, -0.005, d) * (1.0 - smoothstep(-0.005, 0.0, d));
   color = color + U.rimColor * rim * U.fresnelStrength;
 
-  color = mix(color, U.tintColor, clamp(interior * U.tintStrength, 0.0, 1.0));
+  // Interior tint. In glass+morph (dynamic-SDF) mode the tint is per-
+  // pixel — sample each side's path-index map, look up that path's
+  // color, lerp by blendT. Override flags fall back to a flat color
+  // per side (or the single-tint material when both are unset). Plain
+  // glass mode preserves the existing single-color tint.
+  var tintColor: vec3<f32>;
+  if (U.dynamicSdf != 0u) {
+    let st = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    var tA: vec3<f32>;
+    if (U.useOverrideA != 0u) {
+      tA = U.morphColorA;
+    } else {
+      let idxA = decodePathIdx(textureSample(pathIdxA, sampNearest, st).r);
+      tA = U.pathColorsA[idxA].rgb;
+    }
+    var tB: vec3<f32>;
+    if (U.useOverrideB != 0u) {
+      tB = U.morphColorB;
+    } else {
+      let idxB = decodePathIdx(textureSample(pathIdxB, sampNearest, st).r);
+      tB = U.pathColorsB[idxB].rgb;
+    }
+    tintColor = mix(tA, tB, U.blendT);
+  } else {
+    tintColor = U.tintColor;
+  }
+  color = mix(color, tintColor, clamp(interior * U.tintStrength, 0.0, 1.0));
 
   return vec4<f32>(color, insideMask * U.opacity);
   //return vec4<f32>(normal * 0.5 + 0.5, 0.0, insideMask);
@@ -896,20 +1005,39 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
 /**
  * Morph sample shader — flatten-then-bake architecture. One combined
- * SDF per side (texA, texB) lerped by `morphT`; single colorA/colorB
- * lerp paints the entire silhouette. The unified silhouette is what
- * the bake's fill-rule-aware combine produces (see WEBGPU_BAKE_SHADER's
- * sceneSDF for the fill-rule semantics); per-path colors are
- * deliberately not preserved in this mode.
+ * SDF per side (texA, texB) lerped by `morphT` produces the unified
+ * silhouette; the bake's fill-rule-aware combine (see WEBGPU_BAKE_SHADER's
+ * sceneSDF for the fill-rule semantics) is what unifies multi-subpath
+ * inputs into one coherent shape.
+ *
+ * Per-path colors. Each side also carries a path-index texture (baked
+ * by the same shader with `outputMode == 1`) recording which sub-path
+ * "won" the union at that pixel. The renderer uploads each side's per-
+ * path RGB colors into `U.pathColorsA / pathColorsB`; the shader looks
+ * up the corresponding entry and lerps A→B by `U.morphT`. Result: the
+ * morphing silhouette preserves each region's intrinsic SVG color
+ * through the transition (sharp boundaries within a single shape are
+ * intentional — match how SVG natively renders).
+ *
+ * `useOverrideA/B` collapses to a single-color paint (`colorA/colorB`)
+ * when the caller supplies an explicit color override; mixed modes
+ * (override one side, per-path the other) work too.
  *
  * Bindings:
  *   0: uniforms (MorphUniforms)
  *   1: sampler (linear, clamp)
- *   2: texA
- *   3: texB
+ *   2: texA            (shape A combined SDF)
+ *   3: texB            (shape B combined SDF)
+ *   4: pathIdxA        (shape A path-index map)
+ *   5: pathIdxB        (shape B path-index map)
  */
 export const WEBGPU_MORPH_SDF_A_BINDING = 2;
 export const WEBGPU_MORPH_SDF_B_BINDING = 3;
+export const WEBGPU_MORPH_PATH_IDX_A_BINDING = 4;
+export const WEBGPU_MORPH_PATH_IDX_B_BINDING = 5;
+/** Dedicated nearest-filter sampler used by the path-index lookups in
+ *  the morph shader. See the WGSL comment by the binding declaration. */
+export const WEBGPU_MORPH_NEAREST_SAMPLER_BINDING = 6;
 
 export const WEBGPU_MORPH_SHADER = /* wgsl */ `
 struct MorphUniforms {
@@ -920,15 +1048,25 @@ struct MorphUniforms {
   opacity: f32,
   bound: f32,
   colorA: vec3<f32>,
-  _pad0: f32,
+  useOverrideA: u32,
   colorB: vec3<f32>,
-  _pad1: f32,
+  useOverrideB: u32,
+  pathColorsA: array<vec4<f32>, ${MAX_PATHS}>,
+  pathColorsB: array<vec4<f32>, ${MAX_PATHS}>,
 };
 
 @group(0) @binding(0) var<uniform> U: MorphUniforms;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(${WEBGPU_MORPH_SDF_A_BINDING}) var sdfA: texture_2d<f32>;
 @group(0) @binding(${WEBGPU_MORPH_SDF_B_BINDING}) var sdfB: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_MORPH_PATH_IDX_A_BINDING}) var pathIdxA: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_MORPH_PATH_IDX_B_BINDING}) var pathIdxB: texture_2d<f32>;
+// Nearest sampler dedicated to the path-index lookups. Linear filtering
+// would blend integer-encoded path indices at region boundaries (e.g.
+// indices 3 and 7 on either side of an edge would produce a sample at
+// 5/15 — pointing into a third region's colors). NEAREST guarantees
+// each fragment reads exactly one texel's encoded index.
+@group(0) @binding(${WEBGPU_MORPH_NEAREST_SAMPLER_BINDING}) var sampNearest: sampler;
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -946,6 +1084,14 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
   return out;
 }
 
+// Decode the [0..15]/15 path-index encoding the bake writes back into a
+// u32. Half-float storage is plenty for 16 buckets; clamp to MAX_PATHS-1
+// in case sampling lands fractionally above 15/15 from filter edges.
+fn decodePathIdx(v: f32) -> u32 {
+  let raw = u32(round(clamp(v, 0.0, 1.0) * 15.0));
+  return min(raw, ${MAX_PATHS - 1}u);
+}
+
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = U.resolution;
@@ -960,7 +1106,25 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let d = mix(dA, dB, U.morphT);
   let aa = fwidth(d) * 1.2;
   let mask = 1.0 - smoothstep(-aa, aa, d);
-  let color = mix(U.colorA, U.colorB, U.morphT);
+
+  // Per-side color resolution. Override ⇒ flat color; otherwise sample
+  // the path-index map and look up the per-path color. WGSL allows
+  // dynamic indexing of uniform arrays directly so no unrolling needed.
+  var colorA: vec3<f32>;
+  if (U.useOverrideA != 0u) {
+    colorA = U.colorA;
+  } else {
+    let idxA = decodePathIdx(textureSample(pathIdxA, sampNearest, st).r);
+    colorA = U.pathColorsA[idxA].rgb;
+  }
+  var colorB: vec3<f32>;
+  if (U.useOverrideB != 0u) {
+    colorB = U.colorB;
+  } else {
+    let idxB = decodePathIdx(textureSample(pathIdxB, sampNearest, st).r);
+    colorB = U.pathColorsB[idxB].rgb;
+  }
+  let color = mix(colorA, colorB, U.morphT);
   return vec4<f32>(color, mask * U.opacity);
 }
 `;

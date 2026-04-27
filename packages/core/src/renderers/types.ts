@@ -99,14 +99,32 @@ export interface Uniforms {
    * Both shapes are baked once per side into a single combined SDF using
    * the chosen fill rule (see {@link RendererInitOptions.morphFillRule}).
    * Per pixel the morph shader samples both, lerps `mix(dA, dB, t)`, and
-   * paints the silhouette with `mix(colorA, colorB, t)`. The unified-
-   * silhouette aesthetic is what the bake produces; per-path colors are
-   * intentionally not preserved in this mode.
+   * paints the silhouette via per-path color lookup.
+   *
+   * Per-path colors. Each side may carry a `pathColors{A,B}` array of up
+   * to 16 RGB colors (one per source path); the renderer baked a path-
+   * index texture alongside the SDF that lets the shader decide, per
+   * pixel, which path "owns" that region and look up its color. The
+   * morph then lerps per-region colors A→B by `t`. Pass `undefined` (or
+   * an empty array) on a side to fall back to flat `colorA`/`colorB`
+   * for that side.
+   *
+   * Single-color override. `colorA`/`colorB` are still honored — if you
+   * want a flat color instead of per-path, simply omit the `pathColors`
+   * field for that side. Mixed mode works (override one side, per-path
+   * the other). The same overrides apply when this morph drives the
+   * glass+morph composition (the glass shader's interior tint).
    */
   morph?: {
     t: number;
     colorA: readonly [number, number, number];
     colorB: readonly [number, number, number];
+    /** Per-path RGB for shape A; if set, the morph shader samples each
+     *  pixel's "winning path" and uses the matching entry instead of
+     *  `colorA`. Length up to {@link RendererInitOptions.morphTo}'s
+     *  effective path count after `prepareMorphPair`. */
+    pathColorsA?: ReadonlyArray<readonly [number, number, number]>;
+    pathColorsB?: ReadonlyArray<readonly [number, number, number]>;
   };
 }
 

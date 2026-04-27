@@ -13,10 +13,16 @@ import {
   WEBGPU_GLASS_SHADER,
   WEBGPU_GLASS_UNIFORM_SIZE,
   WEBGPU_MORPH_OFFSETS,
+  WEBGPU_GLASS_NEAREST_SAMPLER_BINDING,
+  WEBGPU_MORPH_NEAREST_SAMPLER_BINDING,
+  WEBGPU_MORPH_PATH_IDX_A_BINDING,
+  WEBGPU_MORPH_PATH_IDX_B_BINDING,
   WEBGPU_MORPH_SDF_A_BINDING,
   WEBGPU_MORPH_SDF_B_BINDING,
   WEBGPU_MORPH_SHADER,
   WEBGPU_MORPH_UNIFORM_SIZE,
+  WEBGPU_PATH_IDX_A_BINDING,
+  WEBGPU_PATH_IDX_B_BINDING,
   WEBGPU_SAMPLE_OFFSETS,
   WEBGPU_SAMPLE_SHADER,
   WEBGPU_SAMPLE_UNIFORM_SIZE,
@@ -68,6 +74,12 @@ export class WebGPURenderer implements Renderer {
   private samplePipeline: GPURenderPipeline | null = null;
   private bakePipeline: GPURenderPipeline | null = null;
   private bakeBindGroupLayout: GPUBindGroupLayout | null = null;
+  /** Nearest-filter sampler used by the path-index lookups in the
+   *  morph and glass+morph render shaders. The main `sampler` is
+   *  linear (smooth SDF + backdrop sampling); we need exact-texel
+   *  reads for the integer-encoded path-index map to avoid blending
+   *  indices across region boundaries. */
+  private nearestSampler: GPUSampler | null = null;
   private uniformBuffer: GPUBuffer | null = null;
   private textures: GPUTexture[] = [];
   private dummyTexture: GPUTexture | null = null;
@@ -86,6 +98,12 @@ export class WebGPURenderer implements Renderer {
   /** Single combined SDF for morph shape A (flatten-then-bake). */
   private morphTexA: GPUTexture | null = null;
   private morphTexB: GPUTexture | null = null;
+  /** Per-side path-index textures — each pixel stores which sub-path
+   *  "won" the union at bake time, sampled by the morph render pipeline
+   *  to look up per-path colors and preserve source SVG region colors
+   *  through the morph. */
+  private morphPathIdxTexA: GPUTexture | null = null;
+  private morphPathIdxTexB: GPUTexture | null = null;
   private morphUniformData = new ArrayBuffer(WEBGPU_MORPH_UNIFORM_SIZE);
   private _pathCount = 0;
   private disposed = false;
@@ -115,19 +133,19 @@ export class WebGPURenderer implements Renderer {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
     if (!adapter) throw new Error('no WebGPU adapter');
     // Glass binds 16 SDF textures + backdrop + dynamic-SDF "shape B"
-    // = 18 sampled textures in one stage, two past the WebGPU default
-    // minimum of 16. Request the extra up front so requestDevice
-    // rejects on adapters that can't meet it — clearer than a later
-    // pipeline-creation failure. Every desktop GPU driver exposes
-    // thousands; the downgrade path only matters on very constrained
-    // embedded targets. The sdfB slot is always reserved when glass is
-    // active even in plain glass mode (it's bound to a 1×1 dummy and
-    // unread — the shader gates samples on `dynamicSdf`).
-    const sampledTextureLimit = backdrop ? MAX_PATHS + 2 : MAX_PATHS;
+    // + 2 path-index maps = 20 sampled textures in one stage, four past
+    // the WebGPU default minimum of 16. Request the extra up front so
+    // requestDevice rejects on adapters that can't meet it — clearer
+    // than a later pipeline-creation failure. Every desktop GPU driver
+    // exposes thousands; the downgrade path only matters on very
+    // constrained embedded targets. All four extra slots are reserved
+    // when glass is active even in plain glass mode (they're bound to
+    // a 1×1 dummy and unread — the shader gates samples on `dynamicSdf`).
+    const sampledTextureLimit = backdrop ? MAX_PATHS + 4 : MAX_PATHS;
     const adapterMax = adapter.limits.maxSampledTexturesPerShaderStage;
     if (adapterMax < sampledTextureLimit) {
       throw new Error(
-        `adapter exposes maxSampledTexturesPerShaderStage=${adapterMax}; bezier-sdf needs ${sampledTextureLimit} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop + sdfB' : ''})`,
+        `adapter exposes maxSampledTexturesPerShaderStage=${adapterMax}; bezier-sdf needs ${sampledTextureLimit} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop + sdfB + 2× pathIdx' : ''})`,
       );
     }
     const device = await adapter.requestDevice({
@@ -222,6 +240,15 @@ export class WebGPURenderer implements Renderer {
       addressModeV: 'clamp-to-edge',
     });
     this.sampler = sampler;
+    // Nearest sampler used by glass-on-morph for path-index lookups.
+    // Plain glass mode also gets the binding (the bind group always
+    // includes it for layout stability), but never samples through it.
+    this.nearestSampler = device.createSampler({
+      magFilter: 'nearest',
+      minFilter: 'nearest',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    });
     const sampleShader = device.createShaderModule({ code: WEBGPU_SAMPLE_SHADER });
     const sampleBindGroupLayout = device.createBindGroupLayout({
       entries: [
@@ -284,22 +311,37 @@ export class WebGPURenderer implements Renderer {
     // Flatten each side into one combined segment list and bake into a
     // single SDF using the chosen fill rule. The bake's sceneSDF walks
     // pathEnds[] to compute per-path even-odd parity (nonzero) or one
-    // global crossing count (evenodd).
+    // global crossing count (evenodd). Two passes per side: distance
+    // (outputMode=0) and path-index (outputMode=1). The path-index map
+    // lets the morph render shader look up per-path colors at sample
+    // time so source SVG region colors survive the unified bake.
     const flatA = flattenForBake(prep.markA);
     const flatB = flattenForBake(prep.markB);
 
     const texA = this.allocBakeTexture(device);
     const texB = this.allocBakeTexture(device);
+    const pathIdxA = this.allocBakeTexture(device);
+    const pathIdxB = this.allocBakeTexture(device);
     this.runBakeSegments(
       device, texA, flatA.segments, flatA.pathEnds, fillRuleCode,
-      flatA.pathModes, flatA.pathHalfW,
+      flatA.pathModes, flatA.pathHalfW, 0,
+    );
+    this.runBakeSegments(
+      device, pathIdxA, flatA.segments, flatA.pathEnds, fillRuleCode,
+      flatA.pathModes, flatA.pathHalfW, 1,
     );
     this.runBakeSegments(
       device, texB, flatB.segments, flatB.pathEnds, fillRuleCode,
-      flatB.pathModes, flatB.pathHalfW,
+      flatB.pathModes, flatB.pathHalfW, 0,
+    );
+    this.runBakeSegments(
+      device, pathIdxB, flatB.segments, flatB.pathEnds, fillRuleCode,
+      flatB.pathModes, flatB.pathHalfW, 1,
     );
     this.morphTexA = texA;
     this.morphTexB = texB;
+    this.morphPathIdxTexA = pathIdxA;
+    this.morphPathIdxTexB = pathIdxB;
 
     const sampler = device.createSampler({
       magFilter: 'linear',
@@ -308,6 +350,12 @@ export class WebGPURenderer implements Renderer {
       addressModeV: 'clamp-to-edge',
     });
     this.sampler = sampler;
+    this.nearestSampler = device.createSampler({
+      magFilter: 'nearest',
+      minFilter: 'nearest',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    });
 
     if (backdrop) {
       // Glass+morph composition: skip the dedicated morph render
@@ -363,6 +411,21 @@ export class WebGPURenderer implements Renderer {
           visibility: GPUShaderStage.FRAGMENT,
           texture: { sampleType: 'float', viewDimension: '2d' },
         },
+        {
+          binding: WEBGPU_MORPH_PATH_IDX_A_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
+        {
+          binding: WEBGPU_MORPH_PATH_IDX_B_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
+        {
+          binding: WEBGPU_MORPH_NEAREST_SAMPLER_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          sampler: { type: 'non-filtering' },
+        },
       ],
     });
     this.morphPipeline = device.createRenderPipeline({
@@ -389,6 +452,9 @@ export class WebGPURenderer implements Renderer {
         { binding: 1, resource: sampler },
         { binding: WEBGPU_MORPH_SDF_A_BINDING, resource: texA.createView() },
         { binding: WEBGPU_MORPH_SDF_B_BINDING, resource: texB.createView() },
+        { binding: WEBGPU_MORPH_PATH_IDX_A_BINDING, resource: pathIdxA.createView() },
+        { binding: WEBGPU_MORPH_PATH_IDX_B_BINDING, resource: pathIdxB.createView() },
+        { binding: WEBGPU_MORPH_NEAREST_SAMPLER_BINDING, resource: this.nearestSampler! },
       ],
     });
   }
@@ -451,6 +517,24 @@ export class WebGPURenderer implements Renderer {
           visibility: GPUShaderStage.FRAGMENT,
           texture: { sampleType: 'float', viewDimension: '2d' },
         },
+        {
+          // Path-index map for shape A (glass+morph per-path tinting).
+          // Plain glass binds the 1×1 dummy; the shader gates reads on
+          // `dynamicSdf`.
+          binding: WEBGPU_PATH_IDX_A_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
+        {
+          binding: WEBGPU_PATH_IDX_B_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
+        {
+          binding: WEBGPU_GLASS_NEAREST_SAMPLER_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          sampler: { type: 'non-filtering' },
+        },
       ],
     });
     this.glassBindGroupLayout = glassLayout;
@@ -479,11 +563,13 @@ export class WebGPURenderer implements Renderer {
     viewFor: (i: number) => GPUTextureView,
     backdropTexture: GPUTexture,
   ): GPUBindGroup {
-    // Shape-B view: morphTexB if the renderer was init'd with a morph
-    // target (glass+morph composition), otherwise the 1×1 dummy. The
-    // shader gates samples on `dynamicSdf` so the dummy is never read
-    // in plain glass mode.
+    // Shape-B and path-index views: real morph textures if the renderer
+    // was init'd with a morph target (glass+morph composition), otherwise
+    // the 1×1 dummy. The shader gates samples on `dynamicSdf` so the
+    // dummies are never read in plain glass mode.
     const sdfBView = (this.morphTexB ?? this.dummyTexture)!.createView();
+    const pathIdxAView = (this.morphPathIdxTexA ?? this.dummyTexture)!.createView();
+    const pathIdxBView = (this.morphPathIdxTexB ?? this.dummyTexture)!.createView();
     return device.createBindGroup({
       layout: this.glassBindGroupLayout!,
       entries: [
@@ -495,6 +581,9 @@ export class WebGPURenderer implements Renderer {
         })),
         { binding: WEBGPU_BACKDROP_BINDING, resource: backdropTexture.createView() },
         { binding: WEBGPU_DYNAMIC_SDF_B_BINDING, resource: sdfBView },
+        { binding: WEBGPU_PATH_IDX_A_BINDING, resource: pathIdxAView },
+        { binding: WEBGPU_PATH_IDX_B_BINDING, resource: pathIdxBView },
+        { binding: WEBGPU_GLASS_NEAREST_SAMPLER_BINDING, resource: this.nearestSampler! },
       ],
     });
   }
@@ -531,6 +620,7 @@ export class WebGPURenderer implements Renderer {
     fillRule: number,
     pathModes: readonly number[],
     pathHalfW: readonly number[],
+    outputMode: number = 0,
   ): void {
     const pipeline = this.bakePipeline;
     const layout = this.bakeBindGroupLayout;
@@ -548,12 +638,12 @@ export class WebGPURenderer implements Renderer {
     new Float32Array(segmentBuffer.getMappedRange()).set(segFloats);
     segmentBuffer.unmap();
 
-    // Bake uniforms: pathCount (u32), fillRule (u32), 2 pad u32, then
-    // pathEnds / pathMode / pathHalfW each packed four-wide into
-    // MAX_PATHS/4 vec4 slots. Layout mirrors WGSL's BakeParams struct.
-    // pathMode/pathHalfW carry the per-path render mode so stroked
-    // paths bake as sausage SDFs (pathMinD - halfW) instead of going
-    // through (meaningless) even-odd parity over their open subpaths.
+    // Bake uniforms: pathCount (u32), fillRule (u32), outputMode (u32),
+    // pad (u32), then pathEnds / pathMode / pathHalfW each packed four-
+    // wide into MAX_PATHS/4 vec4 slots. Layout mirrors WGSL's BakeParams
+    // struct. outputMode dispatches the fragment shader between the
+    // signed-distance pass (0) and the path-index pass (1) — same
+    // pipeline, two draws per side at init.
     const bakeUniformBuffer = device.createBuffer({
       size: WEBGPU_BAKE_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -561,8 +651,9 @@ export class WebGPURenderer implements Renderer {
     });
     {
       const view = new DataView(bakeUniformBuffer.getMappedRange());
-      view.setUint32(WEBGPU_BAKE_OFFSETS.pathCount, pathEnds.length, true);
-      view.setUint32(WEBGPU_BAKE_OFFSETS.fillRule,  fillRule,        true);
+      view.setUint32(WEBGPU_BAKE_OFFSETS.pathCount,  pathEnds.length, true);
+      view.setUint32(WEBGPU_BAKE_OFFSETS.fillRule,   fillRule,        true);
+      view.setUint32(WEBGPU_BAKE_OFFSETS.outputMode, outputMode,      true);
       for (let i = 0; i < MAX_PATHS; i++) {
         view.setUint32(WEBGPU_BAKE_OFFSETS.pathEnds  + i * 4, pathEnds[i]  ?? 0, true);
         view.setUint32(WEBGPU_BAKE_OFFSETS.pathMode  + i * 4, pathModes[i] ?? 0, true);
@@ -753,6 +844,17 @@ export class WebGPURenderer implements Renderer {
     view.setFloat32(off.colorB + 4,     m.colorB[1], true);
     view.setFloat32(off.colorB + 8,     m.colorB[2], true);
 
+    // Per-path color arrays. Caller passes them ⇒ unset the override
+    // flag and write the array; otherwise the override stays at 1 and
+    // colorA/colorB drive the side as a flat color (back-compat with the
+    // 2-color morph API).
+    const useA = !m.pathColorsA || m.pathColorsA.length === 0;
+    const useB = !m.pathColorsB || m.pathColorsB.length === 0;
+    view.setUint32(off.useOverrideA, useA ? 1 : 0, true);
+    view.setUint32(off.useOverrideB, useB ? 1 : 0, true);
+    if (!useA) writePathColors(view, off.pathColorsA, m.pathColorsA!);
+    if (!useB) writePathColors(view, off.pathColorsB, m.pathColorsB!);
+
     device.queue.writeBuffer(buffer, 0, this.morphUniformData);
 
     const encoder = device.createCommandEncoder();
@@ -826,6 +928,32 @@ export class WebGPURenderer implements Renderer {
     view.setUint32 (off.dynamicSdf, dynamic ? 1 : 0,    true);
     view.setFloat32(off.blendT,     u.morph?.t ?? 0,    true);
 
+    // Per-path tint plumbing for glass+morph. Mirror of renderMorph
+    // above: caller-supplied per-path color arrays switch the shader
+    // off the morphColorA/B flat overrides and into texture-based
+    // lookup. Plain glass mode forces both overrides to 1 so the
+    // shader's per-pixel tint path is gated out and U.tintColor (set
+    // earlier in this function) drives the unchanged frosted-glass
+    // tint.
+    if (dynamic) {
+      const m = u.morph!;
+      const useA = !m.pathColorsA || m.pathColorsA.length === 0;
+      const useB = !m.pathColorsB || m.pathColorsB.length === 0;
+      view.setUint32 (off.useOverrideA, useA ? 1 : 0, true);
+      view.setUint32 (off.useOverrideB, useB ? 1 : 0, true);
+      view.setFloat32(off.morphColorA,     m.colorA[0], true);
+      view.setFloat32(off.morphColorA + 4, m.colorA[1], true);
+      view.setFloat32(off.morphColorA + 8, m.colorA[2], true);
+      view.setFloat32(off.morphColorB,     m.colorB[0], true);
+      view.setFloat32(off.morphColorB + 4, m.colorB[1], true);
+      view.setFloat32(off.morphColorB + 8, m.colorB[2], true);
+      if (!useA) writePathColors(view, off.pathColorsA, m.pathColorsA!);
+      if (!useB) writePathColors(view, off.pathColorsB, m.pathColorsB!);
+    } else {
+      view.setUint32(off.useOverrideA, 1, true);
+      view.setUint32(off.useOverrideB, 1, true);
+    }
+
     device.queue.writeBuffer(buffer, 0, this.glassUniformData);
 
     const encoder = device.createCommandEncoder();
@@ -855,6 +983,8 @@ export class WebGPURenderer implements Renderer {
     this.backdropTexture?.destroy();
     this.morphTexA?.destroy();
     this.morphTexB?.destroy();
+    this.morphPathIdxTexA?.destroy();
+    this.morphPathIdxTexB?.destroy();
     this.context?.unconfigure();
     this.device?.destroy();
     this.uniformBuffer = null;
@@ -865,6 +995,8 @@ export class WebGPURenderer implements Renderer {
     this.backdropTexture = null;
     this.morphTexA = null;
     this.morphTexB = null;
+    this.morphPathIdxTexA = null;
+    this.morphPathIdxTexB = null;
     this.context = null;
     this.device = null;
     this.samplePipeline = null;
@@ -877,6 +1009,7 @@ export class WebGPURenderer implements Renderer {
     this.morphPipeline = null;
     this.morphBindGroup = null;
     this.sampler = null;
+    this.nearestSampler = null;
   }
 }
 

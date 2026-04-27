@@ -468,16 +468,19 @@ function Playground({
             key={bakeKey}
             ref={logoRef}
             src={src}
-            // Morph has no per-path paint, so an unset color renders as
-            // transparent. Force the start color through whenever morph
-            // is active, regardless of the tint toggle.
-            color={morph || tint ? color : undefined}
+            // The tint toggle gates both endpoints. When tint is on,
+            // `color` overrides shape A's silhouette and (if morph is
+            // active) `morphToColor` overrides shape B's. When off, each
+            // side falls back to its source SVG's per-path paint —
+            // multi-color SVGs morph region-by-region, single-color
+            // silhouettes paint in their authored color.
+            color={tint ? color : undefined}
             opacity={opacity}
             effect={effectProp}
             material={glass ? 'glass' : undefined}
             backdrop={glassBackdrop}
             to={morph ? morphTargetSrc : undefined}
-            toFillColor={morph ? morphToColor : undefined}
+            toFillColor={morph && tint ? morphToColor : undefined}
             autoPlay={autoPlay}
             ariaLabel="playground logo"
             onError={onError}
@@ -878,14 +881,14 @@ function ShowcaseCard({
           key={`${spec.id}:${bakeKey}`}
           ref={ref}
           src={src}
-          // Thematic color applies only to the built-in demo logo —
-          // uploaded SVGs render with their own per-path paint so users
-          // can preview their artwork as authored. Morph always applies
-          // its colors though: the shader has no per-path paint to fall
-          // back on, so an unset color would render as transparent.
-          color={spec.id === 'morph' || src === DEFAULT_SRC ? spec.color : undefined}
+          // Thematic colors apply only to the built-in demo logo —
+          // uploaded SVGs render with their own per-path paint (including
+          // through morph, where each region preserves its source color
+          // across the transition) so users can preview their artwork
+          // as authored.
+          color={src === DEFAULT_SRC ? spec.color : undefined}
           to={toSrc}
-          toFillColor={spec.toFillColor}
+          toFillColor={src === DEFAULT_SRC ? spec.toFillColor : undefined}
           effect={spec.effect}
           backdrop={backdrop}
           autoPlay={spec.autoPlay}

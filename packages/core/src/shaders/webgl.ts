@@ -148,11 +148,13 @@ float distToCubic(vec2 p, vec2 p0, vec2 p1, vec2 p2, vec2 p3, inout int crossing
   vec2 b = bezier(p0, p1, p2, p3, bestT);
   return length(b - p);
 }
-float sceneSDF(vec2 p) {
+float sceneSDF(vec2 p, out int winningPathIdx) {
+  winningPathIdx = 0;
   if (u_fillRule == 1) {
     // Even-odd across every segment in the bake — global parity. Lets
     // designers use cross-path crossings as subtraction; also the only
-    // mode in which the legacy fill-rule artifact can appear.
+    // mode in which the legacy fill-rule artifact can appear. There is
+    // no per-path notion in this mode, so winningPathIdx stays 0.
     float minD = 1e20;
     int crossings = 0;
     for (int i = 0; i < ${MAX_LOOP_BOUND}; i++) {
@@ -176,6 +178,12 @@ float sceneSDF(vec2 p) {
   // Stroked paths (u_pathMode[i] == 1) bypass even-odd entirely and use
   // the sausage SDF (pathMinD - halfW). Open subpaths inside a stroked
   // SVG would otherwise produce garbage parity that corrupts the union.
+  //
+  // winningPathIdx tracks which path produced the smallest signed
+  // distance at this fragment. Used by the bake's path-index output mode
+  // to write a per-pixel ownership map alongside the distance field —
+  // the renderer then samples both to look up per-path colors at draw
+  // time (preserves the source SVG's region colors through the morph).
   float result = 1e20;
   int prevEnd = 0;
   for (int p_i = 0; p_i < ${MAX_PATHS}; p_i++) {
@@ -199,7 +207,10 @@ float sceneSDF(vec2 p) {
       bool insidePath = (pathCrossings - (pathCrossings / 2) * 2) == 1;
       pathSigned = insidePath ? -pathMinD : pathMinD;
     }
-    if (pathSigned < result) result = pathSigned;
+    if (pathSigned < result) {
+      result = pathSigned;
+      winningPathIdx = p_i;
+    }
     prevEnd = segEnd;
   }
   return result;
@@ -223,13 +234,37 @@ void main() {
 }
 `;
 
-/** Bake fragment — writes raw signed distance to R channel. */
+/**
+ * Bake fragment — writes either signed distance or normalized winning
+ * path index to the R channel, switched by `u_bakeOutput`. Two-pass per
+ * side: pass 0 produces the distance texture; pass 1 produces the path-
+ * index texture (`float(idx) / 15.0`, reconstructed at sample time as
+ * `int(round(value * 15.0))`).
+ *
+ * Per-path index encoding lets the morph and glass+morph render paths
+ * preserve the source SVG's per-region colors through the unified bake:
+ * the renderer samples the path-index map alongside the SDF and looks
+ * up the corresponding color from a per-path uniform array. See the
+ * morph and glass shaders below for the lookup logic.
+ *
+ * MRT (WEBGL_draw_buffers) would let us write both outputs in one pass
+ * but adds extension-detection branching for what's a one-shot init-
+ * time cost; keeping it as two passes through the same fragment shader
+ * is simpler and still faster than the cost of a single render frame.
+ */
 export const WEBGL_BAKE_FRAG = /* glsl */ `
 precision highp float;
 varying vec2 v_uv;
+uniform int u_bakeOutput;
 ${SDF_BODY}
 void main() {
-  gl_FragColor = vec4(sceneSDF(v_uv), 0.0, 0.0, 1.0);
+  int idx = 0;
+  float d = sceneSDF(v_uv, idx);
+  if (u_bakeOutput == 1) {
+    gl_FragColor = vec4(float(idx) / 15.0, 0.0, 0.0, 1.0);
+  } else {
+    gl_FragColor = vec4(d, 0.0, 0.0, 1.0);
+  }
 }
 `;
 
@@ -249,6 +284,25 @@ const SDF_SAMPLER_DECLS = Array.from({ length: MAX_PATHS }, (_, i) =>
 const SAMPLE_IDX_BRANCHES = Array.from({ length: MAX_PATHS }, (_, i) =>
   `  if (i == ${i}) return texture2D(u_sdf${i}, t).r;`,
 ).join('\n');
+
+/**
+ * Per-path color lookup helper for the morph and glass-on-morph render
+ * paths. Generates an unrolled if-chain that maps a runtime int index to
+ * one of the {@link MAX_PATHS} entries in `u_pathColors{A,B}`.
+ *
+ * GLSL ES 1.00 allows dynamic indexing of non-sampler uniform arrays in
+ * principle, but driver support is uneven when the index is derived
+ * from a texture sample (path-index textures, here). The unrolled
+ * dispatch sidesteps that — drivers that don't unroll just compile a
+ * compact branch chain.
+ */
+const PATH_COLOR_LOOKUP = (arr: 'A' | 'B') => /* glsl */ `
+vec3 lookupPathColor${arr}(int idx) {
+${Array.from({ length: MAX_PATHS }, (_, i) =>
+  `  if (idx == ${i}) return u_pathColors${arr}[${i}];`,
+).join('\n')}
+  return u_pathColors${arr}[0];
+}`;
 
 /**
  * Sample fragment. Reads up to MAX_PATHS baked SDFs, each translated by
@@ -610,6 +664,26 @@ uniform bool      u_dynamicSdf;
 uniform sampler2D u_sdfB;
 uniform float     u_blendT;
 
+// Per-path tint plumbing. In dynamic-SDF (glass+morph) mode, tint at
+// each pixel comes from per-path colors looked up via the same path-
+// index textures the morph render pipeline uses — so a multi-color SVG
+// flowing under a glass lens shows region-by-region tinting that lerps
+// across the morph. When u_useOverrideA/B is set, the side falls back to
+// the existing u_tintColor material (frosted blue glass by default); this
+// preserves the look of single-color logos and lets callers force a flat
+// tint via color/toColor props.
+uniform sampler2D u_pathIdxA;
+uniform sampler2D u_pathIdxB;
+uniform vec3  u_pathColorsA[MAX_PATHS];
+uniform vec3  u_pathColorsB[MAX_PATHS];
+uniform int   u_useOverrideA;
+uniform int   u_useOverrideB;
+uniform vec3  u_morphColorA;
+uniform vec3  u_morphColorB;
+
+${PATH_COLOR_LOOKUP('A')}
+${PATH_COLOR_LOOKUP('B')}
+
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
@@ -817,8 +891,36 @@ void main() {
   float rim = smoothstep(-0.03, -0.005, d) * (1.0 - smoothstep(-0.005, 0.0, d));
   color += u_rimColor * rim * u_fresnelStrength;
 
-  // Interior tint — slight color wash in proportion to depth.
-  color = mix(color, u_tintColor, clamp(interior * u_tintStrength, 0.0, 1.0));
+  // Interior tint — slight color wash in proportion to depth. In glass+
+  // morph mode, tint is per-pixel: sample each side's path-index map and
+  // look up the corresponding per-path color, then lerp by u_blendT.
+  // u_useOverrideA/B falls back to the single-color material (default
+  // frosted blue glass via u_tintColor, or u_morphColorA/B when the
+  // caller forced a flat color through the React color/toColor props).
+  // In plain glass mode (no dynamic SDF) the existing single u_tintColor
+  // material is preserved unchanged.
+  vec3 tintColor;
+  if (u_dynamicSdf) {
+    vec2 st = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
+    vec3 tA;
+    if (u_useOverrideA == 1) {
+      tA = u_morphColorA;
+    } else {
+      int idxA = int(floor(texture2D(u_pathIdxA, st).r * 15.0 + 0.5));
+      tA = lookupPathColorA(idxA);
+    }
+    vec3 tB;
+    if (u_useOverrideB == 1) {
+      tB = u_morphColorB;
+    } else {
+      int idxB = int(floor(texture2D(u_pathIdxB, st).r * 15.0 + 0.5));
+      tB = lookupPathColorB(idxB);
+    }
+    tintColor = mix(tA, tB, u_blendT);
+  } else {
+    tintColor = u_tintColor;
+  }
+  color = mix(color, tintColor, clamp(interior * u_tintStrength, 0.0, 1.0));
 
   gl_FragColor = vec4(color, insideMask * u_opacity);
 }
@@ -829,12 +931,32 @@ void main() {
  * into a single SDF texture using a fill-rule-aware combine (see
  * {@link SDF_BODY}'s sceneSDF), so the silhouette is unified — multiple
  * sub-paths morph as one coherent shape rather than popping in/out via
- * Porter-Duff "over". Per-path colors are not preserved; the morph
- * paints with `u_colorA`→`u_colorB` lerped by `u_morphT`.
+ * Porter-Duff "over".
  *
  * Two textures, one t lerp, single fill mask:
  *   d = mix(texture(u_sdfA, st).r, texture(u_sdfB, st).r, u_morphT)
  *   mask = 1 - smoothstep(-aa, aa, d)
+ *
+ * Per-path colors. Each side also carries a path-index texture (baked
+ * alongside the SDF, see {@link WEBGL_BAKE_FRAG}) recording which sub-
+ * path "won" the union at that pixel. The renderer uploads each side's
+ * per-path RGB colors into `u_pathColorsA[16]` / `u_pathColorsB[16]`;
+ * the shader samples the index map, looks up the corresponding entry,
+ * and lerps A→B by `u_morphT`. Result: the morphing silhouette
+ * preserves each region's intrinsic SVG color through the transition
+ * (sharp boundaries between paths within a single shape are intentional
+ * — matches how SVG renders).
+ *
+ * Single-color override. When the caller wants a flat color (legacy
+ * behavior, or an explicit `color`/`toColor` prop), it sets
+ * `u_useOverride{A,B} = 1` and the shader bypasses the lookup, painting
+ * the whole side with `u_color{A,B}`. Mixed modes work — A may be
+ * override-tinted while B uses per-path lookup.
+ *
+ * GLSL ES 1.00 allows dynamic indexing of non-sampler uniform arrays,
+ * but driver support is uneven for that pattern when the index comes
+ * from a texture sample. The lookup helpers unroll to a fixed if-chain
+ * keyed by `MAX_PATHS` to stay portable; the dead branches optimize out.
  *
  * Output is straight-alpha (color * opacity) so the renderer's
  * `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blend composites correctly without a
@@ -844,6 +966,8 @@ export const WEBGL_MORPH_FRAG = /* glsl */ `
 #extension GL_OES_standard_derivatives : enable
 precision highp float;
 
+#define MAX_PATHS ${MAX_PATHS}
+
 uniform vec2  u_res;
 uniform float u_zoom;
 uniform vec2  u_offset;
@@ -852,8 +976,17 @@ uniform float u_bound;
 uniform float u_morphT;
 uniform sampler2D u_sdfA;
 uniform sampler2D u_sdfB;
+uniform sampler2D u_pathIdxA;
+uniform sampler2D u_pathIdxB;
 uniform vec3  u_colorA;
 uniform vec3  u_colorB;
+uniform vec3  u_pathColorsA[MAX_PATHS];
+uniform vec3  u_pathColorsB[MAX_PATHS];
+uniform int   u_useOverrideA;
+uniform int   u_useOverrideB;
+
+${PATH_COLOR_LOOKUP('A')}
+${PATH_COLOR_LOOKUP('B')}
 
 void main() {
   vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
@@ -866,7 +999,26 @@ void main() {
   float d = mix(dA, dB, u_morphT);
   float aa = fwidth(d) * 1.2;
   float mask = 1.0 - smoothstep(-aa, aa, d);
-  vec3 color = mix(u_colorA, u_colorB, u_morphT);
+
+  // Per-side color resolution. Override ⇒ flat color; otherwise sample
+  // the path-index map and look up the per-path color. The +0.5 inside
+  // round() handles half-float rounding-to-nearest off the [0..15]/15
+  // encoding the bake writes.
+  vec3 colorA;
+  if (u_useOverrideA == 1) {
+    colorA = u_colorA;
+  } else {
+    int idxA = int(floor(texture2D(u_pathIdxA, st).r * 15.0 + 0.5));
+    colorA = lookupPathColorA(idxA);
+  }
+  vec3 colorB;
+  if (u_useOverrideB == 1) {
+    colorB = u_colorB;
+  } else {
+    int idxB = int(floor(texture2D(u_pathIdxB, st).r * 15.0 + 0.5));
+    colorB = lookupPathColorB(idxB);
+  }
+  vec3 color = mix(colorA, colorB, u_morphT);
   gl_FragColor = vec4(color, mask * u_opacity);
 }
 `;
@@ -889,7 +1041,8 @@ void main() {
   vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
   uv *= 2.0 / u_zoom;
   uv -= u_offset;
-  float d = sceneSDF(uv);
+  int idx = 0;
+  float d = sceneSDF(uv, idx);
   float aa = fwidth(d) * 1.2;
   float mask = 1.0 - smoothstep(-aa, aa, d);
   gl_FragColor = vec4(u_color, mask * u_opacity);

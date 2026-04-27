@@ -37,6 +37,14 @@ const BACKDROP_UNIT = MAX_PATHS;
  *  unused) so the unit-count check at init covers both modes. */
 const DYNAMIC_SDF_B_UNIT = MAX_PATHS + 1;
 
+/** Texture units for the path-index maps (shape A + shape B). Live one
+ *  past the dynamic-SDF "shape B" unit so plain glass mode doesn't have
+ *  to allocate them — only glass+morph wires real textures here. The
+ *  shader samples them only when `u_dynamicSdf` is true, so plain glass
+ *  binding the dummy texture is harmless. */
+const PATH_IDX_A_UNIT = MAX_PATHS + 2;
+const PATH_IDX_B_UNIT = MAX_PATHS + 3;
+
 /** Texture unit used to bind the segment-data texture during bake (and
  *  during the direct render). The bake program reads only this texture;
  *  the direct program reads only this texture. Picking unit 0 keeps it
@@ -77,9 +85,20 @@ export class WebGLRenderer implements Renderer {
   private morphTexA: WebGLTexture | null = null;
   /** Single combined-SDF for morph shape B. */
   private morphTexB: WebGLTexture | null = null;
+  /** Per-side path-index textures. Each pixel stores the index of the
+   *  path that "won" the union at bake time — sampled by the morph and
+   *  glass+morph render shaders to look up per-path colors. */
+  private morphPathIdxTexA: WebGLTexture | null = null;
+  private morphPathIdxTexB: WebGLTexture | null = null;
   /** Per-side segment-data textures (one for A, one for B). Tracked so
    *  dispose can free GPU memory. */
   private morphSegmentTextures: WebGLTexture[] = [];
+  /** 1×1 dummy texture used to fill the path-index texture units in
+   *  plain glass mode (no morph). The shader gates samples on
+   *  `u_dynamicSdf`, so the dummy is never read; binding *something*
+   *  is still required for sampler2D uniforms to point somewhere
+   *  legal. */
+  private dummyPathIdxTex: WebGLTexture | null = null;
   private morphUniforms: Record<string, WebGLUniformLocation | null> = {};
   private textures: WebGLTexture[] = [];
   /** Per-path segment-data textures, parallel to {@link textures}. Each
@@ -102,6 +121,10 @@ export class WebGLRenderer implements Renderer {
   private pathModeBuf = new Int32Array(MAX_PATHS);
   private pathScalarBuf = new Float32Array(MAX_PATHS);
   private pathVec3Buf = new Float32Array(MAX_PATHS * 3);
+  /** Two more vec3-per-MAX_PATHS scratch buffers — used to upload
+   *  per-path morph color arrays each frame without allocating. */
+  private morphColorsABuf = new Float32Array(MAX_PATHS * 3);
+  private morphColorsBBuf = new Float32Array(MAX_PATHS * 3);
   /** Scratch buffer for u_pathEnds[] uploads — sized to the shader's
    *  fixed array length so we don't allocate at bake time. */
   private bakePathEndsBuf = new Int32Array(MAX_PATHS);
@@ -144,15 +167,17 @@ export class WebGLRenderer implements Renderer {
       throw new Error('OES_standard_derivatives not available');
     }
     // With MAX_PATHS=16 the sample shader binds 16 texture units; glass
-    // adds the backdrop and the dynamic-SDF "shape B" slot for 18.
-    // Every modern GPU exposes at least 16, but the WebGL 1 spec floor
-    // is 8. Fail loudly if the driver can't bind enough rather than
-    // letting the render silently sample dummy textures.
+    // adds the backdrop, the dynamic-SDF "shape B" slot, and two path-
+    // index slots (used in glass+morph; bound to a dummy in plain glass).
+    // That's MAX_PATHS + 4 = 20 in glass mode. Every modern GPU exposes
+    // at least 16, but the WebGL 1 spec floor is 8. Fail loudly if the
+    // driver can't bind enough rather than letting the render silently
+    // sample dummy textures.
     const maxUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) as number;
-    const needed = backdrop ? MAX_PATHS + 2 : MAX_PATHS;
+    const needed = backdrop ? MAX_PATHS + 4 : MAX_PATHS;
     if (maxUnits < needed) {
       throw new Error(
-        `this GPU exposes ${maxUnits} fragment texture units; bezier-sdf needs ${needed} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop + sdfB' : ''})`,
+        `this GPU exposes ${maxUnits} fragment texture units; bezier-sdf needs ${needed} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop + sdfB + 2× pathIdx' : ''})`,
       );
     }
     gl.enable(gl.BLEND);
@@ -247,6 +272,12 @@ export class WebGLRenderer implements Renderer {
     // pathHalfW carry the per-path render mode so stroked paths bake as
     // sausage SDFs rather than going through (meaningless) even-odd
     // parity over their open subpaths.
+    //
+    // Two-pass per side: first bake produces the signed-distance map
+    // (outputMode=0); the second produces the path-index map
+    // (outputMode=1). Each is one fullscreen quad over the same
+    // 1024×1024 target, so the cost is 2× the original morph init —
+    // tens of ms for typical icons, never per frame.
     const flatA = flattenForBake(prep.markA);
     const flatB = flattenForBake(prep.markB);
     const segTextures: WebGLTexture[] = [];
@@ -258,21 +289,33 @@ export class WebGLRenderer implements Renderer {
     segTextures.push(segA);
     const texA = this.bakeOne(
       gl, bakeProgram, segA, flatA.segments.length, HALF_FLOAT_OES,
-      flatA.pathEnds, fillRuleCode, flatA.pathModes, flatA.pathHalfW,
+      flatA.pathEnds, fillRuleCode, flatA.pathModes, flatA.pathHalfW, 0,
     );
     if (!texA) { cleanup([]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
+    const pathIdxA = this.bakeOne(
+      gl, bakeProgram, segA, flatA.segments.length, HALF_FLOAT_OES,
+      flatA.pathEnds, fillRuleCode, flatA.pathModes, flatA.pathHalfW, 1,
+    );
+    if (!pathIdxA) { cleanup([texA]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
 
     const segB = this.uploadSegmentTexture(gl, flatB.segments);
     segTextures.push(segB);
     const texB = this.bakeOne(
       gl, bakeProgram, segB, flatB.segments.length, HALF_FLOAT_OES,
-      flatB.pathEnds, fillRuleCode, flatB.pathModes, flatB.pathHalfW,
+      flatB.pathEnds, fillRuleCode, flatB.pathModes, flatB.pathHalfW, 0,
     );
-    if (!texB) { cleanup([texA]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
+    if (!texB) { cleanup([texA, pathIdxA]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
+    const pathIdxB = this.bakeOne(
+      gl, bakeProgram, segB, flatB.segments.length, HALF_FLOAT_OES,
+      flatB.pathEnds, fillRuleCode, flatB.pathModes, flatB.pathHalfW, 1,
+    );
+    if (!pathIdxB) { cleanup([texA, pathIdxA, texB]); gl.deleteProgram(bakeProgram); this.bakeProgram = null; return false; }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
     this.morphTexA = texA;
     this.morphTexB = texB;
+    this.morphPathIdxTexA = pathIdxA;
+    this.morphPathIdxTexB = pathIdxB;
     this.morphSegmentTextures = segTextures;
 
     if (backdrop) {
@@ -281,19 +324,27 @@ export class WebGLRenderer implements Renderer {
       // baked SDFs and blends them per fragment by `u_blendT`. Bind
       // shape A as the renderer's first SDF texture (slot 0, where the
       // glass program's `u_sdf0` lives) and shape B on the dedicated
-      // dynamic-SDF unit.
+      // dynamic-SDF unit. Path-index textures are bound during render
+      // (see render() below) since their uniforms also live in the
+      // glass program.
       this.textures = [texA];
       this.initGlass(gl, backdrop);
       gl.activeTexture(gl.TEXTURE0 + DYNAMIC_SDF_B_UNIT);
       gl.bindTexture(gl.TEXTURE_2D, texB);
+      gl.activeTexture(gl.TEXTURE0 + PATH_IDX_A_UNIT);
+      gl.bindTexture(gl.TEXTURE_2D, pathIdxA);
+      gl.activeTexture(gl.TEXTURE0 + PATH_IDX_B_UNIT);
+      gl.bindTexture(gl.TEXTURE_2D, pathIdxB);
       return true;
     }
 
     const program = link(gl, WEBGL_VERT, WEBGL_MORPH_FRAG);
     if (!program) {
-      cleanup([texA, texB]);
+      cleanup([texA, pathIdxA, texB, pathIdxB]);
       this.morphTexA = null;
       this.morphTexB = null;
+      this.morphPathIdxTexA = null;
+      this.morphPathIdxTexB = null;
       this.morphSegmentTextures = [];
       gl.deleteProgram(bakeProgram);
       this.bakeProgram = null;
@@ -315,9 +366,16 @@ export class WebGLRenderer implements Renderer {
       morphT:  loc('u_morphT'),
       colorA:  loc('u_colorA'),
       colorB:  loc('u_colorB'),
+      pathColorsA:   loc('u_pathColorsA[0]'),
+      pathColorsB:   loc('u_pathColorsB[0]'),
+      useOverrideA:  loc('u_useOverrideA'),
+      useOverrideB:  loc('u_useOverrideB'),
     };
+    // Texture-unit assignments: SDFs on 0/1, path-index maps on 2/3.
     gl.uniform1i(loc('u_sdfA'), 0);
     gl.uniform1i(loc('u_sdfB'), 1);
+    gl.uniform1i(loc('u_pathIdxA'), 2);
+    gl.uniform1i(loc('u_pathIdxB'), 3);
     gl.uniform1f(this.morphUniforms.bound!, WEBGL_BAKE_BOUND);
     return true;
   }
@@ -357,6 +415,12 @@ export class WebGLRenderer implements Renderer {
       pathStrokeHalfW:    loc('u_pathStrokeHalfW[0]'),
       dynamicSdf:         loc('u_dynamicSdf'),
       blendT:             loc('u_blendT'),
+      pathColorsA:        loc('u_pathColorsA[0]'),
+      pathColorsB:        loc('u_pathColorsB[0]'),
+      useOverrideA:       loc('u_useOverrideA'),
+      useOverrideB:       loc('u_useOverrideB'),
+      morphColorA:        loc('u_morphColorA'),
+      morphColorB:        loc('u_morphColorB'),
     };
     // Texture-unit bindings: baked SDFs on 0..MAX_PATHS-1, backdrop just
     // past them, dynamic-SDF "shape B" one further. Same SDF layout as
@@ -367,12 +431,33 @@ export class WebGLRenderer implements Renderer {
     }
     gl.uniform1i(this.glassUniforms.backdrop!, BACKDROP_UNIT);
     gl.uniform1i(loc('u_sdfB'), DYNAMIC_SDF_B_UNIT);
+    gl.uniform1i(loc('u_pathIdxA'), PATH_IDX_A_UNIT);
+    gl.uniform1i(loc('u_pathIdxB'), PATH_IDX_B_UNIT);
     gl.uniform1f(this.glassUniforms.bound!, WEBGL_BAKE_BOUND);
     gl.uniform1i(this.glassUniforms.pathCount!, this._pathCount);
     // Default to plain glass mode; render() flips the flag when a morph
-    // is composed in.
+    // is composed in. Override flags also default on so the (unread)
+    // morphColorA/B uniforms drive the tint when an old caller leaves
+    // the per-path arrays unset.
     gl.uniform1i(this.glassUniforms.dynamicSdf!, 0);
     gl.uniform1f(this.glassUniforms.blendT!, 0);
+    gl.uniform1i(this.glassUniforms.useOverrideA!, 1);
+    gl.uniform1i(this.glassUniforms.useOverrideB!, 1);
+
+    // Plain-glass mode never samples the path-index slots (the shader
+    // gates on u_dynamicSdf), but sampler2D uniforms still must point
+    // at *some* legal texture or the WebGL spec leaves the result
+    // implementation-defined. A 1×1 zero texture serves; reused across
+    // both slots.
+    if (!this.dummyPathIdxTex) {
+      this.dummyPathIdxTex = createDummyHalfFloatTexture(gl, this.halfFloatType);
+      if (this.dummyPathIdxTex) {
+        gl.activeTexture(gl.TEXTURE0 + PATH_IDX_A_UNIT);
+        gl.bindTexture(gl.TEXTURE_2D, this.dummyPathIdxTex);
+        gl.activeTexture(gl.TEXTURE0 + PATH_IDX_B_UNIT);
+        gl.bindTexture(gl.TEXTURE_2D, this.dummyPathIdxTex);
+      }
+    }
 
     // Backdrop texture. CORS-tainted sources throw here — caller should
     // catch and guide the user to same-origin or CORS-enabled hosting.
@@ -491,11 +576,17 @@ export class WebGLRenderer implements Renderer {
     fillRule: number = 0,
     pathModes: readonly number[] = [0],
     pathHalfW: readonly number[] = [0],
+    outputMode: number = 0,
   ): WebGLTexture | null {
     const tex = gl.createTexture();
+    // Path-index map is sampled with NEAREST so the integer encoding
+    // (float(idx)/15) doesn't bleed across path boundaries through
+    // bilinear filtering. Distance map keeps LINEAR for the smooth
+    // antialiased silhouette.
+    const filter = outputMode === 1 ? gl.NEAREST : gl.LINEAR;
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(
@@ -505,7 +596,7 @@ export class WebGLRenderer implements Renderer {
 
     if (!this.runBakeIntoTexture(
       gl, bakeProgram, tex, segmentTex, segCount, pathEnds, fillRule,
-      pathModes, pathHalfW,
+      pathModes, pathHalfW, outputMode,
     )) {
       gl.deleteTexture(tex);
       return null;
@@ -531,6 +622,7 @@ export class WebGLRenderer implements Renderer {
     fillRule: number = 0,
     pathModes: readonly number[] = [0],
     pathHalfW: readonly number[] = [0],
+    outputMode: number = 0,
   ): boolean {
     const fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -554,6 +646,7 @@ export class WebGLRenderer implements Renderer {
     gl.uniform1f(bU.segmentTexWidth!, segCount * 2);
     gl.uniform1i(bU.pathCount!, pathEnds.length);
     gl.uniform1i(bU.fillRule!, fillRule);
+    gl.uniform1i(bU.bakeOutput!, outputMode);
     // Pad arrays to MAX_PATHS so the uniforms are fully written; trailing
     // entries are never read because the shader's outer loop bounds on
     // u_pathCount, but GLSL requires the full array storage to be valid.
@@ -594,6 +687,7 @@ export class WebGLRenderer implements Renderer {
       pathMode:        gl.getUniformLocation(program, 'u_pathMode[0]'),
       pathHalfW:       gl.getUniformLocation(program, 'u_pathHalfW[0]'),
       fillRule:        gl.getUniformLocation(program, 'u_fillRule'),
+      bakeOutput:      gl.getUniformLocation(program, 'u_bakeOutput'),
     };
     // u_segments lives on a fixed unit; set it once so render-time only
     // has to bind the texture itself.
@@ -807,6 +901,19 @@ export class WebGLRenderer implements Renderer {
       gl.bindTexture(gl.TEXTURE_2D, this.morphTexA);
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, this.morphTexB);
+      // Path-index textures live on units 2/3 to match the morph
+      // shader's u_pathIdxA/u_pathIdxB sampler bindings (set at init).
+      // Always bind something legal even if the caller passed no per-
+      // path color arrays; the shader gates the lookup on
+      // u_useOverrideA/B and won't sample when the override fires.
+      if (this.morphPathIdxTexA) {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, this.morphPathIdxTexA);
+      }
+      if (this.morphPathIdxTexB) {
+        gl.activeTexture(gl.TEXTURE3);
+        gl.bindTexture(gl.TEXTURE_2D, this.morphPathIdxTexB);
+      }
 
       const mU = this.morphUniforms;
       gl.uniform2f(mU.res!, u.width, u.height);
@@ -818,6 +925,22 @@ export class WebGLRenderer implements Renderer {
       const cB = u.morph.colorB;
       gl.uniform3f(mU.colorA!, cA[0], cA[1], cA[2]);
       gl.uniform3f(mU.colorB!, cB[0], cB[1], cB[2]);
+      // Per-path colors. Caller passes them ⇒ disable override and
+      // upload the full MAX_PATHS-wide array (trailing slots zero, the
+      // shader's pathCount-style guard isn't applicable here because
+      // the lookup runs on whatever index the path-index map carries
+      // for that pixel — the bake guarantees that's always within the
+      // populated range, since pathCount is what the bake walked).
+      const useA = !u.morph.pathColorsA || u.morph.pathColorsA.length === 0;
+      const useB = !u.morph.pathColorsB || u.morph.pathColorsB.length === 0;
+      gl.uniform1i(mU.useOverrideA!, useA ? 1 : 0);
+      gl.uniform1i(mU.useOverrideB!, useB ? 1 : 0);
+      if (!useA) {
+        gl.uniform3fv(mU.pathColorsA!, fillMorphColors(this.morphColorsABuf, u.morph.pathColorsA!));
+      }
+      if (!useB) {
+        gl.uniform3fv(mU.pathColorsB!, fillMorphColors(this.morphColorsBBuf, u.morph.pathColorsB!));
+      }
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
@@ -840,6 +963,14 @@ export class WebGLRenderer implements Renderer {
       if (dynamic) {
         gl.activeTexture(gl.TEXTURE0 + DYNAMIC_SDF_B_UNIT);
         gl.bindTexture(gl.TEXTURE_2D, this.morphTexB!);
+        if (this.morphPathIdxTexA) {
+          gl.activeTexture(gl.TEXTURE0 + PATH_IDX_A_UNIT);
+          gl.bindTexture(gl.TEXTURE_2D, this.morphPathIdxTexA);
+        }
+        if (this.morphPathIdxTexB) {
+          gl.activeTexture(gl.TEXTURE0 + PATH_IDX_B_UNIT);
+          gl.bindTexture(gl.TEXTURE_2D, this.morphPathIdxTexB);
+        }
       }
 
       const gU = this.glassUniforms;
@@ -890,6 +1021,29 @@ export class WebGLRenderer implements Renderer {
       // existing per-path smin path.
       gl.uniform1i(gU.dynamicSdf!, dynamic ? 1 : 0);
       gl.uniform1f(gU.blendT!, u.morph?.t ?? 0);
+
+      // Per-path tint plumbing for glass+morph. Mirror of the standalone
+      // morph branch above: caller-supplied per-path colors switch the
+      // shader off `morphColorA/B` flat overrides and into texture-based
+      // lookup. In plain glass mode (`!dynamic`) the override flags are
+      // left at their init default of 1, so the shader's per-pixel tint
+      // path is gated out and `u_tintColor` runs unchanged.
+      if (dynamic) {
+        const cA = u.morph!.colorA;
+        const cB = u.morph!.colorB;
+        gl.uniform3f(gU.morphColorA!, cA[0], cA[1], cA[2]);
+        gl.uniform3f(gU.morphColorB!, cB[0], cB[1], cB[2]);
+        const useA = !u.morph!.pathColorsA || u.morph!.pathColorsA.length === 0;
+        const useB = !u.morph!.pathColorsB || u.morph!.pathColorsB.length === 0;
+        gl.uniform1i(gU.useOverrideA!, useA ? 1 : 0);
+        gl.uniform1i(gU.useOverrideB!, useB ? 1 : 0);
+        if (!useA) {
+          gl.uniform3fv(gU.pathColorsA!, fillMorphColors(this.morphColorsABuf, u.morph!.pathColorsA!));
+        }
+        if (!useB) {
+          gl.uniform3fv(gU.pathColorsB!, fillMorphColors(this.morphColorsBBuf, u.morph!.pathColorsB!));
+        }
+      }
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
@@ -982,6 +1136,9 @@ export class WebGLRenderer implements Renderer {
       if (this.backdropTexture) gl.deleteTexture(this.backdropTexture);
       if (this.morphTexA) gl.deleteTexture(this.morphTexA);
       if (this.morphTexB) gl.deleteTexture(this.morphTexB);
+      if (this.morphPathIdxTexA) gl.deleteTexture(this.morphPathIdxTexA);
+      if (this.morphPathIdxTexB) gl.deleteTexture(this.morphPathIdxTexB);
+      if (this.dummyPathIdxTex) gl.deleteTexture(this.dummyPathIdxTex);
       this.morphSegmentTextures.forEach((t) => gl.deleteTexture(t));
       if (this.buffer) gl.deleteBuffer(this.buffer);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
@@ -998,6 +1155,9 @@ export class WebGLRenderer implements Renderer {
     this.backdropTexture = null;
     this.morphTexA = null;
     this.morphTexB = null;
+    this.morphPathIdxTexA = null;
+    this.morphPathIdxTexB = null;
+    this.dummyPathIdxTex = null;
     this.morphSegmentTextures = [];
     this.buffer = null;
   }
@@ -1044,6 +1204,51 @@ function validateCombined(mark: Mark, label: 'A' | 'B'): void {
         'Simplify the source SVG (Inkscape → Path → Simplify) or merge duplicate paths.',
     );
   }
+}
+
+/** Pack up to MAX_PATHS RGB triples into the supplied flat scratch
+ *  buffer. Trailing slots zero-fill; the morph shader's lookup is
+ *  driven by the path-index map (clamped to the populated range during
+ *  bake), so trailing zeros are never observed at sample time. */
+function fillMorphColors(
+  buf: Float32Array,
+  src: ReadonlyArray<readonly [number, number, number]>,
+): Float32Array {
+  for (let i = 0; i < MAX_PATHS; i++) {
+    const c = src[i];
+    buf[i * 3]     = c ? c[0] : 0;
+    buf[i * 3 + 1] = c ? c[1] : 0;
+    buf[i * 3 + 2] = c ? c[2] : 0;
+  }
+  return buf;
+}
+
+/**
+ * Allocate a 1×1 half-float zero texture, suitable for satisfying
+ * sampler bindings the shader never actually reads (e.g. the plain-
+ * glass mode path-index slots, gated out by u_dynamicSdf). NEAREST
+ * filtering matches the path-index sample mode the real textures use.
+ * Returns null if the texture allocation fails — callers fall back to
+ * leaving the slot unbound, which only matters in plain-glass mode
+ * where the slot is gated out anyway.
+ */
+function createDummyHalfFloatTexture(
+  gl: WebGLRenderingContext,
+  halfFloatType: number,
+): WebGLTexture | null {
+  const tex = gl.createTexture();
+  if (!tex) return null;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // 4 zero half-float values — RGBA channels of one pixel, all 0.
+  gl.texImage2D(
+    gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0,
+    gl.RGBA, halfFloatType, new Uint16Array(4),
+  );
+  return tex;
 }
 
 /**
