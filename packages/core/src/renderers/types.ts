@@ -70,6 +70,13 @@ export interface Uniforms {
    * Glass is a material, not a painter: per-path colors, strokes,
    * `color`, and animation offsets are ignored. All paths smooth-union
    * into one silhouette used as the lens shape.
+   *
+   * Composition with morph: when both `glass: true` and `morph` are set
+   * AND the renderer was init'd with both `backdrop` and `morphTo`, the
+   * lens SDF becomes a per-fragment lerp between the two morph-baked
+   * SDFs (`mix(dA, dB, morph.t)`) and the standalone morph pipeline is
+   * bypassed. `morph.colorA`/`colorB` are unused in this mode (glass is
+   * a material, not a painter).
    */
   glass?: boolean;
   /** See liquid-glass params in the shader. Defaults applied if omitted. */
@@ -116,6 +123,11 @@ export interface RendererInitOptions {
    * alongside the normal one; the caller decides per-frame which to use
    * via {@link Uniforms.glass}. Prototype: static only — dynamic
    * backdrops (video, updating canvas) need a re-init.
+   *
+   * Pass `backdrop` together with {@link morphTo} to compose glass with
+   * the morph pipeline: both shapes are baked as combined SDFs and the
+   * glass shader blends them per-fragment by `morph.t` so refraction
+   * happens through a continuously-morphing silhouette.
    */
   backdrop?: TexImageSource;
   /**
@@ -132,11 +144,13 @@ export interface RendererInitOptions {
    * a side). Both should already be normalized via `prepareMorphPair`,
    * which handles the over-cap merging.
    *
-   * Morph mode is exclusive: when `morphTo` is set, the per-path sample
-   * and direct pipelines are *not* compiled — the renderer can only draw
-   * via the morph pipeline. Geometry must lie within the normalized
-   * bake region (`|x|, |y| ≲ 1`) for the field outside the boundary to
-   * remain a meaningful Euclidean distance.
+   * Morph mode is exclusive against the per-path sample and direct
+   * pipelines — when `morphTo` is set, those aren't compiled. The
+   * renderer either renders the dedicated morph pipeline (no `backdrop`)
+   * or routes the morph SDFs through the glass pipeline (with
+   * `backdrop`). Geometry must lie within the normalized bake region
+   * (`|x|, |y| ≲ 1`) for the field outside the boundary to remain a
+   * meaningful Euclidean distance.
    */
   morphTo?: Mark;
   /**

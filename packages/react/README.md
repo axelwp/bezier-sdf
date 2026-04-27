@@ -38,7 +38,7 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 | `'reveal'` | Scroll-into-view, or `autoPlay` | Split-and-merge intro animation. Plays once per mount; use the [imperative handle](#imperative-handle) to replay. |
 | `'ripple'` | Pointer down on the canvas | Gaussian shockwave ring through the silhouette. Up to 4 concurrent rings. |
 | `'liquid-cursor'` | Pointer over the canvas | Silhouette bulges toward the pointer. Stroked paths thicken and warp under the cursor ("wet paint" model). |
-| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; pair with [`toFillColor`](#props-reference) for color animation. Works with mixed fill/stroke SVGs (stroked subpaths bake as sausage SDFs and union cleanly with filled paths). See [Morph](#morph-1). |
+| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; pair with [`toFillColor`](#props-reference) for color animation. Works with mixed fill/stroke SVGs (stroked subpaths bake as sausage SDFs and union cleanly with filled paths). Composes with `material='glass'` for refraction through a morphing silhouette. See [Morph](#morph-1). |
 | `'liquid-glass'` | none | Legacy alias for `material='glass'`. Prefer the [`material`](#material) prop for glass, and use the spec object form to tune. |
 
 ```tsx
@@ -139,6 +139,14 @@ The `material` prop switches the silhouette's sample pipeline to a dedicated sha
   effect="liquid-cursor"
   backdrop="/hero.jpg"
 />
+
+{/* A glass lens that morphs into a different shape on hover */}
+<LiveGraphic
+  src="/logo.svg"
+  to="/logo-alt.svg"
+  material="glass"
+  backdrop="/hero.jpg"
+/>
 ```
 
 ### Liquid glass + ripple
@@ -158,6 +166,36 @@ The canonical composed effect. The glass lens refracts your backdrop; a pointerd
 ```
 
 Glass-specific parameters travel alongside the composition via a `liquid-glass` spec object in the `effect` array; the `material` prop is what actually activates the pipeline. (The legacy `effect='liquid-glass'` form still works on its own and will auto-activate the material, but the `material` prop is the composable path.)
+
+### Liquid glass + morph
+
+Add a `to` prop alongside glass for refraction through a continuously morphing silhouette. Both shapes are baked as combined SDFs at init; the glass shader blends them per fragment by the morph's hover-driven `t`, so the surface normals follow the deforming geometry, the rim Fresnel band tracks the silhouette as it changes, and the chromatic fringe rides along the moving curvature.
+
+```tsx
+<LiveGraphic
+  src="/icons/circle.svg"
+  to="/icons/star.svg"
+  material="glass"
+  backdrop="/hero.jpg"
+/>
+```
+
+Setting `to` is enough to engage the morph runtime; you don't have to add `'morph'` to `effect`. Tune the morph rate via a spec if needed:
+
+```tsx
+<LiveGraphic
+  src="/icons/circle.svg"
+  to="/icons/star.svg"
+  material="glass"
+  effect={[
+    { name: 'morph', rate: 8 },
+    { name: 'liquid-glass', refractionStrength: 0.06 },
+  ]}
+  backdrop="/hero.jpg"
+/>
+```
+
+Stack `ripple` or `liquid-cursor` into the array to add pointer interaction on top of the glass morph. Reduced motion freezes `t = 0` (shape A) and skips the rAF loop.
 
 ### Glass parameters
 
@@ -202,6 +240,8 @@ Hover-driven interpolation between two SVGs. The component loads both `src` and 
   toFillColor="#f472b6"
 />
 ```
+
+Setting the `to` prop alone is enough to engage the morph runtime; the explicit `effect="morph"` is only needed if you want to tune `rate` via the spec form. The runtime is also auto-included whenever `to` is paired with `material="glass"` (see [Liquid glass + morph](#liquid-glass--morph) for refraction through the morphing silhouette).
 
 Behavioral details:
 
@@ -256,7 +296,7 @@ function ReplayableLogo() {
 | `color` | `string` | *none* | Optional global color override. When set, every path is painted with this color (legacy smin mode). Omit to honor the SVG's per-path fill/stroke. Ignored when `material='glass'`. |
 | `opacity` | `number` | `1` | 0..1 multiplier applied on top of any per-effect opacity. |
 | `effect` | `LiveGraphicEffectProp` | `'none'` | Single preset name, spec object, or array of either. See [Effects](#effects). |
-| `to` | `string` | *none* | Target SVG URL for `effect='morph'`. The morph bakes both shapes into a unified-silhouette SDF and lerps. |
+| `to` | `string` | *none* | Target SVG URL for the morph pipeline. Setting `to` engages a hover-driven morph between `src` and the target without requiring an explicit `effect="morph"`. Pairs with `material="glass"` so the backdrop refracts through the morphing silhouette. |
 | `toFillColor` | `string` | *start color* | End color for the morph at `t=1`. Pair with `color` (start color at `t=0`). |
 | `fillRule` | `'nonzero' \| 'evenodd'` | `'nonzero'` | Morph bake fill rule. Default is SVG's default and avoids cross-path fill artifacts in multi-path icons. Switch to `'evenodd'` only when the source artwork relies on cross-path subtractive even-odd semantics (a "donut" SVG drawn as outer + inner contour subtracted via global parity). Other shapes lose their inner subtraction in `'evenodd'` so prefer the default. |
 | `autoPlay` | `boolean` | `false` | For `reveal`: skip the scroll-into-view wait and play on mount. Ignored by reactive effects. |

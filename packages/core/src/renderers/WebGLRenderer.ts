@@ -29,6 +29,14 @@ const GLASS_DEFAULTS = {
  *  MAX_PATHS SDF bindings so raising MAX_PATHS only shifts it. */
 const BACKDROP_UNIT = MAX_PATHS;
 
+/** Texture unit for the dynamic-SDF "shape B" texture. Used by glass+morph
+ *  composition: shape A's combined SDF goes on unit 0 (where `u_sdf0`
+ *  lives), shape B's on this unit, and the shader blends them by
+ *  `u_blendT` per fragment when `u_dynamicSdf` is true. Always reserved
+ *  when glass is active (even in plain glass mode, where the slot is
+ *  unused) so the unit-count check at init covers both modes. */
+const DYNAMIC_SDF_B_UNIT = MAX_PATHS + 1;
+
 /** Texture unit used to bind the segment-data texture during bake (and
  *  during the direct render). The bake program reads only this texture;
  *  the direct program reads only this texture. Picking unit 0 keeps it
@@ -136,15 +144,15 @@ export class WebGLRenderer implements Renderer {
       throw new Error('OES_standard_derivatives not available');
     }
     // With MAX_PATHS=16 the sample shader binds 16 texture units; glass
-    // adds the backdrop for 17. Every modern GPU exposes at least 16,
-    // but the WebGL 1 spec floor is 8. Fail loudly if the driver can't
-    // bind enough rather than letting the render silently sample dummy
-    // textures.
+    // adds the backdrop and the dynamic-SDF "shape B" slot for 18.
+    // Every modern GPU exposes at least 16, but the WebGL 1 spec floor
+    // is 8. Fail loudly if the driver can't bind enough rather than
+    // letting the render silently sample dummy textures.
     const maxUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) as number;
-    const needed = backdrop ? MAX_PATHS + 1 : MAX_PATHS;
+    const needed = backdrop ? MAX_PATHS + 2 : MAX_PATHS;
     if (maxUnits < needed) {
       throw new Error(
-        `this GPU exposes ${maxUnits} fragment texture units; bezier-sdf needs ${needed} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop' : ''})`,
+        `this GPU exposes ${maxUnits} fragment texture units; bezier-sdf needs ${needed} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop + sdfB' : ''})`,
       );
     }
     gl.enable(gl.BLEND);
@@ -174,10 +182,14 @@ export class WebGLRenderer implements Renderer {
     this.segmentFormat = segFormat;
 
     if (morphTo) {
-      // Morph mode is exclusive: skip the per-path sample/direct pipelines
-      // and only bake the two combined SDFs needed by the morph shader.
+      // Morph mode is exclusive against per-path sample/direct: only
+      // the combined-per-side SDFs are baked. With a backdrop the glass
+      // program is compiled instead of the dedicated morph render
+      // program — the glass shader's dynamic-SDF mode samples both
+      // morph SDFs and blends them per fragment, so refraction happens
+      // through a continuously-morphing silhouette.
       this._pathCount = 1;
-      if (!this.initMorph(gl, mark, morphTo, morphFillRule ?? 'nonzero')) {
+      if (!this.initMorph(gl, mark, morphTo, morphFillRule ?? 'nonzero', backdrop)) {
         throw new Error(
           'morph effect requires half-float texture extensions (unavailable in this context)',
         );
@@ -213,6 +225,7 @@ export class WebGLRenderer implements Renderer {
     markA: Mark,
     markB: Mark,
     fillRule: 'nonzero' | 'evenodd',
+    backdrop?: TexImageSource,
   ): boolean {
     const halfFloat = gl.getExtension('OES_texture_half_float');
     const colorBuf = gl.getExtension('EXT_color_buffer_half_float');
@@ -261,6 +274,20 @@ export class WebGLRenderer implements Renderer {
     this.morphTexA = texA;
     this.morphTexB = texB;
     this.morphSegmentTextures = segTextures;
+
+    if (backdrop) {
+      // Glass+morph composition: skip the dedicated morph render
+      // program. The glass shader's dynamic-SDF mode samples both
+      // baked SDFs and blends them per fragment by `u_blendT`. Bind
+      // shape A as the renderer's first SDF texture (slot 0, where the
+      // glass program's `u_sdf0` lives) and shape B on the dedicated
+      // dynamic-SDF unit.
+      this.textures = [texA];
+      this.initGlass(gl, backdrop);
+      gl.activeTexture(gl.TEXTURE0 + DYNAMIC_SDF_B_UNIT);
+      gl.bindTexture(gl.TEXTURE_2D, texB);
+      return true;
+    }
 
     const program = link(gl, WEBGL_VERT, WEBGL_MORPH_FRAG);
     if (!program) {
@@ -328,16 +355,24 @@ export class WebGLRenderer implements Renderer {
       pathOffset:         loc('u_pathOffset[0]'),
       pathMode:           loc('u_pathMode[0]'),
       pathStrokeHalfW:    loc('u_pathStrokeHalfW[0]'),
+      dynamicSdf:         loc('u_dynamicSdf'),
+      blendT:             loc('u_blendT'),
     };
     // Texture-unit bindings: baked SDFs on 0..MAX_PATHS-1, backdrop just
-    // past them. Same layout as the sample program so both can share the
-    // bound textures without reshuffling between draws.
+    // past them, dynamic-SDF "shape B" one further. Same SDF layout as
+    // the sample program so both can share the bound textures without
+    // reshuffling between draws; the sdfB slot is unique to glass.
     for (let i = 0; i < MAX_PATHS; i++) {
       gl.uniform1i(loc(`u_sdf${i}`), i);
     }
     gl.uniform1i(this.glassUniforms.backdrop!, BACKDROP_UNIT);
+    gl.uniform1i(loc('u_sdfB'), DYNAMIC_SDF_B_UNIT);
     gl.uniform1f(this.glassUniforms.bound!, WEBGL_BAKE_BOUND);
     gl.uniform1i(this.glassUniforms.pathCount!, this._pathCount);
+    // Default to plain glass mode; render() flips the flag when a morph
+    // is composed in.
+    gl.uniform1i(this.glassUniforms.dynamicSdf!, 0);
+    gl.uniform1f(this.glassUniforms.blendT!, 0);
 
     // Backdrop texture. CORS-tainted sources throw here — caller should
     // catch and guide the user to same-origin or CORS-enabled hosting.
@@ -790,13 +825,22 @@ export class WebGLRenderer implements Renderer {
 
     if (u.glass && this.glassProgram && this.backdropTexture) {
       gl.useProgram(this.glassProgram);
-      // Bind per-path SDFs on units 0..MAX_PATHS-1, backdrop on BACKDROP_UNIT.
+      // Bind per-path SDFs on units 0..MAX_PATHS-1, backdrop on
+      // BACKDROP_UNIT, and (when composing with morph) shape B's SDF on
+      // DYNAMIC_SDF_B_UNIT. In glass+morph mode `this.textures` is
+      // `[morphTexA]` so this loop binds shape A on slot 0 — matching
+      // the shader's `u_sdf0` lookup inside the dynamic-SDF branch.
       for (let i = 0; i < this.textures.length; i++) {
         gl.activeTexture(gl.TEXTURE0 + i);
         gl.bindTexture(gl.TEXTURE_2D, this.textures[i]!);
       }
       gl.activeTexture(gl.TEXTURE0 + BACKDROP_UNIT);
       gl.bindTexture(gl.TEXTURE_2D, this.backdropTexture);
+      const dynamic = !!u.morph && this.morphTexB !== null;
+      if (dynamic) {
+        gl.activeTexture(gl.TEXTURE0 + DYNAMIC_SDF_B_UNIT);
+        gl.bindTexture(gl.TEXTURE_2D, this.morphTexB!);
+      }
 
       const gU = this.glassUniforms;
       gl.uniform2f(gU.res!, u.width, u.height);
@@ -839,6 +883,13 @@ export class WebGLRenderer implements Renderer {
       // matches legacy single-color smin behavior.
       gl.uniform4iv(gU.pathMode!, this.fillPathModes(u));
       gl.uniform4fv(gU.pathStrokeHalfW!, this.fillPathScalars(u.pathStrokeHalfW, 0));
+      // Dynamic-SDF mode: when the renderer was init'd with both a
+      // backdrop and a morph target, `u.morph.t` drives the per-fragment
+      // blend between the two morph-baked SDFs inside the glass shader.
+      // In plain glass mode the flag stays 0 and the shader runs its
+      // existing per-path smin path.
+      gl.uniform1i(gU.dynamicSdf!, dynamic ? 1 : 0);
+      gl.uniform1f(gU.blendT!, u.morph?.t ?? 0);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;

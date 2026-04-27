@@ -595,6 +595,21 @@ uniform vec2  u_pathOffset[MAX_PATHS];
 uniform ivec4 u_pathMode[MAX_PATH_VEC4];
 uniform vec4  u_pathStrokeHalfW[MAX_PATH_VEC4];
 
+// Dynamic-SDF mode plumbing. When u_dynamicSdf is true, the lens SDF at
+// each pixel is mix(texture(u_sdf0, st), texture(u_sdfB, st), u_blendT)
+// — two combined SDFs (one per side of a morph bake) blended per
+// fragment. Per-path SDFs and smin are not used in this mode because the
+// flatten-then-bake morph pipeline has already unioned each side into a
+// single combined SDF; the result is a proper fill SDF that all the glass
+// math (height field, normals, refraction, Fresnel) operates on
+// unchanged. The flag is intentionally generic — anything that wants to
+// drive the glass SDF dynamically (chained morphs, displacement effects,
+// procedural distortion) can reuse it by binding a second texture and
+// feeding a blend parameter.
+uniform bool      u_dynamicSdf;
+uniform sampler2D u_sdfB;
+uniform float     u_blendT;
+
 float smin(float a, float b, float k) {
   float h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
@@ -672,13 +687,29 @@ float effectsField(vec2 uv) {
   return total;
 }
 
-// Combined lens SDF at 'uv': the cross-path smin silhouette minus the
-// distortion field. Both the smin strength and the SDF subtraction use
-// the same field at this 'uv', so under the cursor the paths fuse more
-// strongly *and* the boundary bulges toward the cursor — one coherent
-// localized deformation.
+// Combined lens SDF at 'uv': the silhouette minus the distortion field.
+//
+// Two source modes selected by u_dynamicSdf:
+//   - false: cross-path smin over the per-path baked SDFs (existing
+//     glass behaviour). Both the smin strength and the SDF subtraction
+//     use the same field at this 'uv', so under the cursor the paths
+//     fuse more strongly *and* the boundary bulges toward the cursor —
+//     one coherent localized deformation.
+//   - true:  per-fragment lerp mix(dA, dB, u_blendT) of two combined
+//     SDFs sampled from u_sdf0 (shape A) and u_sdfB (shape B). No
+//     smin is applied because each side was already flattened-and-baked
+//     into a single proper fill SDF by the morph pipeline (per-path
+//     stroke-to-sausage conversion happens at bake time). The same
+//     effects field still subtracts so cursor/ripple deformations
+//     compose with the morph.
 float lens(vec2 uv) {
   float f = effectsField(uv);
+  if (u_dynamicSdf) {
+    vec2 st = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
+    float dA = texture2D(u_sdf0, st).r;
+    float dB = texture2D(u_sdfB, st).r;
+    return mix(dA, dB, u_blendT) - f;
+  }
   return shapeSdf(uv, u_sminK + f * GLASS_SMIN_COUPLING) - f;
 }
 

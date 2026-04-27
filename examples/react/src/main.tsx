@@ -431,23 +431,12 @@ function Playground({
     setParams((p) => ({ ...p, morph: { ...p.morph, [key]: value } }));
   };
 
-  // Glass and morph are separate render pipelines — having both flagged
-  // confuses the read since morph wins inside LiveGraphic. Make turning one
-  // on flip the other off so the UI matches what's drawn.
-  const toggleGlass = () => {
-    setGlass((g) => {
-      const next = !g;
-      if (next) setMorph(false);
-      return next;
-    });
-  };
-  const toggleMorph = () => {
-    setMorph((m) => {
-      const next = !m;
-      if (next) setGlass(false);
-      return next;
-    });
-  };
+  // Glass + morph compose: when both are on, the glass pipeline samples
+  // the two morph-baked SDFs and blends them per fragment by the morph's
+  // hover-driven `t`, so the backdrop refracts through a continuously
+  // morphing silhouette. The toggles are independent.
+  const toggleGlass = () => setGlass((g) => !g);
+  const toggleMorph = () => setMorph((m) => !m);
 
   const resetParams = () => {
     setParams(DEFAULT_PARAMS);

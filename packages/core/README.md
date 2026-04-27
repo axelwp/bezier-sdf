@@ -117,6 +117,8 @@ See [`docs/technique.md`](https://github.com/axelwp/bezier-sdf/blob/main/docs/te
 
 Pass an image as `backdrop` at init time and the renderer compiles a refractive material pipeline alongside the normal one. Per frame, set `glass: true` and the silhouette renders as a frosted lens that refracts and tints the backdrop, with optional chromatic aberration, Fresnel rim, and box blur. Glass is a material, not a painter: per-path colors and animation offsets are ignored when `glass` is on. Backdrop sources must be same-origin or served with appropriate CORS headers.
 
+Glass also composes with the morph pipeline. Pass both `backdrop` and `morphTo` at init, then set `glass: true` together with `morph: { t, ... }` per frame; the lens SDF becomes a per-fragment lerp between the two morph-baked SDFs (dynamic-SDF mode), so refraction happens through a silhouette that smoothly morphs as `t` advances. Surface normals follow the deforming geometry, the rim Fresnel band tracks the changing edge, and the chromatic fringe rides along the moving curvature. The per-pixel cost adds one texture sample over plain glass. Colors inside the `morph` payload are unused in this mode (glass is still a material).
+
 ## API
 
 ### Geometry
@@ -171,7 +173,7 @@ You normally do not call `init` yourself. `createRenderer` instantiates the chos
 | `canvas` | `HTMLCanvasElement` | *required* | Target canvas. The renderer takes ownership of its GPU context. |
 | `mark` | `Mark` | *required* | Geometry. For morph, this is shape A. |
 | `backdrop` | `TexImageSource` | *none* | Image to refract through the silhouette in liquid-glass mode. When omitted, the glass pipeline is not compiled and `Uniforms.glass` is ignored. |
-| `morphTo` | `Mark` | *none* | When set, switches the renderer into morph mode. Both `mark` and `morphTo` are flattened into a single SDF per side and only the morph pipeline is compiled (the per-path sample and direct pipelines are skipped). |
+| `morphTo` | `Mark` | *none* | When set, switches the renderer into morph mode. Both `mark` and `morphTo` are flattened into a single SDF per side. With no `backdrop`, the dedicated morph pipeline renders straight color-to-color silhouettes. With a `backdrop`, the glass pipeline is compiled instead and samples the two morph SDFs in dynamic mode, refracting the backdrop through a continuously morphing silhouette. The per-path sample and direct pipelines are skipped in either case. |
 | `morphFillRule` | `'nonzero' \| 'evenodd'` | `'nonzero'` | Bake fill rule for both morph sides. `'nonzero'` (default) computes even-odd parity per path and unions paths via `min()`, which preserves intentional holes in a single path (the inside of an "O"). `'evenodd'` uses a single global crossing count across every segment; opt in only when the source artwork relies on cross-path subtractive parity. |
 
 #### `Uniforms` highlights
@@ -180,8 +182,8 @@ Per-frame state. The full type is exported via `@bezier-sdf/core/renderers`. The
 
 - **Legacy smin** (used by `examples/reveal`): pass `color` alone. All paths smooth-union into one silhouette painted with `color`. `sminK` controls the soft-union radius.
 - **Per-path composite** (typical for arbitrary user SVGs): pass `pathModes`, `pathFillColors`, `pathStrokeColors`, `pathStrokeHalfW`. Paths render in document order with Porter-Duff "over" at rest and smin-fuse with color blending under cursor/ripple effects.
-- **Glass**: pass `glass: true`. Requires the renderer to have been init'd with a `backdrop`. Refraction, chromatic aberration, frost blur, Fresnel rim, and tint are tunable via the `refractionStrength`, `chromaticStrength`, `frostStrength`, `fresnelStrength`, `tintStrength`, `rimColor`, and `tintColor` uniforms. Per-path colors and `pathOffsets` are ignored.
-- **Morph**: pass `morph: { t, colorA, colorB }`. Requires the renderer to have been init'd with `morphTo`. `t ∈ [0, 1]` lerps the SDFs and the silhouette color.
+- **Glass**: pass `glass: true`. Requires the renderer to have been init'd with a `backdrop`. Refraction, chromatic aberration, frost blur, Fresnel rim, and tint are tunable via the `refractionStrength`, `chromaticStrength`, `frostStrength`, `fresnelStrength`, `tintStrength`, `rimColor`, and `tintColor` uniforms. Per-path colors and `pathOffsets` are ignored. Pair with `morph` (and a renderer init'd with both `backdrop` and `morphTo`) to refract through a morphing silhouette; the glass shader samples the two morph SDFs and blends them per fragment by `morph.t`.
+- **Morph**: pass `morph: { t, colorA, colorB }`. Requires the renderer to have been init'd with `morphTo`. `t ∈ [0, 1]` lerps the SDFs and the silhouette color. When `glass: true` is also set the standalone morph pipeline is bypassed and the glass shader takes over the SDF blend; colors are unused in that case.
 
 Optional shared deformations: `cursor` / `cursorPull` / `cursorRadius` (Gaussian pull toward a point) and `ripples` (up to 4 concurrent shockwave rings, each `[x, y, age, amplitude]`). Active in legacy and per-path modes; ignored in morph and applied subtly inside glass.
 

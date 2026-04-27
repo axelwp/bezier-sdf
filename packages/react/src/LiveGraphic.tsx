@@ -653,7 +653,17 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
 
     // Snapshot current specs at mount. Param-only changes don't re-run
     // this effect (see `effectKey` dep); they flow in via `pushParams`.
-    const specs = resolveSpecs(effectRef.current);
+    // The morph runtime is auto-instantiated whenever the `to` prop is
+    // set — it drives the hover-flip animation that produces `morphT`,
+    // shared between the standalone morph effect and the glass+morph
+    // composition path. Adding it to the spec list (rather than gating
+    // on `effect="morph"`) means `<LiveGraphic to="…" effect="liquid-glass">`
+    // gets the same hover animation as `<LiveGraphic to="…" effect="morph">`
+    // without the user having to spell it out.
+    const baseSpecs = resolveSpecs(effectRef.current);
+    const specs = to && !baseSpecs.some((s) => s.def.name === 'morph')
+      ? [...baseSpecs, { def: morph }]
+      : baseSpecs;
     const defs = specs.map((s) => s.def);
     const needsPointer = defs.some((d) => d.needsPointer);
     const needsScroll = defs.some((d) => d.scrollTrigger);
@@ -676,6 +686,10 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
     // path. Stable for the lifetime of this renderer — re-init runs
     // whenever mark or markB change.
     const morphPrep = morphMode && markB ? prepareMorphPair(mark, markB) : null;
+    // Glass+morph composition: when both glass material and a morph
+    // target are active, the renderer routes the morph SDFs through
+    // the glass pipeline's dynamic-SDF mode.
+    const glassMorphActive = glassMode && morphPrep !== null;
 
     let cancelled = false;
     let renderer: Renderer | null = null;
@@ -696,13 +710,18 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       const offsets = frame?.pathOffsets ?? zeroOffsets(r.pathCount);
       const base = state.perPath;
 
-      if (morphMode && morphPrep) {
-        // Morph render path. Both shapes were pre-baked into a single
-        // combined SDF per side at init using the chosen fill rule; the
-        // shader lerps `mix(dA, dB, t)` and paints with `mix(colorA,
-        // colorB, t)`. `color` / `toFillColor` provide the start/end
-        // colors; if unset, fall back to black for both endpoints (the
-        // user opted out of color morphing).
+      if (morphMode && morphPrep && !glassMode) {
+        // Pure morph render path. Both shapes were pre-baked into a
+        // single combined SDF per side at init using the chosen fill
+        // rule; the shader lerps `mix(dA, dB, t)` and paints with
+        // `mix(colorA, colorB, t)`. `color` / `toFillColor` provide the
+        // start/end colors; if unset, fall back to black for both
+        // endpoints (the user opted out of color morphing).
+        //
+        // When glass is also active, fall through to the glass branch
+        // below — the glass shader's dynamic-SDF mode samples the same
+        // pair of morph-baked SDFs and refracts the backdrop through
+        // the morphing silhouette.
         const colorA = state.color ? parseColor(state.color) : ([0, 0, 0] as const);
         const colorB = state.toFillColor
           ? parseColor(state.toFillColor)
@@ -736,9 +755,30 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
         // tubes. pathOffsets, cursor, and ripple fields from the frame
         // flow through so the lens geometry animates (reveal) and
         // deforms (cursor/ripple).
+        //
+        // Glass+morph composition: when a morph target is active, pass
+        // `morph: { t, … }` alongside `glass: true`. The renderer
+        // detects the combination and routes the morph SDFs through
+        // the glass shader's dynamic-SDF mode — refraction happens
+        // through a continuously-morphing silhouette. Colors are
+        // unused in this mode (glass is a material) but supplied for
+        // type compatibility with the standalone morph render.
         const spec = extractGlassSpec(effectRef.current) ?? {};
         const gu = resolveGlassUniforms(spec);
         const base = state.perPath;
+        const morphData = glassMorphActive
+          ? (() => {
+              const colorA = state.color ? parseColor(state.color) : ([0, 0, 0] as const);
+              const colorB = state.toFillColor
+                ? parseColor(state.toFillColor)
+                : colorA;
+              return {
+                t: frame?.morphT ?? 0,
+                colorA,
+                colorB,
+              };
+            })()
+          : undefined;
         r.render({
           width: canvas.width,
           height: canvas.height,
@@ -763,6 +803,7 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
           frostStrength:      gu.frostStrength,
           rimColor:           gu.rimColor,
           tintColor:          gu.tintColor,
+          morph: morphData,
         });
         return runtimes.some((rt) => rt.active(now));
       }

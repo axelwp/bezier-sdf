@@ -8,6 +8,7 @@ import {
   WEBGPU_BAKE_BOUND,
   WEBGPU_BAKE_SIZE,
   WEBGPU_BAKE_UNIFORM_SIZE,
+  WEBGPU_DYNAMIC_SDF_B_BINDING,
   WEBGPU_GLASS_OFFSETS,
   WEBGPU_GLASS_SHADER,
   WEBGPU_GLASS_UNIFORM_SIZE,
@@ -113,17 +114,20 @@ export class WebGPURenderer implements Renderer {
     }
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
     if (!adapter) throw new Error('no WebGPU adapter');
-    // Glass binds 16 SDF textures + backdrop = 17 sampled textures in one
-    // stage, one past the WebGPU default minimum of 16. Request the extra
-    // up front so requestDevice rejects on adapters that can't meet it —
-    // clearer than a later pipeline-creation failure. Every desktop GPU
-    // driver exposes thousands; the downgrade path only matters on very
-    // constrained embedded targets.
-    const sampledTextureLimit = backdrop ? MAX_PATHS + 1 : MAX_PATHS;
+    // Glass binds 16 SDF textures + backdrop + dynamic-SDF "shape B"
+    // = 18 sampled textures in one stage, two past the WebGPU default
+    // minimum of 16. Request the extra up front so requestDevice
+    // rejects on adapters that can't meet it — clearer than a later
+    // pipeline-creation failure. Every desktop GPU driver exposes
+    // thousands; the downgrade path only matters on very constrained
+    // embedded targets. The sdfB slot is always reserved when glass is
+    // active even in plain glass mode (it's bound to a 1×1 dummy and
+    // unread — the shader gates samples on `dynamicSdf`).
+    const sampledTextureLimit = backdrop ? MAX_PATHS + 2 : MAX_PATHS;
     const adapterMax = adapter.limits.maxSampledTexturesPerShaderStage;
     if (adapterMax < sampledTextureLimit) {
       throw new Error(
-        `adapter exposes maxSampledTexturesPerShaderStage=${adapterMax}; bezier-sdf needs ${sampledTextureLimit} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop' : ''})`,
+        `adapter exposes maxSampledTexturesPerShaderStage=${adapterMax}; bezier-sdf needs ${sampledTextureLimit} (MAX_PATHS=${MAX_PATHS}${backdrop ? ' + backdrop + sdfB' : ''})`,
       );
     }
     const device = await adapter.requestDevice({
@@ -160,10 +164,13 @@ export class WebGPURenderer implements Renderer {
     this.bakeBindGroupLayout = bakeBindGroupLayout;
 
     if (morphTo) {
-      // Morph mode is exclusive: bake the two combined SDFs and compile
-      // only the morph pipeline. Per-path sample / glass pipelines are
-      // not created.
-      this.initMorph(device, mark, morphTo, morphFillRule ?? 'nonzero');
+      // Morph mode is exclusive against the per-path sample pipeline:
+      // only the combined-per-side SDFs are baked. With a backdrop the
+      // glass pipeline is compiled instead of the dedicated morph
+      // render pipeline — the glass shader's dynamic-SDF mode samples
+      // both morph SDFs and blends them per fragment, producing
+      // refraction through a continuously-morphing silhouette.
+      this.initMorph(device, mark, morphTo, morphFillRule ?? 'nonzero', backdrop);
       return;
     }
 
@@ -269,6 +276,7 @@ export class WebGPURenderer implements Renderer {
     markA: Mark,
     markB: Mark,
     fillRule: 'nonzero' | 'evenodd',
+    backdrop?: TexImageSource,
   ): void {
     const prep = prepareMorphPair(markA, markB);
     const fillRuleCode = fillRule === 'evenodd' ? 1 : 0;
@@ -293,10 +301,6 @@ export class WebGPURenderer implements Renderer {
     this.morphTexA = texA;
     this.morphTexB = texB;
 
-    this.morphUniformBuffer = device.createBuffer({
-      size: WEBGPU_MORPH_UNIFORM_SIZE,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
     const sampler = device.createSampler({
       magFilter: 'linear',
       minFilter: 'linear',
@@ -304,6 +308,45 @@ export class WebGPURenderer implements Renderer {
       addressModeV: 'clamp-to-edge',
     });
     this.sampler = sampler;
+
+    if (backdrop) {
+      // Glass+morph composition: skip the dedicated morph render
+      // pipeline and route the morph SDFs through the glass shader's
+      // dynamic-SDF mode. Shape A becomes the glass program's `tex0`
+      // (the slot the existing per-path glass code reads in its
+      // dynamic-SDF branch); shape B binds to the dedicated `sdfB`
+      // slot. Per-path slots 1..15 remain bound to a 1×1 dummy that
+      // the shader never samples (gated on `dynamicSdf`).
+      this.dummyTexture = device.createTexture({
+        size: [1, 1],
+        format: 'r16float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginRenderPass({
+          colorAttachments: [{
+            view: this.dummyTexture.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          }],
+        });
+        pass.end();
+        device.queue.submit([enc.finish()]);
+      }
+
+      this.textures = [texA];
+      const viewFor = (i: number) =>
+        (i < this.textures.length ? this.textures[i]! : this.dummyTexture!).createView();
+      this.initGlass(device, sampler, backdrop, viewFor);
+      return;
+    }
+
+    this.morphUniformBuffer = device.createBuffer({
+      size: WEBGPU_MORPH_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
     const morphShader = device.createShaderModule({ code: WEBGPU_MORPH_SHADER });
     const morphLayout = device.createBindGroupLayout({
@@ -398,6 +441,16 @@ export class WebGPURenderer implements Renderer {
           visibility: GPUShaderStage.FRAGMENT,
           texture: { sampleType: 'float', viewDimension: '2d' },
         },
+        {
+          // Dynamic-SDF "shape B" slot. In glass+morph composition this
+          // holds shape B's combined SDF; in plain glass mode it's
+          // bound to the 1×1 dummy and never sampled (the shader gates
+          // reads on `dynamicSdf`). The slot exists in the layout
+          // either way so the bind group is shape-stable across modes.
+          binding: WEBGPU_DYNAMIC_SDF_B_BINDING,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },
+        },
       ],
     });
     this.glassBindGroupLayout = glassLayout;
@@ -426,6 +479,11 @@ export class WebGPURenderer implements Renderer {
     viewFor: (i: number) => GPUTextureView,
     backdropTexture: GPUTexture,
   ): GPUBindGroup {
+    // Shape-B view: morphTexB if the renderer was init'd with a morph
+    // target (glass+morph composition), otherwise the 1×1 dummy. The
+    // shader gates samples on `dynamicSdf` so the dummy is never read
+    // in plain glass mode.
+    const sdfBView = (this.morphTexB ?? this.dummyTexture)!.createView();
     return device.createBindGroup({
       layout: this.glassBindGroupLayout!,
       entries: [
@@ -436,6 +494,7 @@ export class WebGPURenderer implements Renderer {
           resource: viewFor(i),
         })),
         { binding: WEBGPU_BACKDROP_BINDING, resource: backdropTexture.createView() },
+        { binding: WEBGPU_DYNAMIC_SDF_B_BINDING, resource: sdfBView },
       ],
     });
   }
@@ -597,13 +656,16 @@ export class WebGPURenderer implements Renderer {
       return;
     }
 
-    const { samplePipeline, uniformBuffer, sampleBindGroup } = this;
-    if (!samplePipeline || !uniformBuffer || !sampleBindGroup) return;
-
+    // Glass branch is checked before the sample-pipeline guard because
+    // glass+morph init compiles only the glass pipeline (no sample), so
+    // a samplePipeline-null guard up here would block valid glass draws.
     if (u.glass && this.glassPipeline && this.glassBindGroup && this.glassUniformBuffer) {
       this.renderGlass(device, context, u);
       return;
     }
+
+    const { samplePipeline, uniformBuffer, sampleBindGroup } = this;
+    if (!samplePipeline || !uniformBuffer || !sampleBindGroup) return;
 
     const perPath =
       u.pathModes !== undefined ||
@@ -754,6 +816,15 @@ export class WebGPURenderer implements Renderer {
     writePathModes(view, off.pathMode, u.pathModes);
     writePackedScalars(view, off.pathStrokeHalfW, u.pathStrokeHalfW, 0);
     writePathOffsets(view, off.pathOffsets, u.pathOffsets);
+
+    // Dynamic-SDF mode: when the renderer was init'd with both a backdrop
+    // and a morph target, `u.morph.t` drives the per-fragment blend
+    // between the two morph-baked SDFs inside the glass shader. In plain
+    // glass mode the flag stays 0 and the shader runs its existing
+    // per-path smin path.
+    const dynamic = !!u.morph && this.morphTexB !== null;
+    view.setUint32 (off.dynamicSdf, dynamic ? 1 : 0,    true);
+    view.setFloat32(off.blendT,     u.morph?.t ?? 0,    true);
 
     device.queue.writeBuffer(buffer, 0, this.glassUniformData);
 

@@ -78,6 +78,11 @@ export const WEBGPU_SAMPLE_UNIFORM_SIZE =
  * Uniform buffer layout for the glass sample pipeline — no compositeMode
  * / paint-color inputs, but carries the refraction/fresnel/tint scalars
  * and still needs the full per-path mode+strokeHalfW+offsets for strokes.
+ *
+ * `dynamicSdf` (u32 0/1) and `blendT` (f32) drive the dynamic-SDF mode:
+ * when set, the lens SDF at each pixel is `mix(sample(sdf0), sample(sdfB),
+ * blendT)` instead of the per-path smin union — used for glass-on-morph
+ * composition (and any future effect that wants a blended-SDF source).
  */
 const GLASS_OFF = {
   resolution: 0,
@@ -101,11 +106,15 @@ const GLASS_OFF = {
   pathMode: 160,                                  // 160..160+PATH_V4*16
   pathStrokeHalfW: 160 + PATH_V4 * 16,            // next
   pathOffsets: 160 + PATH_V4 * 16 * 2,            // two vec2 per vec4
+  dynamicSdf: 160 + PATH_V4 * 16 * 2 + (MAX_PATHS / 2) * 16,
+  blendT: 160 + PATH_V4 * 16 * 2 + (MAX_PATHS / 2) * 16 + 4,
 } as const;
 
 export const WEBGPU_GLASS_OFFSETS = GLASS_OFF;
+// Pad to vec4 alignment so the buffer size is a multiple of 16; WGSL
+// requires array elements / total struct sizes to round up to that.
 export const WEBGPU_GLASS_UNIFORM_SIZE =
-  GLASS_OFF.pathOffsets + (MAX_PATHS / 2) * 16;
+  GLASS_OFF.blendT + 12;
 
 /**
  * Uniform buffer layout for the morph pipeline. Two textures (one
@@ -616,6 +625,16 @@ const GLASS_SDF_DISPATCH = Array.from({ length: MAX_PATHS }, (_, i) =>
 ).join('\n');
 
 /**
+ * Binding for the dynamic-SDF "shape B" texture. Sits one past the
+ * backdrop. When the renderer is init'd in plain glass mode, this slot
+ * holds a 1×1 dummy and the shader never samples it (gated by
+ * `dynamicSdf`). When the renderer is init'd in glass+morph mode, slot
+ * 2 holds shape A's combined SDF and this slot holds shape B's; the
+ * shader's `sampleSdf` blends them by `blendT`.
+ */
+export const WEBGPU_DYNAMIC_SDF_B_BINDING = WEBGPU_BACKDROP_BINDING + 1;
+
+/**
  * Liquid-glass sample pipeline. Same shape-compositing as the legacy
  * smin branch — all paths smooth-unioned into one silhouette — but uses
  * the combined SDF's screen-space gradient as a surface normal to
@@ -627,6 +646,7 @@ const GLASS_SDF_DISPATCH = Array.from({ length: MAX_PATHS }, (_, i) =>
  *   1: sampler (linear, clamp — shared by SDF and backdrop)
  *   2..${SDF_BINDING_START + MAX_PATHS - 1}: baked SDF textures (texN)
  *   ${WEBGPU_BACKDROP_BINDING}: backdrop texture
+ *   ${WEBGPU_BACKDROP_BINDING + 1}: dynamic-SDF "shape B" texture
  */
 export const WEBGPU_GLASS_SHADER = /* wgsl */ `
 struct GlassUniforms {
@@ -659,12 +679,21 @@ struct GlassUniforms {
   pathStrokeHalfW: array<vec4<f32>, ${PATH_V4}>,
   // Two vec2 per vec4, indexed via pathOffset() helper below.
   pathOffsets: array<vec4<f32>, ${MAX_PATHS / 2}>,
+  // Dynamic-SDF mode: when 'dynamicSdf' is non-zero the lens SDF at
+  // each pixel is mix(sample(tex0), sample(sdfB), blendT) — used for
+  // glass-on-morph composition (and any future effect that wants a
+  // blended-SDF source). See WEBGL_GLASS_FRAG for the full rationale.
+  dynamicSdf: u32,
+  blendT: f32,
+  _pad0: u32,
+  _pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: GlassUniforms;
 @group(0) @binding(1) var samp: sampler;
 ${SDF_TEXTURE_BINDINGS}
 @group(0) @binding(${WEBGPU_BACKDROP_BINDING}) var backdrop: texture_2d<f32>;
+@group(0) @binding(${WEBGPU_BACKDROP_BINDING + 1}) var sdfB: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -753,11 +782,23 @@ fn effectsField(uv: vec2<f32>) -> f32 {
   return total;
 }
 
-// Combined lens SDF at 'uv': cross-path smin silhouette (with local k
-// boosted by the effects field) minus the field itself. Fusion and
-// bulge share the same 'f' at each tap — one coherent deformation.
+// Combined lens SDF at 'uv'. Two source modes selected by 'U.dynamicSdf':
+//   - 0: cross-path smin silhouette (with local k boosted by the effects
+//     field) — existing glass behaviour.
+//   - 1: per-fragment lerp 'mix(dA, dB, U.blendT)' over two combined
+//     SDFs sampled from tex0 (shape A) and sdfB (shape B). Skips smin
+//     because each side was already flattened-and-baked into a single
+//     proper fill SDF by the morph pipeline.
+// In both modes the same effects field is subtracted, so cursor and
+// ripple deformations compose with whichever SDF source drives the lens.
 fn lens(uv: vec2<f32>) -> f32 {
   let f = effectsField(uv);
+  if (U.dynamicSdf != 0u) {
+    let st = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    let dA = textureSample(tex0, samp, st).r;
+    let dB = textureSample(sdfB, samp, st).r;
+    return mix(dA, dB, U.blendT) - f;
+  }
   return shapeSdf(uv, U.sminK + f * GLASS_SMIN_COUPLING) - f;
 }
 

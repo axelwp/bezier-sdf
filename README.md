@@ -23,7 +23,7 @@ WebGPU primary, WebGL fallback, static SVG when neither is available.
 
 This repo ships two npm packages. Pick the one that fits your project:
 
-- **[`@bezier-sdf/react`](./packages/react)** is the headline package: a drop-in `<LiveGraphic>` component. Point it at an SVG URL, get a GPU-rendered silhouette with built-in intro animations, hover effects, ripples, glass material, and shape-to-shape morph. Handles fetch, parse, normalize, DPR, resize, `prefers-reduced-motion`, viewport pause, and static-SVG fallback for you. This is what most people want.
+- **[`@bezier-sdf/react`](./packages/react)** is the headline package: a drop-in `<LiveGraphic>` component. Point it at an SVG URL, get a GPU-rendered silhouette with built-in intro animations, hover effects, ripples, glass material, and shape-to-shape morph. Glass and morph compose: drop in a second SVG via `to` and the backdrop refracts through a silhouette that smoothly morphs on hover. Handles fetch, parse, normalize, DPR, resize, `prefers-reduced-motion`, viewport pause, and static-SVG fallback for you. This is what most people want.
 
 - **[`@bezier-sdf/core`](./packages/core)** is the framework-agnostic engine the React component is built on. Use it directly when you need lower-level control (custom render loops, non-React frameworks, your own pointer/scroll bindings, custom shaders). Requires more code and more familiarity with GPU rendering.
 
