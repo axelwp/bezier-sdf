@@ -110,7 +110,9 @@ export const WEBGPU_GLASS_UNIFORM_SIZE =
 /**
  * Uniform buffer layout for the morph pipeline. Two vec3<f32> colors
  * each take 12 B but a vec3 must align to 16 B in WGSL — pad behind
- * each to keep the next field 16-aligned.
+ * each to keep the next field 16-aligned. Stroke conversion params
+ * are packed into one vec4 at the end (aIsStroked, bIsStroked,
+ * aHalfWidth, bHalfWidth) — see the morph fragment for usage.
  *
  *   resolution : vec2<f32>   //  0
  *   zoom       : f32         //  8
@@ -122,6 +124,8 @@ export const WEBGPU_GLASS_UNIFORM_SIZE =
  *   _pad0      : f32         // 44
  *   colorB     : vec3<f32>   // 48  (align 16)
  *   _pad1      : f32         // 60
+ *   strokeArgs : vec4<f32>   // 64  (aIsStroked, bIsStroked,
+ *                                    aHalfWidth, bHalfWidth)
  */
 const MORPH_OFF = {
   resolution: 0,
@@ -132,9 +136,10 @@ const MORPH_OFF = {
   bound: 28,
   colorA: 32,
   colorB: 48,
+  strokeArgs: 64,
 } as const;
 export const WEBGPU_MORPH_OFFSETS = MORPH_OFF;
-export const WEBGPU_MORPH_UNIFORM_SIZE = 64;
+export const WEBGPU_MORPH_UNIFORM_SIZE = 80;
 
 /**
  * Bake shader. A storage buffer of (P0, P1, P2, P3) cubics gets uploaded
@@ -792,6 +797,9 @@ struct MorphUniforms {
   bound: f32,
   colorA: vec3<f32>,
   colorB: vec3<f32>,
+  // x: aIsStroked (0/1), y: bIsStroked (0/1),
+  // z: aHalfWidth, w: bHalfWidth
+  strokeArgs: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> U: MorphUniforms;
@@ -824,8 +832,13 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   uv = uv - U.offset;
 
   let t = clamp((uv / U.bound) * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-  let dA = textureSample(sdfA, samp, t).r;
-  let dB = textureSample(sdfB, samp, t).r;
+  let dA_raw = textureSample(sdfA, samp, t).r;
+  let dB_raw = textureSample(sdfB, samp, t).r;
+
+  // Convert centerline SDFs to fill SDFs for stroked sides before the
+  // lerp. See the GLSL counterpart for the geometry rationale.
+  let dA = mix(dA_raw, abs(dA_raw) - U.strokeArgs.z, U.strokeArgs.x);
+  let dB = mix(dB_raw, abs(dB_raw) - U.strokeArgs.w, U.strokeArgs.y);
   let d = mix(dA, dB, U.morphT);
 
   let aa = fwidth(d) * 1.2;

@@ -714,6 +714,16 @@ void main() {
  * field whose zero-contour is a continuous geometric in-between of A
  * and B at every t (Quilez 2D distance functions, blending demos).
  *
+ * Stroke conversion: a stroked SVG bakes its centerline distance, not
+ * the distance to its filled tube boundary. Lerping a centerline field
+ * against a fill field renders as a solid disc (the centerline's
+ * negative interior is empty in fill semantics). We pre-convert each
+ * stroked side to the sausage fill SDF `abs(d) - halfWidth` (the
+ * Minkowski sum of the centerline with a disc of `halfWidth`) so both
+ * sides of the lerp are coherent fill SDFs. Filled shapes pass through
+ * unchanged (`u_aIsStroked = u_bIsStroked = 0` makes both branches a
+ * no-op).
+ *
  * Color is lerped from `u_colorA` (t=0) to `u_colorB` (t=1). No per-path
  * machinery applies — morph renders as a single uniform color.
  */
@@ -729,6 +739,10 @@ uniform float u_bound;
 uniform float u_morphT;
 uniform vec3  u_colorA;
 uniform vec3  u_colorB;
+uniform float u_aIsStroked;
+uniform float u_bIsStroked;
+uniform float u_aHalfWidth;
+uniform float u_bHalfWidth;
 uniform sampler2D u_sdfA;
 uniform sampler2D u_sdfB;
 
@@ -738,8 +752,11 @@ void main() {
   uv -= u_offset;
 
   vec2 t = clamp((uv / u_bound) * 0.5 + 0.5, 0.0, 1.0);
-  float dA = texture2D(u_sdfA, t).r;
-  float dB = texture2D(u_sdfB, t).r;
+  float dA_raw = texture2D(u_sdfA, t).r;
+  float dB_raw = texture2D(u_sdfB, t).r;
+
+  float dA = mix(dA_raw, abs(dA_raw) - u_aHalfWidth, u_aIsStroked);
+  float dB = mix(dB_raw, abs(dB_raw) - u_bHalfWidth, u_bIsStroked);
   float d = mix(dA, dB, u_morphT);
 
   float aa = fwidth(d) * 1.2;

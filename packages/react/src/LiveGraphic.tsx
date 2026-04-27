@@ -193,6 +193,27 @@ function zeroOffsets(n: number): Array<[number, number]> {
   return Array.from({ length: n }, () => [0, 0] as [number, number]);
 }
 
+/**
+ * Pick the morph shader's per-shape render mode from a mark's paths.
+ *
+ * The morph shader is a fill renderer — it lerps two SDFs and shades
+ * the zero-contour. Filled paths' SDFs are already fill SDFs, but
+ * stroked paths are baked as centerline distance fields; passing one
+ * straight to the lerp shows up as a solid disc with interior
+ * artifacts. When every path is stroked we tell the shader to
+ * pre-convert that side via `abs(d) - halfW` (the sausage / Minkowski-
+ * tube fill SDF) before mixing. Mixed-mode marks fall back to "treat
+ * as filled" — the historical behavior — until we have a use case that
+ * needs per-path mixing inside morph.
+ */
+function detectStrokeMode(mark: Mark): { isStroked: boolean; halfWidth: number } {
+  const paths = mark.paths;
+  if (paths.length === 0) return { isStroked: false, halfWidth: 0 };
+  const allStroke = paths.every((p) => p.mode === 'stroke');
+  if (!allStroke) return { isStroked: false, halfWidth: 0 };
+  return { isStroked: true, halfWidth: paths[0]!.strokeWidth * 0.5 };
+}
+
 interface ResolvedSpec {
   def: EffectDefinition;
   params?: Record<string, number>;
@@ -656,6 +677,12 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
       console.warn('[bezier-sdf] effect="morph" requires the `to` prop; rendering shape A only');
     }
 
+    // Per-shape stroke conversion params for the morph shader. Stable
+    // for the lifetime of this renderer (re-init runs whenever mark or
+    // markB change), so compute once outside the render loop.
+    const morphStrokeA = morphMode && markB ? detectStrokeMode(mark) : null;
+    const morphStrokeB = morphMode && markB ? detectStrokeMode(markB) : null;
+
     let cancelled = false;
     let renderer: Renderer | null = null;
     let runtimes: EffectRuntime[] = [];
@@ -697,6 +724,10 @@ export const LiveGraphic = forwardRef<LiveGraphicHandle, LiveGraphicProps>(funct
             t: frame?.morphT ?? 0,
             colorA: startColor,
             colorB: endColor,
+            aIsStroked: morphStrokeA?.isStroked ?? false,
+            bIsStroked: morphStrokeB?.isStroked ?? false,
+            aHalfWidth: morphStrokeA?.halfWidth ?? 0,
+            bHalfWidth: morphStrokeB?.halfWidth ?? 0,
           },
         });
         return runtimes.some((rt) => rt.active(now));

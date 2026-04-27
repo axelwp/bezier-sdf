@@ -596,6 +596,10 @@ export class WebGPURenderer implements Renderer {
     view.setFloat32(off.colorB,         m.colorB[0], true);
     view.setFloat32(off.colorB + 4,     m.colorB[1], true);
     view.setFloat32(off.colorB + 8,     m.colorB[2], true);
+    view.setFloat32(off.strokeArgs,      m.aIsStroked ? 1 : 0,    true);
+    view.setFloat32(off.strokeArgs + 4,  m.bIsStroked ? 1 : 0,    true);
+    view.setFloat32(off.strokeArgs + 8,  m.aHalfWidth ?? 0,       true);
+    view.setFloat32(off.strokeArgs + 12, m.bHalfWidth ?? 0,       true);
 
     device.queue.writeBuffer(buffer, 0, this.morphUniformData);
 

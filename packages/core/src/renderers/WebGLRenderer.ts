@@ -194,14 +194,18 @@ export class WebGLRenderer implements Renderer {
 
     const loc = (n: string) => gl.getUniformLocation(program, n);
     this.morphUniforms = {
-      res:     loc('u_res'),
-      zoom:    loc('u_zoom'),
-      offset:  loc('u_offset'),
-      opacity: loc('u_opacity'),
-      bound:   loc('u_bound'),
-      morphT:  loc('u_morphT'),
-      colorA:  loc('u_colorA'),
-      colorB:  loc('u_colorB'),
+      res:         loc('u_res'),
+      zoom:        loc('u_zoom'),
+      offset:      loc('u_offset'),
+      opacity:     loc('u_opacity'),
+      bound:       loc('u_bound'),
+      morphT:      loc('u_morphT'),
+      colorA:      loc('u_colorA'),
+      colorB:      loc('u_colorB'),
+      aIsStroked:  loc('u_aIsStroked'),
+      bIsStroked:  loc('u_bIsStroked'),
+      aHalfWidth:  loc('u_aHalfWidth'),
+      bHalfWidth:  loc('u_bHalfWidth'),
     };
     // SDF textures live on units 0 and 1 — set once, render() only rebinds
     // the textures themselves.
@@ -556,6 +560,10 @@ export class WebGLRenderer implements Renderer {
       const cb = u.morph.colorB;
       gl.uniform3f(mU.colorA!, ca[0], ca[1], ca[2]);
       gl.uniform3f(mU.colorB!, cb[0], cb[1], cb[2]);
+      gl.uniform1f(mU.aIsStroked!, u.morph.aIsStroked ? 1 : 0);
+      gl.uniform1f(mU.bIsStroked!, u.morph.bIsStroked ? 1 : 0);
+      gl.uniform1f(mU.aHalfWidth!, u.morph.aHalfWidth ?? 0);
+      gl.uniform1f(mU.bHalfWidth!, u.morph.bHalfWidth ?? 0);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;

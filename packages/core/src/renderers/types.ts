@@ -99,6 +99,26 @@ export interface Uniforms {
     t: number;
     colorA: readonly [number, number, number];
     colorB: readonly [number, number, number];
+    /**
+     * Per-shape render-mode hints. The morph shader is a fill renderer:
+     * it lerps two SDFs and shades the zero-contour. Filled shapes' SDFs
+     * are already fill SDFs, but stroked shapes' SDFs are centerline
+     * distance fields — lerping those alongside a fill SDF produces
+     * nonsense in fill rendering (the stroked side appears as a solid
+     * disc with interior artifacts).
+     *
+     * When `aIsStroked` is true, the shader pre-converts shape A's SDF
+     * to its sausage fill SDF `abs(dA) - aHalfWidth` (the Minkowski sum
+     * of the centerline with a disc of radius `aHalfWidth`) before the
+     * lerp. Same for B. With both flags false the conversion is a no-op
+     * and behavior matches the previous filled-only morph.
+     *
+     * Defaults: `aIsStroked = bIsStroked = false`, half-widths `0`.
+     */
+    aIsStroked?: boolean;
+    bIsStroked?: boolean;
+    aHalfWidth?: number;
+    bHalfWidth?: number;
   };
 }
 
