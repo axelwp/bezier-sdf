@@ -16,9 +16,10 @@ import {
 } from '@bezier-sdf/react';
 import './styles.css';
 
-// The playground's tunable effects are the frame-based ones. `liquid-glass`
-// is a material (separate GPU pipeline) with its own card and static
-// defaults, so it's excluded from the playground's record shapes.
+// Frame-based effects are the ones whose chips share the `active` record
+// and per-name slider config. `liquid-glass` and `morph` each run a
+// separate GPU pipeline driven by their own playground state, so they
+// stay out of these record shapes.
 type FrameEffectName = Exclude<LiveGraphicEffectName, 'liquid-glass' | 'morph'>;
 
 const GLASS_DEFAULTS = {
@@ -195,7 +196,11 @@ type PlaygroundParams = {
   ripple: { speed: number; duration: number; amplitude: number; decay: number };
   'liquid-cursor': { pull: number; radius: number; lerp: number };
   glass: GlassNumericParams;
+  morph: { rate: number };
 };
+
+const MORPH_DEFAULT_TO = '/morph-circle.svg';
+const MORPH_DEFAULT_TO_COLOR = '#10c8ff';
 
 const DEFAULT_PARAMS: PlaygroundParams = {
   reveal: { duration: 1400, startOffset: 0.3, sminK: 0.08 },
@@ -208,6 +213,7 @@ const DEFAULT_PARAMS: PlaygroundParams = {
     tintStrength:       GLASS_DEFAULTS.tintStrength,
     frostStrength:      GLASS_DEFAULTS.frostStrength,
   },
+  morph: { rate: 15 },
 };
 
 interface SliderSpec {
@@ -245,6 +251,10 @@ const GLASS_PARAM_UI: SliderSpec[] = [
   { key: 'frostStrength',      label: 'frost',      min: 0, max: 8,    step: 0.1 },
 ];
 
+const MORPH_PARAM_UI: SliderSpec[] = [
+  { key: 'rate', label: 'rate', min: 1, max: 60, step: 0.5 },
+];
+
 const EFFECT_ORDER: FrameEffectName[] = ['reveal', 'ripple', 'liquid-cursor'];
 const EFFECT_HINT: Record<FrameEffectName, string> = {
   reveal: 'autoplay or replay to see it',
@@ -258,6 +268,7 @@ function buildEffectProp(
   rippleDurationEnabled: boolean,
   glass: boolean,
   glassColors: { rimColor: string; tintColor: string },
+  morph: boolean,
 ): LiveGraphicProps['effect'] {
   const specs: LiveGraphicEffectSpec[] = EFFECT_ORDER
     .filter((name) => active[name])
@@ -277,6 +288,9 @@ function buildEffectProp(
       ...params.glass,
       ...glassColors,
     } as LiveGraphicEffectSpec);
+  }
+  if (morph) {
+    specs.push({ name: 'morph', ...params.morph } as LiveGraphicEffectSpec);
   }
   if (specs.length === 0) return 'none';
   return specs;
@@ -302,6 +316,11 @@ function Playground({
   const [glassUploadUrl, setGlassUploadUrl] = useState<string | null>(null);
   const [glassUploadName, setGlassUploadName] = useState<string | null>(null);
   const glassFileInputRef = useRef<HTMLInputElement>(null);
+  const [morph, setMorph] = useState(false);
+  const [morphUploadUrl, setMorphUploadUrl] = useState<string | null>(null);
+  const [morphUploadName, setMorphUploadName] = useState<string | null>(null);
+  const [morphToColor, setMorphToColor] = useState<string>(MORPH_DEFAULT_TO_COLOR);
+  const morphFileInputRef = useRef<HTMLInputElement>(null);
   const [params, setParams] = useState<PlaygroundParams>(DEFAULT_PARAMS);
   const [rippleDurationEnabled, setRippleDurationEnabled] = useState(false);
   const [tint, setTint] = useState(true);
@@ -357,12 +376,39 @@ function Playground({
     setGlassUploadName(null);
   };
 
+  // Release the object URL when a new morph target replaces it (or on unmount).
+  useEffect(() => () => {
+    if (morphUploadUrl) URL.revokeObjectURL(morphUploadUrl);
+  }, [morphUploadUrl]);
+
+  const onMorphFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const looksLikeSvg =
+      file.type === 'image/svg+xml' || file.name.toLowerCase().endsWith('.svg');
+    if (!looksLikeSvg) return;
+    const url = URL.createObjectURL(file);
+    if (morphUploadUrl) URL.revokeObjectURL(morphUploadUrl);
+    setMorphUploadUrl(url);
+    setMorphUploadName(file.name);
+  };
+
+  const clearMorphUpload = () => {
+    if (morphUploadUrl) URL.revokeObjectURL(morphUploadUrl);
+    setMorphUploadUrl(null);
+    setMorphUploadName(null);
+  };
+
+  const morphTargetSrc = morphUploadUrl ?? MORPH_DEFAULT_TO;
+
   const effectProp = buildEffectProp(
     active,
     params,
     rippleDurationEnabled,
     glass,
     { rimColor: glassRim, tintColor: glassTint },
+    morph,
   );
 
   const toggleEffect = (name: FrameEffectName) => {
@@ -381,10 +427,33 @@ function Playground({
     setParams((p) => ({ ...p, glass: { ...p.glass, [key]: value } }));
   };
 
+  const updateMorphParam = (key: keyof PlaygroundParams['morph'], value: number) => {
+    setParams((p) => ({ ...p, morph: { ...p.morph, [key]: value } }));
+  };
+
+  // Glass and morph are separate render pipelines — having both flagged
+  // confuses the read since morph wins inside LiveGraphic. Make turning one
+  // on flip the other off so the UI matches what's drawn.
+  const toggleGlass = () => {
+    setGlass((g) => {
+      const next = !g;
+      if (next) setMorph(false);
+      return next;
+    });
+  };
+  const toggleMorph = () => {
+    setMorph((m) => {
+      const next = !m;
+      if (next) setGlass(false);
+      return next;
+    });
+  };
+
   const resetParams = () => {
     setParams(DEFAULT_PARAMS);
     setGlassRim(GLASS_DEFAULTS.rimColor);
     setGlassTint(GLASS_DEFAULTS.tintColor);
+    setMorphToColor(MORPH_DEFAULT_TO_COLOR);
   };
 
   return (
@@ -410,11 +479,16 @@ function Playground({
             key={bakeKey}
             ref={logoRef}
             src={src}
-            color={tint ? color : undefined}
+            // Morph has no per-path paint, so an unset color renders as
+            // transparent. Force the start color through whenever morph
+            // is active, regardless of the tint toggle.
+            color={morph || tint ? color : undefined}
             opacity={opacity}
             effect={effectProp}
             material={glass ? 'glass' : undefined}
             backdrop={glassBackdrop}
+            to={morph ? morphTargetSrc : undefined}
+            toFillColor={morph ? morphToColor : undefined}
             autoPlay={autoPlay}
             ariaLabel="playground logo"
             onError={onError}
@@ -440,16 +514,25 @@ function Playground({
                 <input
                   type="checkbox"
                   checked={glass}
-                  onChange={() => setGlass((g) => !g)}
+                  onChange={toggleGlass}
                 />
                 <span>glass</span>
               </label>
+              <label className="chip" data-on={morph ? 'true' : 'false'}>
+                <input
+                  type="checkbox"
+                  checked={morph}
+                  onChange={toggleMorph}
+                />
+                <span>morph</span>
+              </label>
             </div>
-            {EFFECT_ORDER.some((n) => active[n]) || glass ? (
+            {EFFECT_ORDER.some((n) => active[n]) || glass || morph ? (
               <div className="effect-hint">
                 {[
                   ...EFFECT_ORDER.filter((n) => active[n]).map((n) => EFFECT_HINT[n]),
                   ...(glass ? ['refracts the backdrop'] : []),
+                  ...(morph ? ['hover to morph'] : []),
                 ].join(' · ')}
               </div>
             ) : null}
@@ -631,6 +714,57 @@ function Playground({
                   aria-label="tint color"
                 />
                 <code className="row-val">{glassTint}</code>
+              </label>
+            </div>
+          ) : null}
+
+          {morph ? (
+            <div className="ctrl-group">
+              <div className="ctrl-group-head">
+                morph
+                <span className="group-actions">
+                  <input
+                    ref={morphFileInputRef}
+                    type="file"
+                    accept=".svg,image/svg+xml"
+                    onChange={onMorphFile}
+                    style={{ display: 'none' }}
+                  />
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => morphFileInputRef.current?.click()}
+                    title={morphUploadName ?? 'upload a target SVG to morph into'}
+                  >
+                    ↑ target
+                  </button>
+                  {morphUploadUrl ? (
+                    <button type="button" className="btn" onClick={clearMorphUpload}>
+                      reset
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+              <div className="effect-hint">
+                {morphUploadName ?? 'morph-circle.svg'}
+              </div>
+              {MORPH_PARAM_UI.map((s) => (
+                <ParamSlider
+                  key={s.key}
+                  spec={s}
+                  value={params.morph[s.key as keyof PlaygroundParams['morph']]}
+                  onChange={(v) => updateMorphParam(s.key as keyof PlaygroundParams['morph'], v)}
+                />
+              ))}
+              <label className="row">
+                <span className="row-label">to color</span>
+                <input
+                  type="color"
+                  value={morphToColor}
+                  onChange={(e) => setMorphToColor(e.target.value)}
+                  aria-label="morph end color"
+                />
+                <code className="row-val">{morphToColor}</code>
               </label>
             </div>
           ) : null}
