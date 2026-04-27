@@ -1,6 +1,6 @@
 {
   "name": "@bezier-sdf/core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Framework-agnostic GPU signed-distance-field rendering of cubic Bezier curves. WebGPU + WebGL renderers, Canvas 2D helpers, and geometry utilities.",
   "type": "module",
   "sideEffects": false,

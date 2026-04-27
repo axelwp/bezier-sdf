@@ -7,7 +7,7 @@
 Smooth animation, crisp at any zoom, no re-tessellation per frame.
 WebGPU primary, WebGL fallback, static SVG when neither is available.
 
-<img src="./docs/assets/logo-liquid-glass.png" alt="Logo with Liquid Glass Material" width="420" />
+<img src="./docs/assets/morph.gif" alt="Apple logo to apple pay morph animation" width="420" />
 
 ### [**→ Live demo**](https://axelwp.github.io/)
 
