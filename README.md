@@ -125,7 +125,7 @@ https://github.com/user-attachments/assets/79373986-fb38-4aac-8bc8-e926ca45585c
 | Example          | Technique                                                                 |
 |------------------|---------------------------------------------------------------------------|
 | `reveal`         | Split-and-merge intro: sub-paths start displaced, slide to final positions on scroll-into-view |
-| `morph`          | Hover-driven interpolation between two traced SVGs via combined-SDF lerp  |
+| `morph`          | Hover-driven interpolation between two traced SVGs via combined-SDF lerp; each source path keeps its SVG color through the transition |
 | `liquid-cursor`  | Pointer-tracking inverse-square pull bulges the silhouette toward the cursor |
 | `liquid-glass`   | Refractive glass material with chromatic aberration, frost blur, and Fresnel rim |
 | `react`          | `<LiveGraphic>` playground showing every preset and prop                  |

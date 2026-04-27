@@ -38,7 +38,7 @@ Renders the SVG silhouette through a GPU signed-distance field inside the compon
 | `'reveal'` | Scroll-into-view, or `autoPlay` | Split-and-merge intro animation. Plays once per mount; use the [imperative handle](#imperative-handle) to replay. |
 | `'ripple'` | Pointer down on the canvas | Gaussian shockwave ring through the silhouette. Up to 4 concurrent rings. |
 | `'liquid-cursor'` | Pointer over the canvas | Silhouette bulges toward the pointer. Stroked paths thicken and warp under the cursor ("wet paint" model). |
-| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; pair with [`toFillColor`](#props-reference) for color animation. Works with mixed fill/stroke SVGs (stroked subpaths bake as sausage SDFs and union cleanly with filled paths). Composes with `material='glass'` for refraction through a morphing silhouette. See [Morph](#morph-1). |
+| `'morph'` | Pointer over the canvas | Hover-driven shape-to-shape morph between `src` and `to`. Both shapes bake into a unified silhouette SDF and lerp; each source path keeps its own SVG fill/stroke color through the transition by default, or pair with [`color`](#props-reference) / [`toFillColor`](#props-reference) to flatten a side to a single color. Works with mixed fill/stroke SVGs (stroked subpaths bake as sausage SDFs and union cleanly with filled paths). Composes with `material='glass'` for refraction through a morphing silhouette. See [Morph](#morph-1). |
 | `'liquid-glass'` | none | Legacy alias for `material='glass'`. Prefer the [`material`](#material) prop for glass, and use the spec object form to tune. |
 
 ```tsx
@@ -235,7 +235,15 @@ Hover-driven interpolation between two SVGs. The component loads both `src` and 
 <LiveGraphic
   src="/icons/circle.svg"
   to="/icons/star.svg"
-  effect="morph"
+/>
+```
+
+That's enough to engage the morph runtime, and each path on either side keeps its own SVG fill/stroke color through the transition. Add `color` and/or `toFillColor` if you want to flatten a side to a single tint:
+
+```tsx
+<LiveGraphic
+  src="/icons/circle.svg"
+  to="/icons/star.svg"
   color="#22d3ee"
   toFillColor="#f472b6"
 />
@@ -245,7 +253,7 @@ Setting the `to` prop alone is enough to engage the morph runtime; the explicit 
 
 Behavioral details:
 
-- **Single silhouette.** Per-path colors and document order are intentionally collapsed; the morph paints the whole shape with `color` at `t=0` lerping to `toFillColor` at `t=1`. Pass only `color` (omit `toFillColor`) for a single-color morph with no color animation.
+- **Per-path colors are preserved by default.** The bake records, alongside the SDF, which source path owns each pixel. The morph shader uses that lookup to paint each region with its intrinsic SVG fill or stroke color on side A, the corresponding color on side B, and lerps between them as `t` advances. `color` flattens side A to a single color (the start of the morph); `toFillColor` flattens side B (the end). Mixed mode works (override one side, leave the other per-path). Omitting both gives you the full per-path A→B color morph.
 - **Mixed fill + stroke is supported.** Stroked subpaths inside either shape bake as sausage SDFs (`|d| − strokeWidth/2`) and union with filled paths cleanly. Open subpaths in stroked SVGs (e.g. eyebrows or a mouth line in a smiley icon) no longer leak parity-garbage wisps into the silhouette.
 - **Reduced motion.** Stays at `t = 0` (shape A) and skips the rAF loop entirely.
 - **Fill rule.** The bake uses [`fillRule`](#props-reference) (default `'nonzero'`) to decide how each path's interior is determined. The default avoids cross-path fill artifacts in multi-path icons; switch to `'evenodd'` only when the source artwork relies on global subtractive parity (rare).
@@ -293,11 +301,11 @@ function ReplayableLogo() {
 | Prop | Type | Default | Description |
 |---|---|---|---|
 | `src` | `string` | *required* | SVG URL or data URI. Fetched once and cached per-src across component instances. |
-| `color` | `string` | *none* | Optional global color override. When set, every path is painted with this color (legacy smin mode). Omit to honor the SVG's per-path fill/stroke. Ignored when `material='glass'`. |
+| `color` | `string` | *none* | Optional global color override. When set, every path is painted with this color (legacy smin mode); in morph mode it flattens side A (the start of the morph) to this single color. Omit to honor the SVG's per-path fill/stroke. Ignored when `material='glass'` (except in glass+morph, where it overrides side A's interior tint the same way). |
 | `opacity` | `number` | `1` | 0..1 multiplier applied on top of any per-effect opacity. |
 | `effect` | `LiveGraphicEffectProp` | `'none'` | Single preset name, spec object, or array of either. See [Effects](#effects). |
 | `to` | `string` | *none* | Target SVG URL for the morph pipeline. Setting `to` engages a hover-driven morph between `src` and the target without requiring an explicit `effect="morph"`. Pairs with `material="glass"` so the backdrop refracts through the morphing silhouette. |
-| `toFillColor` | `string` | *start color* | End color for the morph at `t=1`. Pair with `color` (start color at `t=0`). |
+| `toFillColor` | `string` | *none* | Flat color for the end of the morph (side B at `t=1`). When omitted, side B keeps each path's own SVG fill/stroke color and the morph lerps to those per-path colors. Pair with `color` to flatten side A as well. |
 | `fillRule` | `'nonzero' \| 'evenodd'` | `'nonzero'` | Morph bake fill rule. Default is SVG's default and avoids cross-path fill artifacts in multi-path icons. Switch to `'evenodd'` only when the source artwork relies on cross-path subtractive even-odd semantics (a "donut" SVG drawn as outer + inner contour subtracted via global parity). Other shapes lose their inner subtraction in `'evenodd'` so prefer the default. |
 | `autoPlay` | `boolean` | `false` | For `reveal`: skip the scroll-into-view wait and play on mount. Ignored by reactive effects. |
 | `material` | `'glass'` | *none* | Switch the silhouette pipeline to a material shader. Composes with frame-based effects. See [Material](#material). |

@@ -89,6 +89,8 @@ You get smooth animation of complex vector shapes without re-tessellation, and p
 
 For shape-to-shape interpolation, the renderer offers a separate **flatten-then-bake** pipeline. Both marks have all of their paths concatenated and baked into a single combined SDF per side; the morph fragment shader samples both textures and lerps `mix(dA, dB, t)` per pixel. The output is a single unified silhouette that flows from shape A to shape B as `t` advances from 0 to 1.
 
+Alongside each side's SDF, the bake also writes a **path-index map**: a low-cost lookup texture that tags each pixel with the source path it belongs to. The render shader uses it to look up the matching color from a small per-side palette and then lerps A→B by `t`, so each region of the silhouette keeps its intrinsic SVG color through the transition instead of collapsing to a single tint. Glass+morph reuses the same lookup for the interior tint when no flat override is supplied. Pass these palettes per frame as `pathColorsA` / `pathColorsB` (one RGB triplet per path on each side, capped at `MORPH_MAX_PATHS`); omit a side's array to fall back to flat `colorA` / `colorB` for that side. Mixed mode is fine (override one side, per-path the other).
+
 The bake distinguishes fill paths from stroke paths internally: filled subpaths use per-path even-odd parity; stroked subpaths bake as sausage SDFs (`pathMinD − strokeWidth/2`). Both produce proper signed fill SDFs that union via `min()` into a coherent silhouette, so SVGs that mix fills and strokes (icons with a circle plus stroked accents, line-art with closed and open subpaths, etc.) morph correctly without parity garbage from the open subpaths leaking into the result.
 
 Each side is capped at `MORPH_MAX_PATHS` (16). If your input has more paths, run it through `prepareMorphPair` first to merge the trailing ones into the last allowed path. Activate the pipeline by passing `morphTo` (and optionally `morphFillRule`) to `createRenderer`, then per-frame uniforms include `morph: { t, colorA, colorB }`:
@@ -108,6 +110,22 @@ renderer.render({
   width, height, zoom: 1, offsetX: 0, offsetY: 0, sminK: 0.08,
   pathOffsets: [], color: [0, 0, 0], opacity: 1,
   morph: { t: 0.5, colorA: [1, 0, 0], colorB: [0, 0, 1] },
+});
+```
+
+To preserve each path's own color through the morph instead of using flat side tints, pass per-path palettes:
+
+```ts
+renderer.render({
+  width, height, zoom: 1, offsetX: 0, offsetY: 0, sminK: 0.08,
+  pathOffsets: [], color: [0, 0, 0], opacity: 1,
+  morph: {
+    t: 0.5,
+    colorA: [0, 0, 0], // unused when pathColorsA is provided
+    colorB: [0, 0, 0],
+    pathColorsA: markA.paths.map((p) => p.fillColor),
+    pathColorsB: markB.paths.map((p) => p.fillColor),
+  },
 });
 ```
 
@@ -183,7 +201,7 @@ Per-frame state. The full type is exported via `@bezier-sdf/core/renderers`. The
 - **Legacy smin** (used by `examples/reveal`): pass `color` alone. All paths smooth-union into one silhouette painted with `color`. `sminK` controls the soft-union radius.
 - **Per-path composite** (typical for arbitrary user SVGs): pass `pathModes`, `pathFillColors`, `pathStrokeColors`, `pathStrokeHalfW`. Paths render in document order with Porter-Duff "over" at rest and smin-fuse with color blending under cursor/ripple effects.
 - **Glass**: pass `glass: true`. Requires the renderer to have been init'd with a `backdrop`. Refraction, chromatic aberration, frost blur, Fresnel rim, and tint are tunable via the `refractionStrength`, `chromaticStrength`, `frostStrength`, `fresnelStrength`, `tintStrength`, `rimColor`, and `tintColor` uniforms. Per-path colors and `pathOffsets` are ignored. Pair with `morph` (and a renderer init'd with both `backdrop` and `morphTo`) to refract through a morphing silhouette; the glass shader samples the two morph SDFs and blends them per fragment by `morph.t`.
-- **Morph**: pass `morph: { t, colorA, colorB }`. Requires the renderer to have been init'd with `morphTo`. `t ∈ [0, 1]` lerps the SDFs and the silhouette color. When `glass: true` is also set the standalone morph pipeline is bypassed and the glass shader takes over the SDF blend; colors are unused in that case.
+- **Morph**: pass `morph: { t, colorA, colorB, pathColorsA?, pathColorsB? }`. Requires the renderer to have been init'd with `morphTo`. `t ∈ [0, 1]` lerps the two SDFs. By default each pixel's color is looked up from the bake's path-index map using the matching entry in `pathColorsA` / `pathColorsB`, then lerped by `t`, so per-path SVG colors are preserved across the transition. Omit a side's `pathColors*` to flatten that side to its `colorA` / `colorB` instead (mixed mode is supported). When `glass: true` is also set the standalone morph pipeline is bypassed and the glass shader takes over the SDF blend; the same per-path lookup drives the glass interior tint, with the same flat-override rules.
 
 Optional shared deformations: `cursor` / `cursorPull` / `cursorRadius` (Gaussian pull toward a point) and `ripples` (up to 4 concurrent shockwave rings, each `[x, y, age, amplitude]`). Active in legacy and per-path modes; ignored in morph and applied subtly inside glass.
 
