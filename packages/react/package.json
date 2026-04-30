@@ -1,6 +1,6 @@
 {
   "name": "@bezier-sdf/react",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Drop-in React component for @bezier-sdf/core — load an SVG, render a crisp GPU silhouette, play built-in intro effects.",
   "type": "module",
   "sideEffects": false,
