@@ -132,6 +132,7 @@ https://github.com/user-attachments/assets/b6aa3d43-aaa6-4a27-a00e-d485a725d081
 | `morph`          | Hover-driven interpolation between two traced SVGs via combined-SDF lerp; each source path keeps its SVG color through the transition |
 | `liquid-cursor`  | Pointer-tracking inverse-square pull bulges the silhouette toward the cursor |
 | `liquid-glass`   | Refractive glass material with chromatic aberration, frost blur, and Fresnel rim |
+| `ink`            | Sumi-ink wash over procedural paper, driven by the baked SDF: wet-edge rim, noise-warped blotching, dry-brush streaks, fibre bleed; zoom-adaptive detail (WebGL2 prototype) |
 | `react`          | `<LiveGraphic>` playground showing every preset and prop                  |
 
 ## Local development

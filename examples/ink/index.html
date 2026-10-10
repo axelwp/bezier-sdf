@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>bezier-sdf — ink</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #e9e2d0; overflow: hidden; }
+      canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+      canvas:active { cursor: grabbing; }
+      #panel {
+        position: fixed; top: 12px; right: 12px; width: 220px; padding: 12px 14px;
+        font: 12px/1.4 ui-sans-serif, system-ui, sans-serif; color: #2a2522;
+        background: rgba(250, 246, 236, 0.86); border: 1px solid rgba(60, 50, 40, 0.18);
+        border-radius: 6px; backdrop-filter: blur(4px);
+      }
+      #panel h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+      #panel label { display: grid; grid-template-columns: 82px 1fr; align-items: center; gap: 6px; margin: 4px 0; }
+      #panel input[type=range] { width: 100%; accent-color: #2a2522; }
+      #panel .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+      #panel .hint { margin-top: 8px; color: #6b625a; }
+      #error { position: fixed; left: 12px; bottom: 12px; color: #8a1c1c; font: 13px ui-sans-serif, system-ui; }
+      @media (max-width: 520px) { #panel { left: 12px; right: 12px; width: auto; top: auto; bottom: 12px; } }
+    </style>
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+    <div id="panel">
+      <h1>Ink &amp; paper</h1>
+      <label>Ink load <input type="range" name="inkLoad" min="0" max="1.5" step="0.01" /></label>
+      <label>Wet edge <input type="range" name="wetEdge" min="0" max="1.5" step="0.01" /></label>
+      <label>Blotching <input type="range" name="blotch" min="0" max="2" step="0.01" /></label>
+      <label>Dry brush <input type="range" name="dry" min="0" max="1" step="0.01" /></label>
+      <label>Bleed <input type="range" name="bleed" min="0" max="2" step="0.01" /></label>
+      <label>Paper grain <input type="range" name="grain" min="0" max="1.5" step="0.01" /></label>
+      <label>Granulation <input type="range" name="granulation" min="0" max="1.5" step="0.01" /></label>
+      <div class="row">
+        <select id="shape">
+          <option value="bamboo">Bamboo</option>
+          <option value="chevrons">Chevrons</option>
+        </select>
+        <button id="reseed" type="button">Reseed</button>
+        <label style="display:flex;gap:4px;margin:0"><input id="sway" type="checkbox" />Sway</label>
+      </div>
+      <div class="hint">Scroll to zoom, drag to pan, double-click to reset.</div>
+    </div>
+    <div id="error"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
