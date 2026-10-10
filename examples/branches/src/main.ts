@@ -1,4 +1,4 @@
-import { BranchRenderer, type TaperedBranch } from '@bezier-sdf/core';
+import { BRANCH_STRIDE, BranchRenderer } from '@bezier-sdf/core';
 
 /**
  * A procedural tree, rebuilt from scratch every frame and drawn by the
@@ -49,10 +49,21 @@ function makeTopology(seed: number): Seg {
   return grow(0, 0, 1);
 }
 
-/** Lay the topology out for one frame: `t` is overall growth in [0, 1]. */
-function layout(root: Seg, t: number, time: number, out: TaperedBranch[]): void {
-  out.length = 0;
-  const visit = (seg: Seg, x: number, y: number, angle: number, len: number, r0: number) => {
+function countSegs(seg: Seg): number {
+  let n = 1;
+  for (let i = 0; i < seg.children.length; i++) n += countSegs(seg.children[i]!);
+  return n;
+}
+
+/**
+ * Lay the topology out for one frame, writing branches straight into
+ * `out` in the `packBranches` layout (sized for every segment) so the
+ * per-frame loop allocates nothing per branch. `t` is overall growth in
+ * [0, 1]. Returns the number of branches written.
+ */
+function layout(root: Seg, t: number, time: number, out: Float32Array): number {
+  let n = 0;
+  const visit = (seg: Seg, x: number, y: number, angle: number, len: number, r0: number): void => {
     const g = Math.min(1, Math.max(0, t * (MAX_DEPTH + 1) - seg.depth));
     if (g <= 0) return;
     const sway = Math.sin(time * 0.0011 + seg.phase) * 0.025 * seg.depth;
@@ -61,15 +72,20 @@ function layout(root: Seg, t: number, time: number, out: TaperedBranch[]): void 
     const dx = Math.cos(a), dy = Math.sin(a);
     const x2 = x + dx * L, y2 = y + dy * L;
     const b = seg.bend * L;
-    const p1: [number, number] = [(x + x2) / 2 - dy * b, (y + y2) / 2 + dx * b];
+    const p1x = (x + x2) / 2 - dy * b, p1y = (y + y2) / 2 + dx * b;
     const r1 = r0 * 0.66;
-    out.push({ p0: [x, y], p1, p2: [x2, y2], r0, r1, growth: g });
+    const o = n++ * BRANCH_STRIDE;
+    out[o] = x; out[o + 1] = y;
+    out[o + 2] = p1x; out[o + 3] = p1y;
+    out[o + 4] = x2; out[o + 5] = y2;
+    out[o + 6] = r0; out[o + 7] = r1; out[o + 8] = g;
     if (g < 1) return;
     // Children leave along the curve's end tangent so joints read as one stroke.
-    const ta = Math.atan2(y2 - p1[1], x2 - p1[0]);
-    for (const c of seg.children) visit(c, x2, y2, ta, L, r1);
+    const ta = Math.atan2(y2 - p1y, x2 - p1x);
+    for (let i = 0; i < seg.children.length; i++) visit(seg.children[i]!, x2, y2, ta, L, r1);
   };
   visit(root, 0, -0.95, Math.PI / 2, 0.36, 0.04);
+  return n;
 }
 
 async function main() {
@@ -81,16 +97,18 @@ async function main() {
   await renderer.init({ canvas });
 
   let topology = makeTopology(3);
+  let packed = new Float32Array(countSegs(topology) * BRANCH_STRIDE);
   let start = performance.now();
   let zoom = 1, offsetX = 0, offsetY = 0;
-  const branches: TaperedBranch[] = [];
   let frames = 0, fpsAt = performance.now(), fps = 0;
 
   const tick = (now: number) => {
+    // Schedule first so one failed frame cannot stop the loop.
+    requestAnimationFrame(tick);
     sizeCanvas(canvas);
     const t = Math.min(1, (now - start) / GROW_MS);
-    layout(topology, t, now, branches);
-    renderer.setBranches(branches);
+    const count = layout(topology, t, now, packed);
+    renderer.setBranches(packed.subarray(0, count * BRANCH_STRIDE));
     renderer.render({
       width: canvas.width, height: canvas.height,
       zoom, offsetX, offsetY,
@@ -98,8 +116,7 @@ async function main() {
     });
     frames++;
     if (now - fpsAt > 500) { fps = (frames * 1000) / (now - fpsAt); frames = 0; fpsAt = now; }
-    hud.textContent = `${branches.length} branches · ${fps.toFixed(0)} fps · zoom ${zoom.toFixed(1)}× · ${renderer.distanceTarget} target`;
-    requestAnimationFrame(tick);
+    hud.textContent = `${count} branches · ${fps.toFixed(0)} fps · zoom ${zoom.toFixed(1)}× · ${renderer.distanceTarget} target`;
   };
   requestAnimationFrame(tick);
 
@@ -131,6 +148,7 @@ async function main() {
   window.addEventListener('pointerup', () => {
     if (drag && !drag.moved) {
       topology = makeTopology((Math.random() * 2 ** 31) | 0);
+      packed = new Float32Array(countSegs(topology) * BRANCH_STRIDE);
       start = performance.now();
     }
     drag = null;

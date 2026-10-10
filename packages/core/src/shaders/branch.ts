@@ -6,9 +6,10 @@
  *   1. DISTANCE pass — one instanced quad per branch. The vertex shader
  *      clips the branch at its growth parameter (exact de Casteljau
  *      split) and covers only the clipped curve's chord-aligned bounding
- *      box, padded by the taper radius and an AA margin. That box is the
- *      culling: a fragment only ever evaluates the handful of branches
- *      whose boxes overlap it, instead of every branch in the scene. The
+ *      box (from branchBoxes() on the CPU, already padded by the taper
+ *      radius) plus an AA margin. That box is the culling: a fragment
+ *      only ever evaluates the handful of branches whose boxes overlap
+ *      it, instead of every branch in the scene. The
  *      fragment shader writes the branch's signed distance and the
  *      target blends with MIN, so the target ends up holding the exact
  *      hard union of all branches as a distance field.
@@ -41,6 +42,11 @@ layout(location = 0) in vec2 a_corner;
 layout(location = 1) in vec4 a_p01;
 layout(location = 2) in vec4 a_p2r;
 layout(location = 3) in float a_growth;
+// Per-instance culling box from branchBoxes() (computed on the CPU so
+// there is one tested implementation): unit chord direction u, and
+// extents (u0, v0, u1, v1) in the (u, perp(u)) frame, radius included.
+layout(location = 4) in vec2 a_axis;
+layout(location = 5) in vec4 a_box;
 
 out vec2 v_world;
 flat out vec2 v_A;
@@ -62,18 +68,10 @@ void main() {
   float r0 = a_p2r.z;
   float r1 = mix(a_p2r.z, a_p2r.w, g);
 
-  // Chord-aligned box around the control hull (which contains the
-  // curve), padded by the larger radius plus the AA margin.
-  vec2 u = Q2 - P0;
-  float len = length(u);
-  u = len > 1e-9 ? u / len : vec2(1.0, 0.0);
+  // Chord-aligned box, padded by the AA margin.
+  vec2 u = a_axis;
   vec2 v = vec2(-u.y, u.x);
-  vec3 pu = vec3(dot(P0, u), dot(Q1, u), dot(Q2, u));
-  vec3 pv = vec3(dot(P0, v), dot(Q1, v), dot(Q2, v));
-  float r = max(r0, r1) + u_pad;
-  vec2 lo = vec2(min(pu.x, min(pu.y, pu.z)), min(pv.x, min(pv.y, pv.z))) - r;
-  vec2 hi = vec2(max(pu.x, max(pu.y, pu.z)), max(pv.x, max(pv.y, pv.z))) + r;
-  vec2 box = mix(lo, hi, a_corner);
+  vec2 box = mix(a_box.xy - u_pad, a_box.zw + u_pad, a_corner);
   vec2 world = box.x * u + box.y * v;
 
   v_world = world;
@@ -101,22 +99,43 @@ out vec4 o_dist;
 
 float dot2(vec2 x) { return dot(x, x); }
 
+// Must match STRAIGHT_EPS / POLISH_STEPS in geometry/branch.ts.
+const float STRAIGHT_EPS = 1e-3;
+const int POLISH_STEPS = 2;
+
+// Newton on f(t) = dot(B(t) - pos, B'(t) / 2) for B(t) = A + 2a t + b t²,
+// d = A - pos; stops where f' <= 0 (not a minimum's basin).
+float polish(float t, vec2 a, vec2 b, vec2 d) {
+  for (int i = 0; i < POLISH_STEPS; i++) {
+    vec2 q = d + (2.0 * a + b * t) * t;
+    vec2 tg = a + b * t;
+    float fp = 2.0 * dot(tg, tg) + dot(q, b);
+    if (!(fp > 0.0)) break;
+    t = clamp(t - dot(q, tg) / fp, 0.0, 1.0);
+  }
+  return t;
+}
+
 // Closed-form distance to a quadratic Bezier and the closest-point
-// parameter (after Inigo Quilez, sdBezier). Mirrors quadraticDistance()
-// in geometry/branch.ts.
+// parameter (after Inigo Quilez, sdBezier), Newton-polished. Mirrors
+// quadraticDistance() in geometry/branch.ts.
 vec2 quadDistance(vec2 pos, vec2 A, vec2 B, vec2 C) {
   vec2 a = B - A;
   vec2 b = A - 2.0 * B + C;
   vec2 d = A - pos;
+  vec2 c = 2.0 * a;
   float bb = dot(b, b);
   float aa = dot(a, a);
-  if (bb <= 1e-5 * aa || bb < 1e-20) {
+  if (bb <= STRAIGHT_EPS * aa || bb < 1e-20) {
     vec2 e = C - A;
     float ee = dot(e, e);
-    float t = ee > 0.0 ? clamp(-dot(d, e) / ee, 0.0, 1.0) : 0.0;
-    return vec2(length(d + e * t), t);
+    float t = polish(ee > 0.0 ? clamp(-dot(d, e) / ee, 0.0, 1.0) : 0.0, a, b, d);
+    float dt = dot2(d + (c + b * t) * t);
+    float d0 = dot2(d), d1 = dot2(d + c + b);
+    if (d0 < dt) { dt = d0; t = 0.0; }
+    if (d1 < dt) { dt = d1; t = 1.0; }
+    return vec2(sqrt(dt), t);
   }
-  vec2 c = 2.0 * a;
   float kk = 1.0 / bb;
   float kx = kk * dot(a, b);
   float ky = kk * (2.0 * aa + dot(d, b)) / 3.0;
@@ -128,17 +147,19 @@ vec2 quadDistance(vec2 pos, vec2 A, vec2 B, vec2 C) {
     h = sqrt(h);
     vec2 x = (vec2(h, -h) - q) / 2.0;
     vec2 uv = sign(x) * pow(abs(x), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    float t = polish(clamp(uv.x + uv.y - kx, 0.0, 1.0), a, b, d);
     return vec2(sqrt(dot2(d + (c + b * t) * t)), t);
   }
   float z = sqrt(-p);
-  float ang = acos(q / (p * z * 2.0)) / 3.0;
+  float ang = acos(clamp(q / (p * z * 2.0), -1.0, 1.0)) / 3.0;
   float m = cos(ang);
   float n = sin(ang) * 1.732050808;
-  vec2 t = clamp(vec2(m + m, -n - m) * z - kx, 0.0, 1.0);
-  float d1 = dot2(d + (c + b * t.x) * t.x);
-  float d2 = dot2(d + (c + b * t.y) * t.y);
-  return d1 < d2 ? vec2(sqrt(d1), t.x) : vec2(sqrt(d2), t.y);
+  // Middle root (n - m) is the quartic's local maximum; skip it.
+  float t1 = polish(clamp((m + m) * z - kx, 0.0, 1.0), a, b, d);
+  float t2 = polish(clamp((-n - m) * z - kx, 0.0, 1.0), a, b, d);
+  float d1 = dot2(d + (c + b * t1) * t1);
+  float d2 = dot2(d + (c + b * t2) * t2);
+  return d1 < d2 ? vec2(sqrt(d1), t1) : vec2(sqrt(d2), t2);
 }
 
 void main() {

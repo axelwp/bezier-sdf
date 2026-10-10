@@ -160,7 +160,8 @@ How it stays cheap: each branch is drawn as one instanced quad covering only its
 
 Notes:
 
-- WebGL 2 only. With `EXT_color_buffer_float` the distance target is R16F and holds the full field (`distanceTarget === 'float'`); otherwise it falls back to RGBA8 storing distance within ±8 px of each edge (`'band'`), which is enough for anti-aliasing.
+- WebGL 2 only. With `EXT_color_buffer_float` the distance target is R16F, with `EXT_color_buffer_half_float` RGBA16F; both hold the full field (`distanceTarget === 'float'`). Otherwise, or if a float target turns out not to be renderable, it falls back to RGBA8 storing distance within ±8 px of each edge (`'band'`), which is enough for anti-aliasing.
+- WebGL context loss is handled: `render` does nothing while the context is lost, and the renderer rebuilds its GPU resources and re-uploads the last branch set when it is restored.
 - `growth` is in Bezier parameter, not arc length. It reads as uniform speed when `p1` sits near the chord midpoint.
 - The tapered distance is distance to the spine minus the radius at the closest spine point. That is exact for constant radius and a close approximation for gentle tapers.
 - Branches union with a hard `min`, so forks show a crease rather than a fillet.
