@@ -1,5 +1,5 @@
 import type { CubicSegment } from './types';
-import { quadAsCubic } from './parseSvgPath';
+import { quadAsCubic } from './elevate';
 
 /**
  * Procedural 2D tree growth, ported from the 3D generator in
@@ -58,8 +58,8 @@ export interface TreeParams {
   readonly firstSide?: 1 | -1;
   /**
    * Upper bound on the number of chains emitted. Chains are generated
-   * breadth-first, so hitting the cap drops the finest twigs first.
-   * Defaults to {@link DEFAULT_MAX_BRANCHES}.
+   * coarsest first (in order of descending `depth`), so hitting the cap
+   * drops the finest twigs first. Defaults to {@link DEFAULT_MAX_BRANCHES}.
    */
   readonly maxBranches?: number;
 }
@@ -107,14 +107,6 @@ export const DEFAULT_TREE_PARAMS: TreeParams = {
   gravity: 0.3,
 };
 
-interface Lateral {
-  cumulativeLengthAtSprout: number;
-  length: number;
-  radius: number;
-  depth: number;
-  side: 1 | -1;
-}
-
 /** A chain waiting to be grown; see `generateTree`. */
 interface PendingChain {
   base: Vec2;
@@ -142,10 +134,14 @@ function requireFinite(name: string, value: number): void {
 
 /**
  * Grow a tree. Branches are returned parents-first (the trunk is index 0),
- * so `parent` always points at an earlier entry. Chains are emitted
- * breadth-first and generation stops once `maxBranches` chains exist.
+ * so `parent` always points at an earlier entry. Chains are emitted in
+ * order of descending `depth` (a child is always shallower than its
+ * parent), and generation stops once `maxBranches` chains exist, so the
+ * cap keeps every chain coarser than the finest one it keeps.
  *
- * Throws a `RangeError` for parameters outside their valid range.
+ * Throws a `RangeError` for parameters outside their valid range, and for
+ * parameters whose geometry overflows (e.g. `lengthRatio * 1.3 > 1` or
+ * `radiusRatio > 1` over a very deep chain).
  */
 export function generateTree(params: TreeParams): TreeBranch[] {
   if (!Number.isInteger(params.depth) || params.depth < 0) {
@@ -160,6 +156,10 @@ export function generateTree(params: TreeParams): TreeBranch[] {
   if (!Number.isInteger(maxBranches) || maxBranches < 1) {
     throw new RangeError(`generateTree: maxBranches must be a positive integer, got ${maxBranches}`);
   }
+  const trunkFirstSide = params.firstSide ?? 1;
+  if (trunkFirstSide !== 1 && trunkFirstSide !== -1) {
+    throw new RangeError(`generateTree: firstSide must be 1 or -1, got ${params.firstSide}`);
+  }
   requireNonNegative('trunkLength', params.trunkLength);
   requireNonNegative('trunkRadius', params.trunkRadius);
   requireNonNegative('lengthRatio', params.lengthRatio);
@@ -173,102 +173,115 @@ export function generateTree(params: TreeParams): TreeBranch[] {
     requireFinite('origin[1]', params.origin[1]);
   }
 
-  const { growthDuration } = params;
+  const { growthDuration, childrenPerNode } = params;
   const out: TreeBranch[] = [];
-  const queue: PendingChain[] = [{
-    base: params.origin ?? [0, -1],
+  // Pending chains bucketed by start depth. Every child is shallower than
+  // its parent, so draining buckets from the deepest down emits parents
+  // before children and coarse chains before fine ones.
+  const buckets: (PendingChain[] | undefined)[] = [];
+  buckets[params.depth] = [{
+    base: params.origin ? [params.origin[0], params.origin[1]] : [0, -1],
     angle: params.angle ?? Math.PI / 2,
     startLength: params.trunkLength,
     startRadius: params.trunkRadius,
     startDepth: params.depth,
     spawnTime: 0,
     side: 0,
-    firstSide: params.firstSide ?? 1,
+    firstSide: trunkFirstSide,
     parent: -1,
   }];
 
-  for (let q = 0; q < queue.length && out.length < maxBranches; q++) {
-    const { base, angle, startLength, startRadius, startDepth, spawnTime, side, firstSide, parent } =
-      queue[q]!;
-    const dir: Vec2 = [Math.cos(angle), Math.sin(angle)];
-    let length = startLength;
-    let radius = startRadius;
-    let depth = startDepth;
-    let cumulativeLength = 0;
-    let lateralCount = 0;
+  for (let d = params.depth; d >= 0 && out.length < maxBranches; d--) {
+    const bucket = buckets[d];
+    if (!bucket) continue;
+    buckets[d] = undefined;
+    for (let q = 0; q < bucket.length && out.length < maxBranches; q++) {
+      const { base, angle, startLength, startRadius, startDepth, spawnTime, side, firstSide, parent } =
+        bucket[q]!;
+      const dir: Vec2 = [Math.cos(angle), Math.sin(angle)];
 
-    const laterals: Lateral[] = [];
-
-    while (depth >= 0) {
-      if (depth > 0) {
-        for (let i = 1; i < params.childrenPerNode; i++) {
-          const lateralSide: 1 | -1 = lateralCount % 2 === 0 ? firstSide : (-firstSide as 1 | -1);
-          lateralCount++;
-          // Siblings sprout progressively further along the node, never
-          // in its first 30%, so they don't stack on the node's base.
-          const tLocal = (i / params.childrenPerNode) * 0.7 + 0.3;
-          laterals.push({
-            cumulativeLengthAtSprout: cumulativeLength + length * tLocal,
-            length: length * params.lengthRatio,
-            radius: radius * params.radiusRatio,
-            depth: depth - 1,
-            side: lateralSide,
-          });
-        }
+      // The chain's total length and tip radius. The axis continues a
+      // little longer than its laterals (×1.3), as in the 3D version, so
+      // the leader stays dominant.
+      let length = startLength;
+      let radius = startRadius;
+      let cumulativeLength = 0;
+      for (let depth = startDepth; ; depth--) {
+        cumulativeLength += length;
+        if (depth === 0) break;
+        length *= params.lengthRatio * 1.3;
+        radius *= params.radiusRatio;
       }
 
-      cumulativeLength += length;
-      if (depth === 0) break;
+      const tipRadius = radius * params.radiusRatio;
+      const chainTip: Vec2 = [base[0] + dir[0] * cumulativeLength, base[1] + dir[1] * cumulativeLength];
 
-      // The axis continues a little longer than its laterals (×1.3), as in
-      // the 3D version, so the leader stays dominant.
-      length *= params.lengthRatio * 1.3;
-      radius *= params.radiusRatio;
-      depth--;
-    }
+      // The chain is straight before sag, so its direction is `dir`. Sag is
+      // strongest for horizontal chains and zero for vertical ones; the
+      // control point sags less than the tip so the curve bows downward.
+      const horizontality = 1 - Math.abs(dir[1]);
+      const tipSag = cumulativeLength * params.gravity * horizontality;
+      const controlSag = tipSag * 0.4;
+      const half = cumulativeLength / 2;
+      const c: Vec2 = [base[0] + dir[0] * half, base[1] + dir[1] * half - controlSag];
+      const b: Vec2 = [chainTip[0], chainTip[1] - tipSag];
 
-    const tipRadius = radius * params.radiusRatio;
-    const chainTip: Vec2 = [base[0] + dir[0] * cumulativeLength, base[1] + dir[1] * cumulativeLength];
+      if (![base[0], base[1], c[0], c[1], b[0], b[1], startRadius, tipRadius, spawnTime].every(Number.isFinite)) {
+        throw new RangeError(
+          'generateTree: parameters produce non-finite geometry; ' +
+            'reduce depth, lengthRatio, radiusRatio or gravity',
+        );
+      }
 
-    // The chain is straight before sag, so its direction is `dir`. Sag is
-    // strongest for horizontal chains and zero for vertical ones; the
-    // control point sags less than the tip so the curve bows downward.
-    const horizontality = 1 - Math.abs(dir[1]);
-    const tipSag = cumulativeLength * params.gravity * horizontality;
-    const controlSag = tipSag * 0.4;
-    const half = cumulativeLength / 2;
-    const c: Vec2 = [base[0] + dir[0] * half, base[1] + dir[1] * half - controlSag];
-    const b: Vec2 = [chainTip[0], chainTip[1] - tipSag];
-
-    const index = out.length;
-    out.push({
-      a: base, c, b, ra: startRadius, rb: tipRadius, spawnTime, growthDuration,
-      depth: startDepth, side, parent,
-    });
-
-    for (const lat of laterals) {
-      // Chains past the cap would never be emitted; don't queue them.
-      if (queue.length >= maxBranches) break;
-      // A zero-length chain (trunkLength or lengthRatio 0) collapses to a
-      // point; sprout everything from its base rather than dividing 0/0.
-      const t = cumulativeLength > 0 ? lat.cumulativeLengthAtSprout / cumulativeLength : 0;
-      // Tilt off the sagged curve's actual tangent at the sprout point, so
-      // children follow a drooping parent. Fall back to the chain's
-      // unsagged direction where the tangent vanishes.
-      const [tx, ty] = quadraticTangent(base, c, b, t);
-      const parentAngle = tx !== 0 || ty !== 0 ? Math.atan2(ty, tx) : angle;
-      queue.push({
-        base: evalQuadratic(base, c, b, t),
-        angle: parentAngle + lat.side * params.tiltAngle,
-        startLength: lat.length,
-        startRadius: lat.radius,
-        startDepth: lat.depth,
-        spawnTime: spawnTime + t * growthDuration,
-        side: lat.side,
-        // Start each child's alternation back toward its parent's axis.
-        firstSide: (-lat.side) as 1 | -1,
-        parent: index,
+      const index = out.length;
+      out.push({
+        a: base, c, b, ra: startRadius, rb: tipRadius, spawnTime, growthDuration,
+        depth: startDepth, side, parent,
       });
+
+      // Sprout laterals node by node, replaying the length sequence above.
+      length = startLength;
+      radius = startRadius;
+      let nodeStart = 0;
+      let parity = 0; // laterals so far along this chain, mod 2
+      for (let depth = startDepth; depth > 0; depth--) {
+        const target = (buckets[depth - 1] ??= []);
+        // Chains in `target` are emitted after everything emitted so far,
+        // so at most `maxBranches - out.length` of them ever will be; don't
+        // queue past that. This bounds work by the cap, not the tree size.
+        const room = maxBranches - out.length - target.length;
+        const count = Math.min(childrenPerNode - 1, Math.max(0, room));
+        for (let i = 1; i <= count; i++) {
+          const lateralSide: 1 | -1 = (parity + i - 1) % 2 === 0 ? firstSide : (-firstSide as 1 | -1);
+          // Siblings sprout progressively further along the node, never
+          // in its first 30%, so they don't stack on the node's base.
+          const tLocal = (i / childrenPerNode) * 0.7 + 0.3;
+          // A zero-length chain (trunkLength or lengthRatio 0) collapses to
+          // a point; sprout everything from its base rather than dividing 0/0.
+          const t = cumulativeLength > 0 ? (nodeStart + length * tLocal) / cumulativeLength : 0;
+          // Tilt off the sagged curve's actual tangent at the sprout point,
+          // so children follow a drooping parent. Fall back to the chain's
+          // unsagged direction where the tangent vanishes.
+          const [tx, ty] = quadraticTangent(base, c, b, t);
+          const parentAngle = tx !== 0 || ty !== 0 ? Math.atan2(ty, tx) : angle;
+          target.push({
+            base: evalQuadratic(base, c, b, t),
+            angle: parentAngle + lateralSide * params.tiltAngle,
+            startLength: length * params.lengthRatio,
+            startRadius: radius * params.radiusRatio,
+            startDepth: depth - 1,
+            spawnTime: spawnTime + t * growthDuration,
+            side: lateralSide,
+            // Start each child's alternation back toward its parent's axis.
+            firstSide: (-lateralSide) as 1 | -1,
+            parent: index,
+          });
+        }
+        parity = (parity + childrenPerNode - 1) % 2;
+        nodeStart += length;
+        length *= params.lengthRatio * 1.3;
+        radius *= params.radiusRatio;
+      }
     }
   }
 
@@ -327,13 +340,13 @@ export function growBranch(branch: TreeBranch, growth: number): TreeBranch {
  */
 export function treeAtTime(branches: readonly TreeBranch[], time: number): TreeBranch[] {
   const out: TreeBranch[] = [];
-  const outIndex = new Map<number, number>();
+  const outIndex = new Int32Array(branches.length).fill(-1);
   branches.forEach((br, i) => {
     const g = branchGrowth(br, time);
     if (g <= 0) return;
     const grown = growBranch(br, g);
-    const parent = br.parent >= 0 ? (outIndex.get(br.parent) ?? -1) : -1;
-    outIndex.set(i, out.length);
+    const parent = br.parent >= 0 && br.parent < i ? outIndex[br.parent]! : -1;
+    outIndex[i] = out.length;
     out.push(parent === br.parent ? grown : { ...grown, parent });
   });
   return out;

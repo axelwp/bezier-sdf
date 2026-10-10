@@ -184,13 +184,56 @@ describe('generateTree', () => {
 
   it('caps the number of branches, keeping the coarse structure', () => {
     const full = generateTree(params({ depth: 4 }));
-    const capped = generateTree(params({ depth: 4, maxBranches: 10 }));
-    expect(capped).toHaveLength(10);
-    // Breadth-first: the cap keeps the first chains of the full tree.
-    expect(capped).toEqual(full.slice(0, 10));
-    capped.forEach((br, i) => expect(br.parent).toBeLessThan(i));
+    for (const maxBranches of [1, 2, 3, 10, 20, 50, full.length - 1]) {
+      const capped = generateTree(params({ depth: 4, maxBranches }));
+      expect(capped).toHaveLength(maxBranches);
+      // The cap keeps a prefix of the full tree, parents first...
+      expect(capped).toEqual(full.slice(0, maxBranches));
+      capped.forEach((br, i) => expect(br.parent).toBeLessThan(i));
+      // ...and no kept branch is finer than any dropped one.
+      const dropped = full.slice(maxBranches);
+      const finestKept = Math.min(...capped.map((br) => br.depth));
+      const coarsestDropped = Math.max(...dropped.map((br) => br.depth));
+      expect(finestKept).toBeGreaterThanOrEqual(coarsestDropped);
+    }
+    // With depth 4 and 20 branches, every chain of depth ≥ 2 survives.
+    const counts = (tree: TreeBranch[]) =>
+      tree.reduce<Record<number, number>>((m, br) => ({ ...m, [br.depth]: (m[br.depth] ?? 0) + 1 }), {});
+    expect(counts(generateTree(params({ depth: 4, maxBranches: 20 })))).toEqual({ 4: 1, 3: 2, 2: 6, 1: 11 });
     // The default cap stops runaway growth.
     expect(generateTree(params({ depth: 12, childrenPerNode: 4 }))).toHaveLength(DEFAULT_MAX_BRANCHES);
+  });
+
+  it('bounds work by maxBranches, not by childrenPerNode', () => {
+    const tree = generateTree({ ...DEFAULT_TREE_PARAMS, depth: 2, childrenPerNode: 5e7, maxBranches: 1 });
+    expect(tree).toHaveLength(1);
+    expect(generateTree(params({ depth: 2, childrenPerNode: 5e7 }))).toHaveLength(DEFAULT_MAX_BRANCHES);
+  });
+
+  it('rejects parameters whose geometry overflows', () => {
+    expect(() => generateTree(params({ depth: 1000, lengthRatio: 2, childrenPerNode: 1 }))).toThrow(RangeError);
+    expect(() => generateTree(params({ depth: 1100, radiusRatio: 2, childrenPerNode: 1 }))).toThrow(RangeError);
+    // Growing leaders are fine as long as they stay finite.
+    const tree = generateTree(params({ depth: 6, lengthRatio: 1, radiusRatio: 1 }));
+    for (const v of packBranches(tree)) expect(Number.isFinite(v)).toBe(true);
+    for (const br of tree) for (const p of [br.a, br.c, br.b]) expect(p.every(Number.isFinite)).toBe(true);
+  });
+
+  it('rejects a firstSide other than 1 or -1', () => {
+    for (const firstSide of [0, 2, -2, NaN]) {
+      expect(() => generateTree(params({ firstSide: firstSide as 1 }))).toThrow(/firstSide/);
+    }
+    expect(() => generateTree(params({ firstSide: undefined }))).not.toThrow();
+  });
+
+  it('does not alias the caller\'s origin', () => {
+    const origin: [number, number] = [0.25, -0.5];
+    const tree = generateTree(params({ origin }));
+    const before = structuredClone(tree);
+    origin[0] = 9;
+    origin[1] = 9;
+    expect(tree).toEqual(before);
+    expect(tree[0]!.a).toEqual([0.25, -0.5]);
   });
 
   it('tilts laterals off the sagged parent tangent, not its straight direction', () => {
@@ -254,7 +297,9 @@ describe('growth', () => {
   });
 
   it('treeAtTime remaps parent indices into its output', () => {
-    const tree = generateTree(params({ depth: 3, childrenPerNode: 3 }));
+    // Big enough that some chain spawns before a coarser one listed ahead
+    // of its parent, so remapping actually kicks in.
+    const tree = generateTree(params({ depth: 4, childrenPerNode: 4 }));
     let remapped = 0;
     for (const { spawnTime } of tree) {
       // Just after each spawn, some but not all branches exist.
