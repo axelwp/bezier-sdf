@@ -30,6 +30,7 @@ export {
   type TreeParams,
   type TreeBranch,
   DEFAULT_TREE_PARAMS,
+  DEFAULT_MAX_BRANCHES,
   BRANCH_STRIDE,
   generateTree,
   evalQuadratic,

@@ -9,6 +9,7 @@ import {
   packBranches,
   BRANCH_STRIDE,
   DEFAULT_TREE_PARAMS,
+  DEFAULT_MAX_BRANCHES,
   type TreeParams,
   type TreeBranch,
 } from './tree';
@@ -45,7 +46,7 @@ describe('generateTree', () => {
     expect(trunk!.spawnTime).toBe(0);
   });
 
-  it('produces one chain per lateral: 1 + (k-1)·d per level', () => {
+  it('produces 2^depth chains with one lateral per node', () => {
     // childrenPerNode 2 → one lateral per node. A chain at depth d has
     // d branching nodes, each spawning a chain of depth d-1, so
     // N(d) = 1 + Σ_{j<d} N(j) = 2^d.
@@ -130,7 +131,7 @@ describe('generateTree', () => {
       expect(br.spawnTime).toBeGreaterThan(p.spawnTime);
       expect(br.spawnTime).toBeLessThanOrEqual(p.spawnTime + growthDuration);
       // At spawn time, the parent's growing tip sits on the child's base.
-      const grown = growBranch(p, branchGrowth(p, br.spawnTime, growthDuration));
+      const grown = growBranch(p, branchGrowth(p, br.spawnTime));
       expect(Math.hypot(grown.b[0] - br.a[0], grown.b[1] - br.a[1])).toBeLessThan(1e-9);
     }
   });
@@ -158,6 +159,63 @@ describe('generateTree', () => {
     expect(() => generateTree(params({ depth: -1 }))).toThrow(RangeError);
     expect(() => generateTree(params({ depth: 1.5 }))).toThrow(RangeError);
     expect(() => generateTree(params({ childrenPerNode: 0 }))).toThrow(RangeError);
+    expect(() => generateTree(params({ maxBranches: 0 }))).toThrow(RangeError);
+  });
+
+  it('rejects out-of-range numeric parameters', () => {
+    expect(() => generateTree(params({ growthDuration: -1 }))).toThrow(/growthDuration/);
+    expect(() => generateTree(params({ trunkLength: -0.1 }))).toThrow(/trunkLength/);
+    expect(() => generateTree(params({ trunkRadius: -0.1 }))).toThrow(/trunkRadius/);
+    expect(() => generateTree(params({ lengthRatio: -0.5 }))).toThrow(/lengthRatio/);
+    expect(() => generateTree(params({ radiusRatio: -0.5 }))).toThrow(/radiusRatio/);
+    expect(() => generateTree(params({ gravity: NaN }))).toThrow(/gravity/);
+    expect(() => generateTree(params({ tiltAngle: Infinity }))).toThrow(/tiltAngle/);
+    expect(() => generateTree(params({ angle: NaN }))).toThrow(/angle/);
+    expect(() => generateTree(params({ origin: [NaN, 0] }))).toThrow(/origin/);
+  });
+
+  it('produces finite output for zero-valued parameters', () => {
+    for (const overrides of [{ trunkLength: 0 }, { lengthRatio: 0 }, { growthDuration: 0 }]) {
+      const tree = generateTree(params({ depth: 3, ...overrides }));
+      expect(tree.length).toBeGreaterThan(1);
+      for (const v of packBranches(tree)) expect(Number.isFinite(v)).toBe(true);
+    }
+  });
+
+  it('caps the number of branches, keeping the coarse structure', () => {
+    const full = generateTree(params({ depth: 4 }));
+    const capped = generateTree(params({ depth: 4, maxBranches: 10 }));
+    expect(capped).toHaveLength(10);
+    // Breadth-first: the cap keeps the first chains of the full tree.
+    expect(capped).toEqual(full.slice(0, 10));
+    capped.forEach((br, i) => expect(br.parent).toBeLessThan(i));
+    // The default cap stops runaway growth.
+    expect(generateTree(params({ depth: 12, childrenPerNode: 4 }))).toHaveLength(DEFAULT_MAX_BRANCHES);
+  });
+
+  it('tilts laterals off the sagged parent tangent, not its straight direction', () => {
+    const tilt = 0.4;
+    const gravity = 0.8;
+    const tree = generateTree(params({
+      depth: 1, childrenPerNode: 2, angle: 0, origin: [0, 0],
+      trunkLength: 1, lengthRatio: 0.6, gravity, tiltAngle: tilt,
+    }));
+    const [trunk, kid] = tree as [TreeBranch, TreeBranch];
+    // The trunk's single lateral sprouts at tLocal = 0.65 of its first node.
+    const t = 0.65 / (1 + 0.6 * 1.3);
+    expect(distToCurve(trunk, kid.a)).toBeLessThan(1e-3);
+    const tx = (1 - t) * (trunk.c[0] - trunk.a[0]) + t * (trunk.b[0] - trunk.c[0]);
+    const ty = (1 - t) * (trunk.c[1] - trunk.a[1]) + t * (trunk.b[1] - trunk.c[1]);
+    const tangent = Math.atan2(ty, tx);
+    expect(tangent).toBeLessThan(-0.05); // the parent really droops there
+
+    // Rebuild the child's tip from its expected direction: length 0.6
+    // along tangent + side·tilt, then sagged like any other chain.
+    const angle = tangent + kid.side * tilt;
+    const len = 0.6;
+    const sag = len * gravity * (1 - Math.abs(Math.sin(angle)));
+    expect(kid.b[0]).toBeCloseTo(kid.a[0] + Math.cos(angle) * len, 12);
+    expect(kid.b[1]).toBeCloseTo(kid.a[1] + Math.sin(angle) * len - sag, 12);
   });
 });
 
@@ -165,12 +223,13 @@ describe('growth', () => {
   const br = generateTree(params({ depth: 0, angle: 0, origin: [0, 0], trunkLength: 1, gravity: 0.5 }))[0]!;
 
   it('branchGrowth clamps to [0, 1] around spawnTime', () => {
-    const late = { ...br, spawnTime: 1 };
-    expect(branchGrowth(late, 0.5, 2)).toBe(0);
-    expect(branchGrowth(late, 2, 2)).toBe(0.5);
-    expect(branchGrowth(late, 10, 2)).toBe(1);
-    expect(branchGrowth(late, 1, 0)).toBe(1);
-    expect(branchGrowth(late, 0.9, 0)).toBe(0);
+    const late = { ...br, spawnTime: 1, growthDuration: 2 };
+    expect(branchGrowth(late, 0.5)).toBe(0);
+    expect(branchGrowth(late, 2)).toBe(0.5);
+    expect(branchGrowth(late, 10)).toBe(1);
+    const instant = { ...late, growthDuration: 0 };
+    expect(branchGrowth(instant, 1)).toBe(1);
+    expect(branchGrowth(instant, 0.9)).toBe(0);
   });
 
   it('growBranch retraces the original curve and interpolates the radius', () => {
@@ -189,10 +248,45 @@ describe('growth', () => {
 
   it('treeAtTime drops unspawned branches and grows the rest', () => {
     const tree = generateTree(params({ depth: 2 }));
-    const d = DEFAULT_TREE_PARAMS.growthDuration;
-    expect(treeAtTime(tree, -1, d)).toHaveLength(0);
-    expect(treeAtTime(tree, 0.01, d)).toHaveLength(1);
-    expect(treeAtTime(tree, 100, d)).toEqual(tree);
+    expect(treeAtTime(tree, -1)).toHaveLength(0);
+    expect(treeAtTime(tree, 0.01)).toHaveLength(1);
+    expect(treeAtTime(tree, 100)).toEqual(tree);
+  });
+
+  it('treeAtTime remaps parent indices into its output', () => {
+    const tree = generateTree(params({ depth: 3, childrenPerNode: 3 }));
+    let remapped = 0;
+    for (const { spawnTime } of tree) {
+      // Just after each spawn, some but not all branches exist.
+      const time = spawnTime + 1e-6;
+      const grown = treeAtTime(tree, time);
+      const sources = tree.filter((br) => br.spawnTime < time);
+      expect(grown).toHaveLength(sources.length);
+      grown.forEach((br, i) => {
+        const src = sources[i]!;
+        if (src.parent < 0) {
+          expect(br.parent).toBe(-1);
+          return;
+        }
+        // The remapped parent is the grown copy of the original parent.
+        expect(br.parent).toBeLessThan(i);
+        expect(br.parent).toBe(sources.indexOf(tree[src.parent]!));
+        if (br.parent !== src.parent) remapped++;
+      });
+    }
+    expect(remapped).toBeGreaterThan(0);
+  });
+
+  it('uses the growthDuration the tree was generated with', () => {
+    const tree = generateTree(params({ depth: 3, growthDuration: 4 }));
+    for (const br of tree) expect(br.growthDuration).toBe(4);
+    // Each lateral's base is on its parent's grown tip at its spawn time.
+    for (const br of tree.slice(1)) {
+      const grown = treeAtTime(tree, br.spawnTime + 1e-9);
+      const kid = grown.find((g) => g.a === br.a)!;
+      const p = grown[kid.parent]!;
+      expect(Math.hypot(p.b[0] - br.a[0], p.b[1] - br.a[1])).toBeLessThan(1e-6);
+    }
   });
 });
 
@@ -222,7 +316,7 @@ describe('packBranches', () => {
         new Float32Array([br.a[0], br.a[1], br.c[0], br.c[1], br.b[0], br.b[1], br.ra, br.rb, br.spawnTime, br.depth]),
       ),
     );
-    expect(buf[o + 10]).toBe(0);
+    expect(buf[o + 10]).toBe(Math.fround(br.growthDuration));
     expect(buf[o + 11]).toBe(0);
   });
 });

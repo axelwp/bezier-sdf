@@ -246,7 +246,7 @@ function lineAsCubic(x0: number, y0: number, x: number, y: number): CubicSegment
   return [x0, y0, c1x, c1y, c2x, c2y, x, y];
 }
 
-function quadAsCubic(
+export function quadAsCubic(
   x0: number, y0: number,
   qx: number, qy: number,
   x: number,  y: number,

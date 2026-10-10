@@ -1,4 +1,5 @@
 import type { CubicSegment } from './types';
+import { quadAsCubic } from './parseSvgPath';
 
 /**
  * Procedural 2D tree growth, ported from the 3D generator in
@@ -55,7 +56,16 @@ export interface TreeParams {
   readonly angle?: number;
   /** Side of the trunk's first lateral: 1 = left, -1 = right. Defaults to 1. */
   readonly firstSide?: 1 | -1;
+  /**
+   * Upper bound on the number of chains emitted. Chains are generated
+   * breadth-first, so hitting the cap drops the finest twigs first.
+   * Defaults to {@link DEFAULT_MAX_BRANCHES}.
+   */
+  readonly maxBranches?: number;
 }
+
+/** Default for {@link TreeParams.maxBranches}. */
+export const DEFAULT_MAX_BRANCHES = 4096;
 
 /**
  * One axial chain as a tapered quadratic Bezier `a → c → b`. The radius
@@ -70,6 +80,12 @@ export interface TreeBranch {
   readonly rb: number;
   /** Time at which this chain starts growing. */
   readonly spawnTime: number;
+  /**
+   * Time this chain takes to grow from base to tip; the tree's
+   * `params.growthDuration`, carried here so growth helpers can't be
+   * driven with a duration that disagrees with the spawn times.
+   */
+  readonly growthDuration: number;
   /** Recursion depth this chain started at (trunk = `params.depth`). */
   readonly depth: number;
   /** Which side of its parent it sprouted from: 1 = left, -1 = right, 0 = trunk. */
@@ -93,16 +109,43 @@ export const DEFAULT_TREE_PARAMS: TreeParams = {
 
 interface Lateral {
   cumulativeLengthAtSprout: number;
-  angle: number;
   length: number;
   radius: number;
   depth: number;
   side: 1 | -1;
 }
 
+/** A chain waiting to be grown; see `generateTree`. */
+interface PendingChain {
+  base: Vec2;
+  angle: number;
+  startLength: number;
+  startRadius: number;
+  startDepth: number;
+  spawnTime: number;
+  side: 1 | -1 | 0;
+  firstSide: 1 | -1;
+  parent: number;
+}
+
+function requireNonNegative(name: string, value: number): void {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError(`generateTree: ${name} must be a finite non-negative number, got ${value}`);
+  }
+}
+
+function requireFinite(name: string, value: number): void {
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`generateTree: ${name} must be a finite number, got ${value}`);
+  }
+}
+
 /**
  * Grow a tree. Branches are returned parents-first (the trunk is index 0),
- * so `parent` always points at an earlier entry.
+ * so `parent` always points at an earlier entry. Chains are emitted
+ * breadth-first and generation stops once `maxBranches` chains exist.
+ *
+ * Throws a `RangeError` for parameters outside their valid range.
  */
 export function generateTree(params: TreeParams): TreeBranch[] {
   if (!Number.isInteger(params.depth) || params.depth < 0) {
@@ -113,20 +156,40 @@ export function generateTree(params: TreeParams): TreeBranch[] {
       `generateTree: childrenPerNode must be a positive integer, got ${params.childrenPerNode}`,
     );
   }
+  const maxBranches = params.maxBranches ?? DEFAULT_MAX_BRANCHES;
+  if (!Number.isInteger(maxBranches) || maxBranches < 1) {
+    throw new RangeError(`generateTree: maxBranches must be a positive integer, got ${maxBranches}`);
+  }
+  requireNonNegative('trunkLength', params.trunkLength);
+  requireNonNegative('trunkRadius', params.trunkRadius);
+  requireNonNegative('lengthRatio', params.lengthRatio);
+  requireNonNegative('radiusRatio', params.radiusRatio);
+  requireNonNegative('growthDuration', params.growthDuration);
+  requireFinite('tiltAngle', params.tiltAngle);
+  requireFinite('gravity', params.gravity);
+  if (params.angle !== undefined) requireFinite('angle', params.angle);
+  if (params.origin !== undefined) {
+    requireFinite('origin[0]', params.origin[0]);
+    requireFinite('origin[1]', params.origin[1]);
+  }
 
+  const { growthDuration } = params;
   const out: TreeBranch[] = [];
+  const queue: PendingChain[] = [{
+    base: params.origin ?? [0, -1],
+    angle: params.angle ?? Math.PI / 2,
+    startLength: params.trunkLength,
+    startRadius: params.trunkRadius,
+    startDepth: params.depth,
+    spawnTime: 0,
+    side: 0,
+    firstSide: params.firstSide ?? 1,
+    parent: -1,
+  }];
 
-  function generateChain(
-    base: Vec2,
-    angle: number,
-    startLength: number,
-    startRadius: number,
-    startDepth: number,
-    spawnTime: number,
-    side: 1 | -1 | 0,
-    firstSide: 1 | -1,
-    parent: number,
-  ): void {
+  for (let q = 0; q < queue.length && out.length < maxBranches; q++) {
+    const { base, angle, startLength, startRadius, startDepth, spawnTime, side, firstSide, parent } =
+      queue[q]!;
     const dir: Vec2 = [Math.cos(angle), Math.sin(angle)];
     let length = startLength;
     let radius = startRadius;
@@ -146,7 +209,6 @@ export function generateTree(params: TreeParams): TreeBranch[] {
           const tLocal = (i / params.childrenPerNode) * 0.7 + 0.3;
           laterals.push({
             cumulativeLengthAtSprout: cumulativeLength + length * tLocal,
-            angle: angle + lateralSide * params.tiltAngle,
             length: length * params.lengthRatio,
             radius: radius * params.radiusRatio,
             depth: depth - 1,
@@ -179,37 +241,47 @@ export function generateTree(params: TreeParams): TreeBranch[] {
     const b: Vec2 = [chainTip[0], chainTip[1] - tipSag];
 
     const index = out.length;
-    out.push({ a: base, c, b, ra: startRadius, rb: tipRadius, spawnTime, depth: startDepth, side, parent });
+    out.push({
+      a: base, c, b, ra: startRadius, rb: tipRadius, spawnTime, growthDuration,
+      depth: startDepth, side, parent,
+    });
 
     for (const lat of laterals) {
-      const t = lat.cumulativeLengthAtSprout / cumulativeLength;
-      generateChain(
-        evalQuadratic(base, c, b, t),
-        lat.angle,
-        lat.length,
-        lat.radius,
-        lat.depth,
-        spawnTime + t * params.growthDuration,
-        lat.side,
+      // Chains past the cap would never be emitted; don't queue them.
+      if (queue.length >= maxBranches) break;
+      // A zero-length chain (trunkLength or lengthRatio 0) collapses to a
+      // point; sprout everything from its base rather than dividing 0/0.
+      const t = cumulativeLength > 0 ? lat.cumulativeLengthAtSprout / cumulativeLength : 0;
+      // Tilt off the sagged curve's actual tangent at the sprout point, so
+      // children follow a drooping parent. Fall back to the chain's
+      // unsagged direction where the tangent vanishes.
+      const [tx, ty] = quadraticTangent(base, c, b, t);
+      const parentAngle = tx !== 0 || ty !== 0 ? Math.atan2(ty, tx) : angle;
+      queue.push({
+        base: evalQuadratic(base, c, b, t),
+        angle: parentAngle + lat.side * params.tiltAngle,
+        startLength: lat.length,
+        startRadius: lat.radius,
+        startDepth: lat.depth,
+        spawnTime: spawnTime + t * growthDuration,
+        side: lat.side,
         // Start each child's alternation back toward its parent's axis.
-        (-lat.side) as 1 | -1,
-        index,
-      );
+        firstSide: (-lat.side) as 1 | -1,
+        parent: index,
+      });
     }
   }
 
-  generateChain(
-    params.origin ?? [0, -1],
-    params.angle ?? Math.PI / 2,
-    params.trunkLength,
-    params.trunkRadius,
-    params.depth,
-    0,
-    0,
-    params.firstSide ?? 1,
-    -1,
-  );
   return out;
+}
+
+/** Derivative (unnormalised) of the quadratic Bezier `a → c → b` at `t`. */
+function quadraticTangent(a: Vec2, c: Vec2, b: Vec2, t: number): [number, number] {
+  const mt = 1 - t;
+  return [
+    2 * (mt * (c[0] - a[0]) + t * (b[0] - c[0])),
+    2 * (mt * (c[1] - a[1]) + t * (b[1] - c[1])),
+  ];
 }
 
 /** Evaluate the quadratic Bezier `a → c → b` at `t` in `[0, 1]`. */
@@ -223,10 +295,11 @@ export function evalQuadratic(a: Vec2, c: Vec2, b: Vec2, t: number): [number, nu
 
 /**
  * How far `branch` has grown at `time`, in `[0, 1]`. Same formula as the
- * tree-marching shader: zero before `spawnTime`, then linear over
- * `growthDuration`.
+ * tree-marching shader: zero before `spawnTime`, then linear over the
+ * branch's `growthDuration`.
  */
-export function branchGrowth(branch: TreeBranch, time: number, growthDuration: number): number {
+export function branchGrowth(branch: TreeBranch, time: number): number {
+  const { growthDuration } = branch;
   if (growthDuration <= 0) return time >= branch.spawnTime ? 1 : 0;
   return Math.min(1, Math.max(0, (time - branch.spawnTime) / growthDuration));
 }
@@ -247,19 +320,22 @@ export function growBranch(branch: TreeBranch, growth: number): TreeBranch {
 
 /**
  * Every branch that exists at `time`, trimmed to its current length.
- * Branches that haven't spawned yet are left out, so indices do not
- * line up with the input; use `parent` from the input array if needed.
+ * Branches that haven't spawned yet are left out; `parent` indices are
+ * remapped to the returned array (-1 if a parent was left out, which
+ * can't happen for output of {@link generateTree}, since a child never
+ * spawns before its parent).
  */
-export function treeAtTime(
-  branches: readonly TreeBranch[],
-  time: number,
-  growthDuration: number,
-): TreeBranch[] {
+export function treeAtTime(branches: readonly TreeBranch[], time: number): TreeBranch[] {
   const out: TreeBranch[] = [];
-  for (const br of branches) {
-    const g = branchGrowth(br, time, growthDuration);
-    if (g > 0) out.push(growBranch(br, g));
-  }
+  const outIndex = new Map<number, number>();
+  branches.forEach((br, i) => {
+    const g = branchGrowth(br, time);
+    if (g <= 0) return;
+    const grown = growBranch(br, g);
+    const parent = br.parent >= 0 ? (outIndex.get(br.parent) ?? -1) : -1;
+    outIndex.set(i, out.length);
+    out.push(parent === br.parent ? grown : { ...grown, parent });
+  });
   return out;
 }
 
@@ -269,12 +345,7 @@ export function treeAtTime(
  */
 export function branchToCubic(branch: TreeBranch): CubicSegment {
   const { a, c, b } = branch;
-  return [
-    a[0], a[1],
-    a[0] + (2 / 3) * (c[0] - a[0]), a[1] + (2 / 3) * (c[1] - a[1]),
-    b[0] + (2 / 3) * (c[0] - b[0]), b[1] + (2 / 3) * (c[1] - b[1]),
-    b[0], b[1],
-  ];
+  return quadAsCubic(a[0], a[1], c[0], c[1], b[0], b[1]);
 }
 
 /** Floats per branch in {@link packBranches}: three vec4s. */
@@ -283,7 +354,7 @@ export const BRANCH_STRIDE = 12;
 /**
  * Flatten branches for upload to a GPU buffer, three vec4s per branch:
  *
- *   [a.x, a.y, c.x, c.y,  b.x, b.y, ra, rb,  spawnTime, depth, 0, 0]
+ *   [a.x, a.y, c.x, c.y,  b.x, b.y, ra, rb,  spawnTime, depth, growthDuration, 0]
  */
 export function packBranches(branches: readonly TreeBranch[]): Float32Array {
   const out = new Float32Array(branches.length * BRANCH_STRIDE);
@@ -295,6 +366,7 @@ export function packBranches(branches: readonly TreeBranch[]): Float32Array {
     out[o + 6] = br.ra;   out[o + 7] = br.rb;
     out[o + 8] = br.spawnTime;
     out[o + 9] = br.depth;
+    out[o + 10] = br.growthDuration;
   });
   return out;
 }
