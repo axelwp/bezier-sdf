@@ -25,3 +25,17 @@ export {
   prepareMorphPair,
   type PreparedMorphPair,
 } from './morphPair';
+export {
+  type Vec2,
+  type TreeParams,
+  type TreeBranch,
+  DEFAULT_TREE_PARAMS,
+  BRANCH_STRIDE,
+  generateTree,
+  evalQuadratic,
+  branchGrowth,
+  growBranch,
+  treeAtTime,
+  branchToCubic,
+  packBranches,
+} from './tree';
