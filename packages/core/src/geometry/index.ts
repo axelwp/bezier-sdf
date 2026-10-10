@@ -25,3 +25,13 @@ export {
   prepareMorphPair,
   type PreparedMorphPair,
 } from './morphPair';
+export {
+  BRANCH_STRIDE,
+  type TaperedBranch,
+  type Vec2,
+  packBranches,
+  clipBranch,
+  quadraticDistance,
+  branchDistance,
+  branchBounds,
+} from './branch';

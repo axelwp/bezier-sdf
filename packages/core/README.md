@@ -137,6 +137,38 @@ Pass an image as `backdrop` at init time and the renderer compiles a refractive 
 
 Glass also composes with the morph pipeline. Pass both `backdrop` and `morphTo` at init, then set `glass: true` together with `morph: { t, ... }` per frame; the lens SDF becomes a per-fragment lerp between the two morph-baked SDFs (dynamic-SDF mode), so refraction happens through a silhouette that smoothly morphs as `t` advances. Surface normals follow the deforming geometry, the rim Fresnel band tracks the changing edge, and the chromatic fringe rides along the moving curvature. The per-pixel cost adds one texture sample over plain glass. Colors inside the `morph` payload are unused in this mode (glass is still a material).
 
+### Live tapered branches
+
+`BranchRenderer` is a separate, bake-free renderer for plant and tree work. Its primitive is a tapered quadratic Bezier branch: a curve `p0 → p1 → p2` whose radius tapers linearly from `r0` to `r1`, clipped to the first `growth ∈ [0, 1]` of its parameter range. Each frame it evaluates every branch's closed-form distance analytically, so geometry can change every frame (growth, wind, interpolation between parameter sets) and edges stay exact at any zoom instead of being limited by a 1024² bake.
+
+```ts
+import { BranchRenderer } from '@bezier-sdf/core';
+
+const r = new BranchRenderer();
+await r.init({ canvas });
+
+function frame(t: number) {
+  r.setBranches([
+    { p0: [0, -0.9], p1: [0.1, -0.3], p2: [0, 0.2], r0: 0.05, r1: 0.03, growth: t },
+    // ...one entry per branch; children start where their parent ends
+  ]);
+  r.render({ width: canvas.width, height: canvas.height, zoom: 1, offsetX: 0, offsetY: 0, color: [0.1, 0.09, 0.08], opacity: 1 });
+}
+```
+
+How it stays cheap: each branch is drawn as one instanced quad covering only its growth-clipped curve's chord-aligned bounding box (padded by the radius and a 2 px AA margin), so a pixel evaluates just the few branches whose boxes overlap it. Branches write signed distance into an offscreen target with `MIN` blending, giving the exact union as a distance field; a fullscreen pass turns that into anti-aliased coverage. Ungrown branches (`growth <= 0`) cost nothing.
+
+Notes:
+
+- WebGL 2 only. With `EXT_color_buffer_float` the distance target is R16F and holds the full field (`distanceTarget === 'float'`); otherwise it falls back to RGBA8 storing distance within ±8 px of each edge (`'band'`), which is enough for anti-aliasing.
+- `growth` is in Bezier parameter, not arc length. It reads as uniform speed when `p1` sits near the chord midpoint.
+- The tapered distance is distance to the spine minus the radius at the closest spine point. That is exact for constant radius and a close approximation for gentle tapers.
+- Branches union with a hard `min`, so forks show a crease rather than a fillet.
+- For per-frame animation of many branches, pass a reused `Float32Array` in the `packBranches` layout to `setBranches` to skip object packing.
+- The same math is available on the CPU (`branchDistance`, `quadraticDistance`, `clipBranch`, `branchBounds`) for hit-testing and tests.
+
+See [`examples/branches`](../../examples/branches) for a procedural tree that grows and sways in wind, with scroll-to-zoom.
+
 ## API
 
 ### Geometry
@@ -153,6 +185,8 @@ import {
   MORPH_MAX_PATHS,    // hard cap on paths per side in morph mode (16)
   DEMO_MARK,          // built-in demo: two rounded chevrons
   makePath, mark,     // small constructors with sensible defaults
+  packBranches,       // TaperedBranch[] → BranchRenderer instance layout
+  branchDistance,     // CPU signed distance to a tapered, growth-clipped branch
 } from '@bezier-sdf/core/geometry';
 ```
 
@@ -163,6 +197,7 @@ import {
   createRenderer,   // factory with WebGPU → WebGL fallback
   WebGPURenderer,   // direct access if you want to skip the factory
   WebGLRenderer,
+  BranchRenderer,   // live tapered quadratic branches (WebGL 2), no bake
   MAX_PATHS,        // hard cap on paths per mark in non-morph modes (16)
 } from '@bezier-sdf/core/renderers';
 ```

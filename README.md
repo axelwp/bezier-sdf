@@ -105,6 +105,7 @@ bezier-sdf/
 │   ├── morph/               ← shape-to-shape morph between two SVGs
 │   ├── liquid-cursor/       ← silhouette bulges toward the pointer
 │   ├── liquid-glass/        ← refractive lens material over a backdrop
+│   ├── branches/            ← live tapered Bezier tree, growing, no bake
 │   └── react/               ← <LiveGraphic> playground
 └── docs/
     └── technique.md         ← the math + the rendering pipeline writeup
