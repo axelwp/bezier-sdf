@@ -1,8 +1,10 @@
 import { DEMO_MARK, type Mark } from '@bezier-sdf/core';
-import { bambooMark } from './plant';
+import { bambooMark, type InkMark } from './plant';
 import { BAKE_BOUND, BAKE_FRAG, INK_FRAG, MAX_PATHS, VERT } from './shaders';
 
 const BAKE_SIZE = 1024;
+/** Re-baked every frame while swaying, so a quarter of the fragments. */
+const SWAY_BAKE_SIZE = 512;
 
 interface Params {
   inkLoad: number;
@@ -29,14 +31,10 @@ const PAPER: readonly [number, number, number] = [0.95, 0.91, 0.82];
 
 type ShapeId = 'bamboo' | 'chevrons';
 
-/** Per-path brush load. Culm internodes are painted lighter than leaves. */
-function tonesFor(shape: ShapeId, mark: Mark): number[] {
-  if (shape === 'bamboo') {
-    // bambooMark emits 5 internodes, 2 twigs, then leaves.
-    return mark.paths.map((_, i) => (i < 5 ? 0.62 : i < 7 ? 0.8 : 0.92 + 0.08 * Math.sin(i * 2.7)));
-  }
-  return mark.paths.map((_, i) => (i % 2 === 0 ? 1.0 : 0.7));
-}
+const CHEVRONS: InkMark = {
+  mark: DEMO_MARK,
+  tones: DEMO_MARK.paths.map((_, i) => (i % 2 === 0 ? 1.0 : 0.7)),
+};
 
 /** Principal axis of a path's control points: the direction the brush moved. */
 function brushAngle(path: Mark['paths'][number]): number {
@@ -93,52 +91,80 @@ function main() {
   const inkProg = link(gl, INK_FRAG);
   const loc = (prog: WebGLProgram, name: string) => gl.getUniformLocation(prog, name);
 
-  // Segment texture (RGBA32F, 2 texels per cubic) and the baked field.
+  // Segment texture (RGBA32F, 2 texels per cubic). Reallocated only when
+  // the segment count changes; sway frames update it in place.
   const segTex = gl.createTexture()!;
-  const sdfTex = gl.createTexture()!;
-  gl.bindTexture(gl.TEXTURE_2D, sdfTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, BAKE_SIZE, BAKE_SIZE, 0, gl.RGBA, gl.HALF_FLOAT, null);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  const fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sdfTex, 0);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindTexture(gl.TEXTURE_2D, segTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  let segCapacity = 0;
+  let segData = new Float32Array(0);
+  const ends = new Int32Array(MAX_PATHS);
+  const modes = new Int32Array(MAX_PATHS);
+  const halfW = new Float32Array(MAX_PATHS);
+  const tone = new Float32Array(MAX_PATHS);
+  const angle = new Float32Array(MAX_PATHS);
 
-  const bake = (mark: Mark, tones: number[]) => {
+  // Baked fields: full resolution for still frames, a smaller one that
+  // sway re-bakes every frame.
+  const makeTarget = (size: number) => {
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, size, size, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo, size };
+  };
+  const stillTarget = makeTarget(BAKE_SIZE);
+  const swayTarget = makeTarget(SWAY_BAKE_SIZE);
+  let current = stillTarget;
+
+  const bake = ({ mark, tones }: InkMark, target: typeof stillTarget) => {
     const paths = mark.paths.slice(0, MAX_PATHS);
     const segCount = paths.reduce((n, p) => n + p.segments.length, 0);
-    const data = new Float32Array(segCount * 8);
-    const ends = new Int32Array(MAX_PATHS);
-    const tone = new Float32Array(MAX_PATHS);
-    const angle = new Float32Array(MAX_PATHS);
+    if (segData.length !== segCount * 8) segData = new Float32Array(segCount * 8);
     let k = 0;
     paths.forEach((p, i) => {
-      for (const s of p.segments) data.set(s, (k++) * 8);
+      for (const s of p.segments) segData.set(s, (k++) * 8);
       ends[i] = k;
+      modes[i] = p.mode === 'stroke' ? 1 : 0;
+      halfW[i] = p.mode === 'fill' ? 0 : p.strokeWidth * 0.5;
       tone[i] = tones[i] ?? 1;
       angle[i] = brushAngle(p);
     });
     gl.bindTexture(gl.TEXTURE_2D, segTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, segCount * 2, 1, 0, gl.RGBA, gl.FLOAT, data);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    if (segCount === segCapacity) {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, segCount * 2, 1, gl.RGBA, gl.FLOAT, segData);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, segCount * 2, 1, 0, gl.RGBA, gl.FLOAT, segData);
+      segCapacity = segCount;
+    }
 
     gl.useProgram(bakeProg);
     gl.uniform1i(loc(bakeProg, 'u_segments'), 0);
+    gl.uniform1i(loc(bakeProg, 'u_segCount'), segCount);
+    gl.uniform1f(loc(bakeProg, 'u_segmentTexWidth'), segCount * 2);
+    gl.uniform1i(loc(bakeProg, 'u_fillRule'), 0);
     gl.uniform1i(loc(bakeProg, 'u_pathCount'), paths.length);
     gl.uniform1iv(loc(bakeProg, 'u_pathEnds'), ends);
+    gl.uniform1iv(loc(bakeProg, 'u_pathMode'), modes);
+    gl.uniform1fv(loc(bakeProg, 'u_pathHalfW'), halfW);
     gl.uniform1fv(loc(bakeProg, 'u_pathTone'), tone);
     gl.uniform1fv(loc(bakeProg, 'u_pathAngle'), angle);
     gl.uniform1f(loc(bakeProg, 'u_bound'), BAKE_BOUND);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.viewport(0, 0, BAKE_SIZE, BAKE_SIZE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, target.size, target.size);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, segTex);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    current = target;
   };
 
   // ---- State -------------------------------------------------------------
@@ -151,24 +177,24 @@ function main() {
   let swayStart = performance.now();
   let frameQueued = false;
 
-  const markFor = (s: ShapeId, t: number): Mark =>
-    s === 'bamboo' ? bambooMark(sway ? 0.07 * Math.sin(t * 1.3) + 0.03 * Math.sin(t * 2.9) : 0) : DEMO_MARK;
-  const rebake = (t = 0) => {
-    const m = markFor(shape, t);
-    bake(m, tonesFor(shape, m));
-  };
+  // Only the bamboo moves; the chevrons are a static mark.
+  const animating = () => sway && shape === 'bamboo';
+  const markFor = (s: ShapeId, t: number): InkMark =>
+    s === 'bamboo' ? bambooMark(sway ? 0.07 * Math.sin(t * 1.3) + 0.03 * Math.sin(t * 2.9) : 0) : CHEVRONS;
+  const rebake = (t = 0) => bake(markFor(shape, t), animating() ? swayTarget : stillTarget);
 
   const draw = () => {
     gl.useProgram(inkProg);
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, sdfTex);
+    gl.bindTexture(gl.TEXTURE_2D, current.tex);
     gl.uniform1i(loc(inkProg, 'u_sdf'), 0);
     gl.uniform1f(loc(inkProg, 'u_bound'), BAKE_BOUND);
     gl.uniform2f(loc(inkProg, 'u_res'), canvas.width, canvas.height);
     gl.uniform1f(loc(inkProg, 'u_zoom'), zoom);
     gl.uniform2f(loc(inkProg, 'u_pan'), pan[0], pan[1]);
-    gl.uniform1f(loc(inkProg, 'u_seed'), seed);
+    // Integer lattice offset per reseed (see vnoise); keeps noise inputs small.
+    gl.uniform2f(loc(inkProg, 'u_seedLat'), Math.floor(seed * 7919) % 4096, Math.floor(seed * 104729) % 4096);
     gl.uniform3f(loc(inkProg, 'u_ink'), ...INK);
     gl.uniform3f(loc(inkProg, 'u_paper'), ...PAPER);
     for (const [k, v] of Object.entries(params)) gl.uniform1f(loc(inkProg, `u_${k}`), v);
@@ -177,9 +203,9 @@ function main() {
 
   const frame = (now: number) => {
     frameQueued = false;
-    if (sway) rebake((now - swayStart) / 1000);
+    if (animating()) rebake((now - swayStart) / 1000);
     draw();
-    if (sway) requestFrame();
+    if (animating()) requestFrame();
   };
   const requestFrame = () => {
     if (frameQueued) return;
@@ -233,7 +259,12 @@ function main() {
     pan = [pan[0] + drag[0] - cur[0], pan[1] + drag[1] - cur[1]];
     requestFrame();
   });
-  canvas.addEventListener('pointerup', () => (drag = null));
+  // A cancelled gesture (system swipe, palm rejection) never sends
+  // pointerup; losing capture covers that and every other way out.
+  const endDrag = () => (drag = null);
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+  canvas.addEventListener('lostpointercapture', endDrag);
   canvas.addEventListener('dblclick', () => {
     zoom = 1;
     pan = [0, 0];
@@ -252,17 +283,18 @@ function main() {
   }
   document.querySelector<HTMLSelectElement>('#shape')!.addEventListener('change', (e) => {
     shape = (e.target as HTMLSelectElement).value as ShapeId;
+    swayStart = performance.now();
     rebake();
     requestFrame();
   });
   document.querySelector<HTMLButtonElement>('#reseed')!.addEventListener('click', () => {
-    seed = Math.random() * 100;
+    seed = Math.random();
     requestFrame();
   });
   document.querySelector<HTMLInputElement>('#sway')!.addEventListener('change', (e) => {
     sway = (e.target as HTMLInputElement).checked;
     swayStart = performance.now();
-    if (!sway) rebake();
+    rebake();
     requestFrame();
   });
 

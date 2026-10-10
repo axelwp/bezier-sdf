@@ -81,29 +81,46 @@ function internode(x0: number, y0: number, y1: number, hw: number, lean: number)
   return closedFromPoints(q);
 }
 
-export function bambooMark(sway = 0): Mark {
+/** A mark plus each path's brush load (ink tone), index-aligned. */
+export interface InkMark {
+  mark: Mark;
+  tones: number[];
+}
+
+export function bambooMark(sway = 0): InkMark {
   const paths: Path[] = [];
+  const tones: number[] = [];
+  // Brush load travels with each path, so reordering or adding strokes
+  // can't hand leaves the culm's tone. Culm is painted lighter than leaves.
+  const stroke = (p: Path, tone: number) => {
+    paths.push(p);
+    tones.push(tone);
+  };
   const lean = 0.12;
   const x0 = -0.2;
   const hw = 0.055;
   const gap = 0.022;
   const nodes = [-1.0, -0.55, -0.14, 0.22, 0.55, 0.82];
   for (let i = 0; i + 1 < nodes.length; i++) {
-    paths.push(internode(x0, nodes[i]! + gap, nodes[i + 1]! - gap, hw * (1 - i * 0.07), lean));
+    stroke(internode(x0, nodes[i]! + gap, nodes[i + 1]! - gap, hw * (1 - i * 0.07), lean), 0.62);
   }
   const nodeAt = (i: number): V => [x0 + lean * nodes[i]!, nodes[i]!];
 
   // Twig from the third node, sweeping right and up.
   const t1o = add(nodeAt(2), [hw * 0.6, 0]);
   const t1a = 0.55 + sway * 0.4;
-  paths.push(twig(t1o, t1a, 0.62, 0.012, -0.05 - sway * 0.2));
-  const t1 = (u: number): V => add(t1o, rot([0.62 * u, -0.05 * 0.62 * u * u], t1a));
+  const t1b = -0.05 - sway * 0.2;
+  stroke(twig(t1o, t1a, 0.62, 0.012, t1b), 0.8);
+  // Points along the twig's centreline, using the same bend as the twig
+  // itself so leaves stay attached while it sways.
+  const t1 = (u: number): V => add(t1o, rot([0.62 * u, t1b * 0.62 * u * u], t1a));
 
   // Twig from the fourth node, sweeping left.
   const t2o = add(nodeAt(4), [-hw * 0.6, 0]);
   const t2a = Math.PI - 0.7 + sway * 0.3;
-  paths.push(twig(t2o, t2a, 0.42, 0.010, 0.06 + sway * 0.2));
-  const t2 = (u: number): V => add(t2o, rot([0.42 * u, 0.06 * 0.42 * u * u], t2a));
+  const t2b = 0.06 + sway * 0.2;
+  stroke(twig(t2o, t2a, 0.42, 0.010, t2b), 0.8);
+  const t2 = (u: number): V => add(t2o, rot([0.42 * u, t2b * 0.42 * u * u], t2a));
 
   // Leaf clusters. Each: [anchor, angle, length, width, bend].
   const s = sway;
@@ -119,7 +136,7 @@ export function bambooMark(sway = 0): Mark {
     [nodeAt(5), 0.85 + s * 0.6, 0.3, 0.045, -0.2],
     [nodeAt(5), 2.35 + s * 0.6, 0.28, 0.042, 0.18],
   ];
-  for (const [o, a, l, w, b] of leaves) paths.push(leaf(o, a, l, w, b));
+  leaves.forEach(([o, a, l, w, b], i) => stroke(leaf(o, a, l, w, b), 0.92 + 0.08 * Math.sin((i + 7) * 2.7)));
 
-  return { paths, renderMode: 'legacy-smin' };
+  return { mark: { paths, renderMode: 'legacy-smin' }, tones };
 }

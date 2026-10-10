@@ -85,7 +85,7 @@ export const MAX_LOOP_BOUND = 1024;
  * The runtime `u_segCount` upper-bounds the inner loop; `MAX_LOOP_BOUND`
  * is a compile-time ceiling required by the GLSL ES 1.00 spec.
  */
-const SDF_BODY = /* glsl */ `
+export const SDF_BODY = /* glsl */ `
 uniform int       u_segCount;
 uniform sampler2D u_segments;
 uniform float     u_segmentTexWidth;

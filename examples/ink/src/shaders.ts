@@ -1,12 +1,13 @@
+import { MAX_PATHS, WEBGL_SDF_BODY } from '@bezier-sdf/core';
+
 /**
  * GLSL ES 3.00 shaders for the ink-wash example.
  *
  * Two passes, mirroring the core renderer's bake/sample split:
  *
  *   1. BAKE — evaluates the mark's signed distance straight from its cubic
- *      Beziers over [-BOUND, BOUND]² into an RGBA16F texture. R holds the
- *      signed distance (per-path even-odd parity, paths hard-unioned with
- *      min(), same rule as core's nonzero bake). G holds the "ink tone" of
+ *      Beziers over [-BOUND, BOUND]² into an RGBA16F texture, using core's
+ *      own sceneSDF (nonzero rule). R holds the signed distance. G holds the "ink tone" of
  *      whichever path won the min, so each stroke can carry its own value
  *      the way a painter loads the brush differently for culm and leaves.
  *      B holds that path's brush direction (its principal axis, radians),
@@ -30,7 +31,7 @@
  * takes ink stay put while the geometry moves through it.
  */
 
-export const MAX_PATHS = 64;
+export { MAX_PATHS };
 export const BAKE_BOUND = 1.25;
 
 export const VERT = /* glsl */ `#version 300 es
@@ -45,80 +46,24 @@ void main() {
 export const BAKE_FRAG = /* glsl */ `#version 300 es
 precision highp float;
 precision highp int;
+precision highp sampler2D;
+// Core's estimator is written in GLSL ES 1.00; map its texture call.
+#define texture2D texture
 in vec2 v_pos;
 out vec4 o;
 
-uniform highp sampler2D u_segments; // RGBA32F, 2 texels per cubic
-uniform int   u_pathCount;
-uniform int   u_pathEnds[${MAX_PATHS}];
 uniform float u_pathTone[${MAX_PATHS}];
 uniform float u_pathAngle[${MAX_PATHS}];
 uniform float u_bound;
 
-vec2 bez(vec2 p0, vec2 p1, vec2 p2, vec2 p3, float t) {
-  float u = 1.0 - t;
-  return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
-}
-vec2 bezD(vec2 p0, vec2 p1, vec2 p2, vec2 p3, float t) {
-  float u = 1.0 - t;
-  return 3.0*u*u*(p1 - p0) + 6.0*u*t*(p2 - p1) + 3.0*t*t*(p3 - p2);
-}
-
-// Same estimator as core's SDF_BODY: 16-step crossing walk for parity,
-// 12-sample coarse search + 3 Newton steps for the closest point.
-float distToCubic(vec2 p, vec2 p0, vec2 p1, vec2 p2, vec2 p3, inout int crossings) {
-  float prevY = p0.y - p.y;
-  float prevX = p0.x;
-  for (int i = 1; i <= 16; i++) {
-    vec2 b = bez(p0, p1, p2, p3, float(i) / 16.0);
-    float y = b.y - p.y;
-    if ((prevY <= 0.0 && y > 0.0) || (prevY > 0.0 && y <= 0.0)) {
-      float xc = mix(prevX, b.x, prevY / (prevY - y));
-      if (xc > p.x) crossings += 1;
-    }
-    prevY = y;
-    prevX = b.x;
-  }
-  float bestT = 0.0;
-  float bestD2 = 1e20;
-  for (int i = 0; i <= 12; i++) {
-    float t = float(i) / 12.0;
-    vec2 b = bez(p0, p1, p2, p3, t);
-    float d2 = dot(b - p, b - p);
-    if (d2 < bestD2) { bestD2 = d2; bestT = t; }
-  }
-  for (int i = 0; i < 3; i++) {
-    vec2 diff = bez(p0, p1, p2, p3, bestT) - p;
-    vec2 db = bezD(p0, p1, p2, p3, bestT);
-    float u = 1.0 - bestT;
-    vec2 ddb = 6.0*u*(p2 - 2.0*p1 + p0) + 6.0*bestT*(p3 - 2.0*p2 + p1);
-    float fp = dot(db, db) + dot(diff, ddb);
-    if (abs(fp) > 1e-8) bestT = clamp(bestT - dot(diff, db) / fp, 0.0, 1.0);
-  }
-  return length(bez(p0, p1, p2, p3, bestT) - p);
-}
+// Core's own bake estimator: per-path even-odd parity hard-unioned with
+// min(), stroked paths as sausage SDFs. Shared, so fixes reach this too.
+${WEBGL_SDF_BODY}
 
 void main() {
-  vec2 p = v_pos * u_bound;
-  float result = 1e20;
-  float tone = 1.0;
-  float angle = 0.0;
-  int prevEnd = 0;
-  for (int pi = 0; pi < ${MAX_PATHS}; pi++) {
-    if (pi >= u_pathCount) break;
-    int segEnd = u_pathEnds[pi];
-    float minD = 1e20;
-    int crossings = 0;
-    for (int s = prevEnd; s < segEnd; s++) {
-      vec4 a = texelFetch(u_segments, ivec2(s * 2, 0), 0);
-      vec4 b = texelFetch(u_segments, ivec2(s * 2 + 1, 0), 0);
-      minD = min(minD, distToCubic(p, a.xy, a.zw, b.xy, b.zw, crossings));
-    }
-    float sd = (crossings % 2 == 1) ? -minD : minD;
-    if (sd < result) { result = sd; tone = u_pathTone[pi]; angle = u_pathAngle[pi]; }
-    prevEnd = segEnd;
-  }
-  o = vec4(result, tone, angle, 1.0);
+  int win;
+  float d = sceneSDF(v_pos * u_bound, win);
+  o = vec4(d, u_pathTone[win], u_pathAngle[win], 1.0);
 }
 `;
 
@@ -127,12 +72,12 @@ precision highp float;
 in vec2 v_pos;
 out vec4 o;
 
-uniform sampler2D u_sdf;
+uniform highp sampler2D u_sdf;
 uniform float u_bound;
 uniform vec2  u_res;
 uniform float u_zoom;
 uniform vec2  u_pan;
-uniform float u_seed;
+uniform vec2  u_seedLat; // integer lattice offset: reseeds without moving coordinates
 
 uniform float u_inkLoad;     // overall pigment density
 uniform float u_wetEdge;     // strength of the dark drying rim
@@ -153,6 +98,10 @@ float vnoise(vec2 p) {
   vec2 i = floor(p);
   vec2 f = fract(p);
   vec2 u = f * f * (3.0 - 2.0 * f);
+  // The seed shifts which lattice cell feeds the hash, not the sample
+  // position, so coordinates stay small and fract() stays exact however
+  // deep the zoom-adaptive octaves go.
+  i += u_seedLat;
   float a = hash12(i);
   float b = hash12(i + vec2(1.0, 0.0));
   float c = hash12(i + vec2(0.0, 1.0));
@@ -262,13 +211,13 @@ float fibres(vec2 p) {
 void main() {
   float px = 2.2 / min(u_res.x, u_res.y) / u_zoom; // logo units per pixel
   vec2 p = (gl_FragCoord.xy - 0.5 * u_res) * px + u_pan;
-  vec2 sp = p + vec2(u_seed * 17.31, u_seed * -9.17);
+  vec2 sp = p;
 
   // ---- Paper -------------------------------------------------------------
   float mott = fbm(sp * 1.4);
   float grain = detail(sp, 85.0, px);
   // A finer generation of fibres fades in once zoomed past ~4x.
-  float fib = max(fibres(sp), 0.6 * fibres(sp * 5.0 + 2.9) * smoothstep(0.0015, 0.0006, px));
+  float fib = max(fibres(sp), 0.6 * fibres(sp * 5.0 + 2.9) * (1.0 - smoothstep(0.0006, 0.0015, px)));
   // Emboss the grain with a fixed light from the upper left. Slope is
   // measured per pixel, so the relief stays crisp at every zoom.
   float e = px * 1.5;
@@ -295,8 +244,9 @@ void main() {
   // valleys; fibres carry a soft feather (the halo below), not the edge.
   float wick = u_bleed * (0.004 + 0.008 * (1.0 - grain)) * (0.4 + mott);
   float de = d - wick;
-  float cov = smoothstep(px, -px, de);
+  float cov = 1.0 - smoothstep(-px, px, de);
   float depth = max(-de, 0.0);
+  float edgeCov = cov; // coverage before dry-brush gaps, for the halo
 
   // Pigment density: uneven pooling, then the wet-edge rim on top.
   float pool = fbm(sp * 4.2 + 3.1);
@@ -312,14 +262,15 @@ void main() {
   float dryness = clamp(u_dry * 1.6 * smoothstep(0.35, 0.75, dryField + 0.25 * u_dry), 0.0, 1.0);
   float gap = smoothstep(0.45, 0.58, streak) * dryness;
   float tooth = detail(sp, 220.0, px);
-  gap = max(gap, dryness * dryness * smoothstep(0.5, 0.36, tooth) * 0.3);
+  gap = max(gap, dryness * dryness * (1.0 - smoothstep(0.36, 0.5, tooth)) * 0.3);
   // Keep the outermost rim intact a little: the brush edge holds ink longest.
   gap *= smoothstep(0.0, 0.012, depth);
   dens *= 1.0 - 0.85 * gap;
   cov *= 1.0 - 0.75 * gap;
 
-  // Faint halo where water carried diluted pigment past the edge.
-  float halo = u_bleed * 0.2 * exp(-max(de, 0.0) / (0.004 + 0.012 * fib)) * (0.6 + 0.4 * fib) * (1.0 - cov);
+  // Faint halo where water carried diluted pigment past the edge. Gated on
+  // the pre-gap coverage so it stays outside the stroke, not in dry holes.
+  float halo = u_bleed * 0.2 * exp(-max(de, 0.0) / (0.004 + 0.012 * fib)) * (0.6 + 0.4 * fib) * (1.0 - edgeCov);
 
   // Beer-Lambert-ish: density stacks toward full black instead of linearly.
   float a = clamp(cov * (1.0 - exp(-2.3 * dens)) + halo, 0.0, 1.0);
